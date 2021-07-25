@@ -1,0 +1,632 @@
+From 064dab2f1de7e22a5f058b59c01e19f434e71cc0 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:00:08 +0900
+Subject: kernel/arch/int: implement for riscv64 (2)
+
+Change-Id: Ic7722f6787a971cb208eb71a86bd3fd98fb3e690
+---
+ .../private/kernel/arch/riscv64/arch_int.h    |   6 +-
+ .../private/kernel/arch/riscv64/arch_traps.h  |  88 +++++
+ src/system/kernel/arch/riscv64/arch_int.cpp   | 319 +++++++++++-------
+ src/system/kernel/arch/riscv64/arch_traps.S   |  50 ---
+ 4 files changed, 292 insertions(+), 171 deletions(-)
+ create mode 100644 headers/private/kernel/arch/riscv64/arch_traps.h
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_int.h b/headers/private/kernel/arch/riscv64/arch_int.h
+index 85331a8c0d..db1867716e 100644
+--- a/headers/private/kernel/arch/riscv64/arch_int.h
++++ b/headers/private/kernel/arch/riscv64/arch_int.h
+@@ -61,11 +61,11 @@ arch_int_are_interrupts_enabled_inline(void)
+ 
+ 
+ enum {
+-	switchToSmodeMmodeSyscall = 0,
+-	setTimerMmodeSyscall = 1,
++	kMSyscallSwitchToSmode = 0,
++	kMSyscallSetTimer      = 1,
+ };
+ 
+-extern "C" status_t MSyscall(...);
++extern "C" status_t MSyscall(uint64 op, ...);
+ 
+ 
+ #endif /* _KERNEL_ARCH_RISCV64_INT_H */
+diff --git a/headers/private/kernel/arch/riscv64/arch_traps.h b/headers/private/kernel/arch/riscv64/arch_traps.h
+new file mode 100644
+index 0000000000..8afc947b7e
+--- /dev/null
++++ b/headers/private/kernel/arch/riscv64/arch_traps.h
+@@ -0,0 +1,88 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#ifndef _ARCH_TRAPS_H_
++#define _ARCH_TRAPS_H_
++
++
++# NOTE: this macro don't save SP, it should be saved manually
++.macro PushTrapFrame
++	addi sp, sp, -256
++
++	sd ra,   0*8(sp)
++	sd t6,   1*8(sp)
++#	sd sp,   2*8(sp) # sp
++	sd gp,   3*8(sp)
++	sd tp,   4*8(sp)
++	sd t0,   5*8(sp)
++	sd t1,   6*8(sp)
++	sd t2,   7*8(sp)
++	sd t5,   8*8(sp)
++	sd s1,   9*8(sp)
++	sd a0,  10*8(sp)
++	sd a1,  11*8(sp)
++	sd a2,  12*8(sp)
++	sd a3,  13*8(sp)
++	sd a4,  14*8(sp)
++	sd a5,  15*8(sp)
++	sd a6,  16*8(sp)
++	sd a7,  17*8(sp)
++	sd s2,  18*8(sp)
++	sd s3,  19*8(sp)
++	sd s4,  20*8(sp)
++	sd s5,  21*8(sp)
++	sd s6,  22*8(sp)
++	sd s7,  23*8(sp)
++	sd s8,  24*8(sp)
++	sd s9,  25*8(sp)
++	sd s10, 26*8(sp)
++	sd s11, 27*8(sp)
++	sd t3,  28*8(sp)
++	sd t4,  29*8(sp)
++	sd fp,  30*8(sp)
++
++	addi fp, sp, 256
++.endm
++
++
++.macro PopTrapFrame
++	ld ra,   0*8(sp)
++	ld t6,   1*8(sp)
++#	ld sp,   2*8(sp) restore later
++	ld gp,   3*8(sp)
++#	ld tp,   4*8(sp)
++	ld t0,   5*8(sp)
++	ld t1,   6*8(sp)
++	ld t2,   7*8(sp)
++	ld t5,   8*8(sp)
++	ld s1,   9*8(sp)
++	ld a0,  10*8(sp)
++	ld a1,  11*8(sp)
++	ld a2,  12*8(sp)
++	ld a3,  13*8(sp)
++	ld a4,  14*8(sp)
++	ld a5,  15*8(sp)
++	ld a6,  16*8(sp)
++	ld a7,  17*8(sp)
++	ld s2,  18*8(sp)
++	ld s3,  19*8(sp)
++	ld s4,  20*8(sp)
++	ld s5,  21*8(sp)
++	ld s6,  22*8(sp)
++	ld s7,  23*8(sp)
++	ld s8,  24*8(sp)
++	ld s9,  25*8(sp)
++	ld s10, 26*8(sp)
++	ld s11, 27*8(sp)
++	ld t3,  28*8(sp)
++	ld t4,  29*8(sp)
++	ld fp,  30*8(sp)
++
++	ld sp,   2*8(sp)
++.endm
++
++
++#endif	// _ARCH_TRAPS_H_
+diff --git a/src/system/kernel/arch/riscv64/arch_int.cpp b/src/system/kernel/arch/riscv64/arch_int.cpp
+index d4e382cfa4..95af34f489 100644
+--- a/src/system/kernel/arch/riscv64/arch_int.cpp
++++ b/src/system/kernel/arch/riscv64/arch_int.cpp
+@@ -20,15 +20,16 @@
+ #include <Htif.h>
+ #include <Plic.h>
+ #include <Clint.h>
++#include <AutoDeleterDrivers.h>
++#include "RISCV64VMTranslationMap.h"
+ 
+ #include <algorithm>
+ 
+ 
+-__attribute__ ((aligned (16))) char sMStack[64*1024];
++static uint32 sBootHartId = 0;
++static int32 sPlicContextOfs = 0;
+ 
+ 
+-extern "C" void MVec();
+-extern "C" void MVecS();
+ extern "C" void SVec();
+ extern "C" void SVecU();
+ 
+@@ -153,87 +154,20 @@ WriteCause(uint64_t cause)
+ void
+ WriteTrapInfo()
+ {
++	InterruptsLocker locker;
+ 	dprintf("STrap("); WriteCause(Scause()); dprintf(")\n");
+ 	dprintf("  sstatus: "); WriteSstatus(Sstatus()); dprintf("\n");
+ 	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
+ 	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
+-	dprintf("  stval: "); WritePC(Stval()); dprintf("\n");
++	//dprintf("  stval: "); WritePC(Stval()); dprintf("\n");
++	dprintf("  stval: 0x%" B_PRIx64 "\n", Stval());
+ 	dprintf("  tp: 0x%" B_PRIxADDR "(%s)\n", Tp(),
+ 		thread_get_current_thread()->name);
+-	//dprintf("  stval: 0x%" B_PRIx64 "\n", Stval());
+ }
+ 
+ 
+ //#pragma mark -
+ 
+-extern "C" void
+-MTrap(iframe* frame)
+-{
+-	uint64 cause = Mcause();
+-/*
+-	HtifOutString("+MTrap("); WriteCause(Mcause()); HtifOutString(")\n");
+-	dprintf("  mstatus: "); WriteMstatus(Mstatus()); dprintf("\n");
+-	dprintf("  mie: "); WriteInterruptSet(Mie()); dprintf("\n");
+-	dprintf("  mip: "); WriteInterruptSet(Mip()); dprintf("\n");
+-	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
+-	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
+-	dprintf("  mscratch: 0x%" B_PRIxADDR "\n", Mscratch());
+-	DoStackTrace(Fp(), 0);
+-*/
+-	switch (cause) {
+-		case causeMEcall:
+-		case causeSEcall: {
+-			frame->epc += 4;
+-			uint64 op = frame->a0;
+-			switch (op) {
+-				case switchToSmodeMmodeSyscall: {
+-					HtifOutString("switchToSmodeMmodeSyscall()\n");
+-					MstatusReg status(Mstatus());
+-					status.mpp = modeS;
+-					SetMedeleg(
+-						0xffff & ~((1 << causeMEcall) | (1 << causeSEcall)));
+-					SetMideleg(0xffff & ~(1 << mTimerInt));
+-					SetMstatus(status.val);
+-					dprintf("modeM stack: 0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
+-						"\n", (addr_t)sMStack,
+-						(addr_t)(sMStack + sizeof(sMStack)));
+-					SetMscratch((addr_t)(sMStack + sizeof(sMStack)));
+-					SetMtvec((uint64)MVecS);
+-					frame->a0 = B_OK;
+-					return;
+-				}
+-				case setTimerMmodeSyscall: {
+-					// HtifOutString("setTimerMmodeSyscall()\n");
+-					bool enable = frame->a1 != 0;
+-					SetSip(Sip() & ~(1 << sTimerInt));
+-					if (!enable) {
+-						SetMie(Mie() & ~(1 << mTimerInt));
+-					} else {
+-						gClintRegs->mTimeCmp[0] = frame->a2;
+-						SetMie(Mie() | (1 << mTimerInt));
+-					}
+-					frame->a0 = B_OK;
+-					return;
+-				}
+-				default:
+-					frame->a0 = B_NOT_SUPPORTED;
+-					return;
+-			}
+-			break;
+-		}
+-		case causeInterrupt + mTimerInt: {
+-			disable_interrupts();
+-			SetMie(Mie() & ~(1 << mTimerInt));
+-			SetMip(Mip() | (1 << sTimerInt));
+-			return;
+-		}
+-	}
+-	HtifOutString("unhandled MTrap\n");
+-	// DoStackTrace(Fp(), 0);
+-	HtifShutdown();
+-}
+-
+-
+ static void
+ SendSignal(debug_exception_type type, uint32 signalNumber, int32 signalCode,
+ 	addr_t signalAddress = 0, int32 signalError = B_ERROR)
+@@ -268,6 +202,9 @@ SendSignal(debug_exception_type type, uint32 signalNumber, int32 signalCode,
+ static void
+ AfterInterrupt()
+ {
++	if (debug_debugger_running())
++		return;
++
+ 	Thread* thread = thread_get_current_thread();
+ 	cpu_status state = disable_interrupts();
+ 	if (thread->cpu->invoke_scheduler) {
+@@ -289,74 +226,218 @@ AfterInterrupt()
+ }
+ 
+ 
++static bool
++SetAccessedFlags(addr_t addr, bool isWrite)
++{
++	VMAddressSpacePutter addressSpace;
++	if (IS_KERNEL_ADDRESS(addr))
++		addressSpace.SetTo(VMAddressSpace::GetKernel());
++	else if (IS_USER_ADDRESS(addr))
++		addressSpace.SetTo(VMAddressSpace::GetCurrent());
++
++	if(!addressSpace.IsSet())
++		return false;
++
++	RISCV64VMTranslationMap* map
++		= (RISCV64VMTranslationMap*)addressSpace->TranslationMap();
++
++	phys_addr_t physAdr;
++	uint32 pageFlags;
++	map->QueryInterrupt(addr, &physAdr, &pageFlags);
++	if (isWrite) {
++		if (
++			((B_WRITE_AREA | B_KERNEL_WRITE_AREA) & pageFlags) != 0
++			&& ((PAGE_ACCESSED | PAGE_MODIFIED) & pageFlags)
++				!= (PAGE_ACCESSED | PAGE_MODIFIED)
++		) {
++			map->SetFlags(addr, PAGE_ACCESSED | PAGE_MODIFIED);
++/*
++			dprintf("SetAccessedFlags(%#" B_PRIxADDR ", %d)\n", addr, isWrite);
++*/
++			return true;
++		}
++	} else {
++		if (
++			((B_READ_AREA | B_KERNEL_READ_AREA) & pageFlags) != 0
++			&& (PAGE_ACCESSED & pageFlags) == 0
++		) {
++			map->SetFlags(addr, PAGE_ACCESSED);
++/*
++			dprintf("SetAccessedFlags(%#" B_PRIxADDR ", %d)\n", addr, isWrite);
++*/
++			return true;
++		}
++	}
++	return false;
++}
++
++
++static void
++WriteProtection(uint32 flags)
++{
++	dprintf("kernel: {");
++	if (B_KERNEL_READ_AREA & flags) dprintf("R");
++	if (B_KERNEL_WRITE_AREA & flags) dprintf("W");
++	if (B_KERNEL_EXECUTE_AREA & flags) dprintf("X");
++	if (B_KERNEL_STACK_AREA & flags) dprintf("S");
++	dprintf("}, user: {");
++	if (B_READ_AREA & flags) dprintf("R");
++	if (B_WRITE_AREA & flags) dprintf("W");
++	if (B_EXECUTE_AREA & flags) dprintf("X");
++	if (B_STACK_AREA & flags) dprintf("S");
++	dprintf("}");
++}
++
++
++template<typename F>
++class ScopeExit 
++{
++public:
++	explicit ScopeExit(F&& fn) : fFn(fn)
++	{
++	}
++
++	~ScopeExit()
++	{ 
++		fFn();
++	}
++
++	ScopeExit(ScopeExit&& other) : fFn(std::move(other.fFn))
++	{
++	}
++
++private:
++	ScopeExit(const ScopeExit&);
++	ScopeExit& operator=(const ScopeExit&);
++	
++private:
++	F fFn;
++};
++
++template<typename F>
++ScopeExit<F> MakeScopeExit(F&& fn)
++{
++	return ScopeExit<F>(std::move(fn));
++}
++
++
+ extern "C" void
+ STrap(iframe* frame)
+ {
+ 	// dprintf("STrap("); WriteCause(Scause()); dprintf(")\n");
+-	if (SstatusReg(Sstatus()).spp == modeU) {
++
++	SstatusReg status(Sstatus());
++	uint64 cause = Scause();
++
++	const auto& statusRestorer = MakeScopeExit([&]() {
++		SetSstatus(status.val);
++	});
++
++	switch (cause) {
++		case causeExecPageFault:
++		case causeLoadPageFault:
++		case causeStorePageFault: {
++			if (SetAccessedFlags(Stval(), cause == causeStorePageFault))
++				return;
++		}
++	}
++
++	if (status.spp == modeU) {
+ 		thread_get_current_thread()->arch_info.userFrame = frame;
+ 		thread_at_kernel_entry(system_time());
+ 	}
+-	struct ScopeExit {
+-		~ScopeExit()
+-		{
+-			if (SstatusReg(Sstatus()).spp == modeU) {
+-				if ((thread_get_current_thread()->flags
+-					& (THREAD_FLAGS_SIGNALS_PENDING
+-					| THREAD_FLAGS_DEBUG_THREAD
+-					| THREAD_FLAGS_TRAP_FOR_CORE_DUMP)) != 0) {
+-					enable_interrupts();
+-					thread_at_kernel_exit();
+-				} else {
+-					thread_at_kernel_exit_no_signals();
+-				}
+-				thread_get_current_thread()->arch_info.userFrame = NULL;
++	const auto& kernelExit = MakeScopeExit([&]() {
++		if (status.spp == modeU) {
++			disable_interrupts();
++			if ((thread_get_current_thread()->flags
++				& (THREAD_FLAGS_SIGNALS_PENDING
++				| THREAD_FLAGS_DEBUG_THREAD
++				| THREAD_FLAGS_TRAP_FOR_CORE_DUMP)) != 0) {
++				enable_interrupts();
++				thread_at_kernel_exit();
++			} else {
++				thread_at_kernel_exit_no_signals();
+ 			}
++			thread_get_current_thread()->arch_info.userFrame = NULL;
+ 		}
+-	} scopeExit;
++	});
+ 
+-	uint64 cause = Scause();
+ 	switch (cause) {
+-		case causeIllegalInst:
++		case causeIllegalInst: {
+ 			return SendSignal(B_INVALID_OPCODE_EXCEPTION, SIGILL, ILL_ILLOPC,
+ 				frame->epc);
++		}
+ 		case causeExecMisalign:
+ 		case causeLoadMisalign:
+-		case causeStoreMisalign:
++		case causeStoreMisalign: {
+ 			return SendSignal(B_ALIGNMENT_EXCEPTION, SIGBUS, BUS_ADRALN,
+ 				Stval());
++		}
+ 		// case causeBreakpoint:
+-		// case causeExecAccessFault:
+-		// case causeLoadAccessFault:
+-		// case causeStoreAccessFault:
++		case causeExecAccessFault:
++		case causeLoadAccessFault:
++		case causeStoreAccessFault: {
++			return SendSignal(B_SEGMENT_VIOLATION, SIGBUS, BUS_ADRERR,
++				Stval());
++		}
+ 		case causeExecPageFault:
+ 		case causeLoadPageFault:
+ 		case causeStorePageFault: {
+ 			uint64 stval = Stval();
+-			SstatusReg status(Sstatus());
++
++			if (debug_debugger_running()) {
++				Thread* thread = thread_get_current_thread();
++				if (thread != NULL) {
++					cpu_ent* cpu = &gCPU[smp_get_current_cpu()];
++					if (cpu->fault_handler != 0) {
++						debug_set_page_fault_info(stval, frame->epc,
++							(cause == causeStorePageFault)
++								? DEBUG_PAGE_FAULT_WRITE : 0);
++						frame->epc = cpu->fault_handler;
++						frame->sp = cpu->fault_handler_stack_pointer;
++						return;
++					}
++
++					if (thread->fault_handler != 0) {
++						kprintf("ERROR: thread::fault_handler used in kernel "
++							"debugger!\n");
++						debug_set_page_fault_info(stval, frame->epc,
++							cause == causeStorePageFault
++								? DEBUG_PAGE_FAULT_WRITE : 0);
++						frame->epc = (addr_t)thread->fault_handler;
++						return;
++					}
++				}
++
++				panic("page fault in debugger without fault handler! Touching "
++					"address %p from ip %p\n", (void*)stval, (void*)frame->epc);
++				return;
++			}
++
++			if (status.pie == 0) {
++				WriteTrapInfo();
++				panic("page fault with interrupts disabled@!dump_virt_page %#" B_PRIx64, stval);
++			}
++
+ 			addr_t newIP = 0;
+ 			enable_interrupts();
+ 			vm_page_fault(stval, frame->epc, cause == causeStorePageFault,
+-				cause == causeExecPageFault, status.spp == modeU, &newIP);
++				cause == causeExecPageFault, status.spp == modeU, status.sum != 0, &newIP);
+ 			if (newIP != 0)
+ 				frame->epc = newIP;
+-			SetSstatus(status.val);
++
+ 			return;
+ 		}
+ 		case causeInterrupt + sTimerInt: {
+-			SstatusReg status(Sstatus());
+ 			timer_interrupt();
+ 			AfterInterrupt();
+-			SetSstatus(status.val);
+ 			return;
+ 		}
+ 		case causeInterrupt + sExternInt: {
+-			SstatusReg status(Sstatus());
+-			uint64 irq = gPlicRegs->contexts[0].claimAndComplete;
++			uint64 irq = gPlicRegs->contexts[modeS + 2*sBootHartId + sPlicContextOfs].claimAndComplete;
+ 			int_io_interrupt_handler(irq, true);
+-			gPlicRegs->contexts[0].claimAndComplete = irq;
++			gPlicRegs->contexts[modeS + 2*sBootHartId + sPlicContextOfs].claimAndComplete = irq;
+ 			AfterInterrupt();
+-			SetSstatus(status.val);
+ 			return;
+ 		}
+ 		case causeUEcall: {
+@@ -387,12 +468,10 @@ STrap(iframe* frame)
+ 			}
+ */
+ 			// dprintf("syscall: %s\n", kExtendedSyscallInfos[syscall].name);
+-			SstatusReg status(Sstatus());
+ 			enable_interrupts();
+ 			uint64 returnValue = 0;
+ 			syscall_dispatcher(syscall, (void*)args, &returnValue);
+ 			frame->a0 = returnValue;
+-			SetSstatus(status.val);
+ 			return;
+ 		}
+ 	}
+@@ -406,19 +485,21 @@ STrap(iframe* frame)
+ status_t
+ arch_int_init(kernel_args* args)
+ {
+-	SetMtvec((uint64)MVec);
++	sBootHartId = args->arch_args.bootHart;
++	sPlicContextOfs = (sBootHartId == 0) ? 0 : -1;
++
+ 	SetStvec((uint64)SVec);
+-	MstatusReg mstatus(Mstatus());
+-	mstatus.ie = 1 << modeM;
+-	mstatus.fs = extStatusInitial; // enable FPU
+-	mstatus.xs = extStatusOff;
+-	SetMstatus(mstatus.val);
+-	MSyscall(switchToSmodeMmodeSyscall);
++	SstatusReg sstatus(Sstatus());
++	sstatus.ie = 0;
++	sstatus.fs = extStatusInitial; // enable FPU
++	sstatus.xs = extStatusOff;
++	SetSstatus(sstatus.val);
+ 	SetSie(Sie() | (1 << sTimerInt) | (1 << sExternInt));
+ 
+ 	// TODO: read from FDT
+-	reserve_io_interrupt_vectors(32, 0, INTERRUPT_TYPE_IRQ);
++	reserve_io_interrupt_vectors(128, 0, INTERRUPT_TYPE_IRQ);
+ 
++	gPlicRegs->contexts[modeS + 2*sBootHartId + sPlicContextOfs].priorityThreshold = 0;
+ 	return B_OK;
+ }
+ 
+@@ -447,16 +528,18 @@ arch_int_init_io(kernel_args* args)
+ void
+ arch_int_enable_io_interrupt(int irq)
+ {
+-	// not implemented by TinyEMU
+-	gPlicRegs->enable[0][irq / 32] |= 1 << (irq % 32);
++	dprintf("arch_int_enable_io_interrupt(%d)\n", irq);
++	gPlicRegs->priority[irq] = 1;
++	gPlicRegs->enable[modeS + 2*sBootHartId + sPlicContextOfs][irq / 32] |= 1 << (irq % 32);
+ }
+ 
+ 
+ void
+ arch_int_disable_io_interrupt(int irq)
+ {
+-	// not implemented by TinyEMU
+-	gPlicRegs->enable[0][irq / 32] &= ~(1 << (irq % 32));
++	dprintf("arch_int_disable_io_interrupt(%d)\n", irq);
++	gPlicRegs->priority[irq] = 0;
++	gPlicRegs->enable[modeS + 2*sBootHartId + sPlicContextOfs][irq / 32] &= ~(1 << (irq % 32));
+ }
+ 
+ 
+diff --git a/src/system/kernel/arch/riscv64/arch_traps.S b/src/system/kernel/arch/riscv64/arch_traps.S
+index a8e7fe9b6b..dcadb6ed51 100644
+--- a/src/system/kernel/arch/riscv64/arch_traps.S
++++ b/src/system/kernel/arch/riscv64/arch_traps.S
+@@ -7,56 +7,6 @@
+ #include "arch_traps.h"
+ 
+ 
+-.globl MVec
+-.type  MVec, @function
+-.align 4
+-MVec:
+-	PushTrapFrame
+-	sd fp, 2*8(sp)
+-	csrr t0, mepc
+-	sd   t0, 31*8(sp)
+-
+-	mv a0, sp
+-	call MTrap
+-
+-	ld t0, 31*8(sp)
+-	csrw mepc, t0
+-	PopTrapFrame
+-	mret
+-.size	MVec, .-MVec
+-
+-
+-.globl MVecS
+-.type  MVecS, @function
+-.align 4
+-MVecS:
+-	csrrw sp, mscratch, sp
+-
+-	PushTrapFrame
+-
+-	csrr t0, mscratch
+-	sd t0, 2*8(sp) # save supervisor SP
+-	csrw mscratch, fp
+-
+-	csrr t0, mepc
+-	sd   t0, 31*8(sp)
+-
+-	la   t0,    MVec
+-	csrw mtvec, t0
+-
+-	mv a0, sp
+-	call MTrap
+-
+-	la   t0,    MVecS
+-	csrw mtvec, t0
+-
+-	ld t0, 31*8(sp)
+-	csrw mepc, t0
+-	PopTrapFrame
+-	mret
+-.size	MVecS, .-MVecS
+-
+-
+ .globl SVec
+ .type  SVec, @function
+ .align 4
+-- 
+2.30.2
+

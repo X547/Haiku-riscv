@@ -1,0 +1,47 @@
+From 53ad45a6909393a5150e2e76c5af9e5742bbbdd5 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 18 Apr 2021 12:01:04 +0900
+Subject: Menu: use menu superitem when exists when adding menu as item
+
+Change-Id: I8422fdf27048752d4836e6a2e2fc8e70de2e13b1
+---
+ src/kits/interface/Menu.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/kits/interface/Menu.cpp b/src/kits/interface/Menu.cpp
+index d9158bd0d2..9a2464fa16 100644
+--- a/src/kits/interface/Menu.cpp
++++ b/src/kits/interface/Menu.cpp
+@@ -953,6 +953,9 @@ BMenu::AddItem(BMenuItem* item, BRect frame)
+ bool
+ BMenu::AddItem(BMenu* submenu)
+ {
++	if (submenu->Superitem() != NULL)
++		return AddItem(submenu->Superitem(), CountItems());
++
+ 	BMenuItem* item = new (nothrow) BMenuItem(submenu);
+ 	if (item == NULL)
+ 		return false;
+@@ -975,6 +978,9 @@ BMenu::AddItem(BMenu* submenu, int32 index)
+ 			"be called if the menu layout is not B_ITEMS_IN_MATRIX");
+ 	}
+ 
++	if (submenu->Superitem() != NULL)
++		return AddItem(submenu->Superitem(), index);
++
+ 	BMenuItem* item = new (nothrow) BMenuItem(submenu);
+ 	if (item == NULL)
+ 		return false;
+@@ -997,6 +1003,9 @@ BMenu::AddItem(BMenu* submenu, BRect frame)
+ 			"be called if the menu layout is B_ITEMS_IN_MATRIX");
+ 	}
+ 
++	if (submenu->Superitem() != NULL)
++		return AddItem(submenu->Superitem(), frame);
++
+ 	BMenuItem* item = new (nothrow) BMenuItem(submenu);
+ 	if (item == NULL)
+ 		return false;
+-- 
+2.30.2
+

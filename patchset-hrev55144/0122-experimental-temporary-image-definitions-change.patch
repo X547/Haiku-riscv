@@ -1,0 +1,202 @@
+From d4164ab89ab578e72c6174b553cadf42b6ab750d Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:49:11 +0900
+Subject: experimental temporary image definitions change
+
+Change-Id: I45046a226218cbaa6882362a6a91fd7d73e235ac
+---
+ build/jam/images/definitions/minimum | 59 ++++++++++++++++++++++------
+ build/jam/images/definitions/regular |  3 +-
+ build/jam/packages/Haiku             |  4 +-
+ 3 files changed, 51 insertions(+), 15 deletions(-)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index c32164f56c..6d5eceb39d 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -32,6 +32,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
+ 	urlwrapper useradd userdel
+ 	version vmstat
+ 	waitfor watch writembr@x86,x86_64 xres
++	dpms
+ ] ;
+ 
+ SYSTEM_APPS = [ FFilterByBuildFeatures
+@@ -45,6 +46,11 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
+ 	ShowImage StyledEdit
+ 	Terminal TextSearch
+ 	Workspaces
++	ActivityMonitor
++	Icon-O-Matic Installer
++	Magnify MediaConverter MediaPlayer
++	People PoorMan
++	SerialConnect SoundRecorder
+ ] ;
+ 
+ DESKBAR_APPLICATIONS =
+@@ -53,12 +59,19 @@ DESKBAR_APPLICATIONS =
+ 	Expander
+ 	StyledEdit
+ 	Terminal
++	ActivityMonitor
++	Icon-O-Matic Installer
++	Magnify MediaConverter MediaPlayer
++	People PoorMan
++	SerialConnect SoundRecorder
+ ;
+ 
+ DESKBAR_DESKTOP_APPLETS =
+ 	NetworkStatus
+ 	ProcessController
+ 	Workspaces
++	AutoRaise
++	LaunchBox
+ ;
+ 
+ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
+@@ -73,9 +86,15 @@ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
+ 	Screen Shortcuts
+ 	Time <preference>Tracker
+ 	VirtualMemory
++	DataTranslations
++	ScreenSaver
+ ] ;
+ 
+-SYSTEM_DEMOS = ;
++SYSTEM_DEMOS += [ FFilterByBuildFeatures
++	Chart Clock Cortex@expat FontDemo
++	Mandelbrot OverlayImage Pairs
++	Playground Pulse Sudoku
++] ;
+ 
+ 
+ rule HaikuImageGetSystemLibs
+@@ -90,9 +109,12 @@ rule HaikuImageGetSystemLibs
+ 			libdebug.so
+ 			libdebugger.so@primary
+ 			libdevice.so
++			libgame.so
+ 			libgnu.so
++			libmedia.so
+ 			libnetwork.so
+ 			libpackage.so
++			libscreensaver.so
+ 			libtextencoding.so libtracker.so libtranslation.so
+ 		] ]
+ 		;
+@@ -120,6 +142,7 @@ SYSTEM_SERVERS = [ FFilterByBuildFeatures
+ 	package_daemon power_daemon
+ 	registrar
+ 	syslog_daemon
++	media_addon_server media_server
+ ] ;
+ 
+ SYSTEM_NETWORK_DEVICES =
+@@ -143,22 +166,34 @@ SYSTEM_NETWORK_PROTOCOLS =
+ ;
+ 
+ SYSTEM_ADD_ONS_ACCELERANTS = [ FFilterByBuildFeatures
+-	x86,x86_64,riscv64 @{
+-		vesa.accelerant
+-	}@ # x86,x86_64,riscv64
++	vesa.accelerant
++	ati.accelerant
++	radeon_hd.accelerant
+ ] ;
+ 
+ SYSTEM_ADD_ONS_TRANSLATORS =
++	BMPTranslator
++	HVIFTranslator
++	TGATranslator
+ 	STXTTranslator
+ ;
+ 
+ SYSTEM_ADD_ONS_LOCALE_CATALOGS =
+-	<catalog-addon>plaintext
++#	<catalog-addon>plaintext
+ ;
+ 
+-SYSTEM_ADD_ONS_MEDIA = ;
++SYSTEM_ADD_ONS_MEDIA += [ FFilterByBuildFeatures
++	cortex_audioadapter.media_addon	cortex_flanger.media_addon
++	cortex_logging_consumer.media_addon
++	hmulti_audio.media_addon
++	mixer.media_addon
++	tone_producer_demo.media_addon
++	video_producer_demo.media_addon	video_window_demo.media_addon
++] ;
+ 
+-SYSTEM_ADD_ONS_MEDIA_PLUGINS =  ;
++SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
++	raw_decoder
++] ;
+ 
+ SYSTEM_ADD_ONS_PRINT = ;
+ 
+@@ -166,14 +201,16 @@ SYSTEM_ADD_ONS_PRINT_TRANSPORT = ;
+ 
+ SYSTEM_ADD_ONS_SCREENSAVERS = ;
+ 
+-SYSTEM_ADD_ONS_DRIVERS_AUDIO = ;
++SYSTEM_ADD_ONS_DRIVERS_AUDIO +=
++	hda
++;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_AUDIO_OLD = ;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_GRAPHICS = [ FFilterByBuildFeatures
+-	x86,x86_64,riscv64 @{
+-		vesa
+-	}@ # x86,x86_64,riscv64
++	vesa
++	ati
++	radeon_hd
+ ] ;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_MIDI = ;
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 6d42312521..ac57f7a598 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -118,7 +118,7 @@ SYSTEM_ADD_ONS_ACCELERANTS += [ FFilterByBuildFeatures
+ 		via.accelerant
+ 	}@ # x86,x86_64
+ 	x86 @{
+-		3dfx.accelerant ati.accelerant neomagic.accelerant s3.accelerant
++		3dfx.accelerant neomagic.accelerant s3.accelerant
+ 	}@ # x86
+ ] ;
+ 
+@@ -214,7 +214,6 @@ SYSTEM_ADD_ONS_DRIVERS_GRAPHICS += [ FFilterByBuildFeatures
+ 	}@ # x86,x86_64
+ 	x86 @{
+ 		3dfx
+-		ati
+ 		neomagic
+ 		s3
+ 	}@ # x86
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 3e29e02899..64f4207ca1 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -61,7 +61,7 @@ if $(TARGET_ARCH) = x86 || $(TARGET_ARCH) = x86_64 {
+ 
+ # drivers
+ AddNewDriversToPackage 				: wmi@x86,x86_64 ;
+-AddNewDriversToPackage disk			: nvme_disk@x86,x86_64 ;
++AddNewDriversToPackage disk			: nvme_disk ;
+ AddNewDriversToPackage disk mmc		: mmc_disk ;
+ AddNewDriversToPackage disk scsi	: scsi_cd scsi_disk ;
+ AddNewDriversToPackage disk virtual : virtio_block ram_disk ;
+@@ -192,7 +192,7 @@ AddBootModuleSymlinksToPackage
+ 	ide_isa@x86 isa@x86,x86_64 intel it8211
+ 	legacy_sata locked_pool
+ 	mmc mmc_disk
+-	nvme_disk@x86,x86_64
++	nvme_disk
+ 	openpic@ppc
+ 	packagefs pci
+ 	fdt@riscv64
+-- 
+2.30.2
+

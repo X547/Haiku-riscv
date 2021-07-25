@@ -1,0 +1,100 @@
+From 456514dc123e9d829538740710f127cfd983b185 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:32:31 +0900
+Subject: virtio_input: add (2)
+
+Change-Id: I9976fa36356dba9c833b23c9e3c2950f8e5a5829
+---
+ .../input/virtio_input/virtio_input.cpp       | 22 +++++++++----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp b/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp
+index 688996e979..55d546912c 100644
+--- a/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp
++++ b/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp
+@@ -69,7 +69,7 @@ struct VirtioInputHandle {
+ #define CALLED() 			TRACE("CALLED %s\n", __PRETTY_FUNCTION__)
+ 
+ 
+-static device_manager_info* sDeviceManager;
++device_manager_info* gDeviceManager;
+ 
+ 
+ static void WriteInputPacket(const VirtioInputPacket &pkt)
+@@ -111,8 +111,8 @@ static void WriteInputPacket(const VirtioInputPacket &pkt)
+ 	}
+ 	switch (pkt.type) {
+ 		case kVirtioInputEvSyn: break;
+-		case kVirtioInputEvKey: dprintf(", "); if (pkt.value == 0) dprintf("up"); else if (pkt.value == 1) dprintf("down"); else dprintf("%d", pkt.value); break;
+-		default: dprintf(", "); dprintf("%d", pkt.value);
++		case kVirtioInputEvKey: dprintf(", "); if (pkt.value == 0) dprintf("up"); else if (pkt.value == 1) dprintf("down"); else dprintf("%" B_PRId32, pkt.value); break;
++		default: dprintf(", "); dprintf("%" B_PRId32, pkt.value);
+ 	}
+ }
+ 
+@@ -215,8 +215,8 @@ virtio_input_init_device(void* _info, void** _cookie)
+ 	TRACE("virtio_input_init_device(%p)\n", _info);
+ 	VirtioInputDevice* info = (VirtioInputDevice*)_info;
+ 
+-	DeviceNodePutter<&sDeviceManager> parent(sDeviceManager->get_parent_node(info->node));
+-	sDeviceManager->get_driver(parent.Get(), (driver_module_info **)&info->virtio,
++	DeviceNodePutter<&gDeviceManager> parent(gDeviceManager->get_parent_node(info->node));
++	gDeviceManager->get_driver(parent.Get(), (driver_module_info **)&info->virtio,
+ 		(void **)&info->virtio_device);
+ 
+ 	info->virtio->negotiate_features(info->virtio_device, 0, &info->features, NULL);
+@@ -365,14 +365,14 @@ virtio_input_supports_device(device_node *parent)
+ 	uint16 deviceType;
+ 
+ 	// make sure parent is really the Virtio bus manager
+-	if (sDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false))
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false))
+ 		return -1;
+ 
+ 	if (strcmp(bus, "virtio"))
+ 		return 0.0;
+ 
+ 	// check whether it's really a Direct Access Device
+-	if (sDeviceManager->get_attr_uint16(parent, VIRTIO_DEVICE_TYPE_ITEM,
++	if (gDeviceManager->get_attr_uint16(parent, VIRTIO_DEVICE_TYPE_ITEM,
+ 			&deviceType, true) != B_OK || deviceType != kVirtioDevInput)
+ 		return 0.0;
+ 
+@@ -392,7 +392,7 @@ virtio_input_register_device(device_node *node)
+ 		{ NULL }
+ 	};
+ 
+-	return sDeviceManager->register_node(node, VIRTIO_INPUT_DRIVER_MODULE_NAME,
++	return gDeviceManager->register_node(node, VIRTIO_INPUT_DRIVER_MODULE_NAME,
+ 		attrs, NULL, NULL);
+ }
+ 
+@@ -434,14 +434,14 @@ virtio_input_register_child_devices(void* _cookie)
+ 	VirtioInputDevice* info = (VirtioInputDevice*)_cookie;
+ 	status_t status;
+ 
+-	int32 id = sDeviceManager->create_id(VIRTIO_INPUT_DEVICE_ID_GENERATOR);
++	int32 id = gDeviceManager->create_id(VIRTIO_INPUT_DEVICE_ID_GENERATOR);
+ 	if (id < 0)
+ 		return id;
+ 
+ 	char name[64];
+ 	snprintf(name, sizeof(name), "input/virtio/%" B_PRId32 "/raw", id);
+ 
+-	status = sDeviceManager->publish_device(info->node, name, VIRTIO_INPUT_DEVICE_MODULE_NAME);
++	status = gDeviceManager->publish_device(info->node, name, VIRTIO_INPUT_DEVICE_MODULE_NAME);
+ 	if (status < B_OK) {
+ 		TRACE("  error: 0x%" B_PRIx32 "(%s) \n", status, strerror(status));
+ 		panic("(!)");
+@@ -455,7 +455,7 @@ virtio_input_register_child_devices(void* _cookie)
+ 
+ 
+ module_dependency module_dependencies[] = {
+-	{B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager},
++	{B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager},
+ 	{}
+ };
+ 
+-- 
+2.30.2
+

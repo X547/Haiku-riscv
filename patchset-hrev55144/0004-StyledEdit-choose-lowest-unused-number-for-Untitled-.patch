@@ -1,0 +1,72 @@
+From 6463db5ab772dc5ab3319a334a14a8516a35f9ec Mon Sep 17 00:00:00 2001
+From: ejno <none>
+Date: Wed, 26 Jun 2013 08:48:24 +0000
+Subject: StyledEdit: choose lowest unused number for Untitled documents
+
+Change-Id: I8825008f45f2549e233be2c7adad13c8993f003d
+---
+ src/apps/stylededit/StyledEditApp.cpp | 25 +++++++++++++++++++++++--
+ src/apps/stylededit/StyledEditApp.h   |  1 -
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/apps/stylededit/StyledEditApp.cpp b/src/apps/stylededit/StyledEditApp.cpp
+index 7e3ecdc08d..810dc37ed6 100644
+--- a/src/apps/stylededit/StyledEditApp.cpp
++++ b/src/apps/stylededit/StyledEditApp.cpp
+@@ -130,7 +130,6 @@ StyledEditApp::StyledEditApp()
+ 		fOpenPanelEncodingMenu = NULL;
+ 
+ 	fWindowCount = 0;
+-	fNextUntitledWindow = 1;
+ 	fBadArguments = false;
+ 
+ 	float factor = be_plain_font->Size() / 12.0f;
+@@ -179,10 +178,32 @@ StyledEditApp::MessageReceived(BMessage* message)
+ }
+ 
+ 
++static int32
++GetNextUntitled()
++{
++	int nextUntitled = 1;
++
++	BString untitled(B_TRANSLATE("Untitled "));
++	BString title = untitled;
++	title << nextUntitled;
++
++	int32 numWindows = be_app->CountWindows();
++	for (int32 i = 0; i < numWindows; i++) {
++		if (be_app->WindowAt(i)->Title() == title)
++		{
++			title = untitled;
++			title << ++nextUntitled;
++		}
++	}
++
++	return nextUntitled;
++}
++
++
+ void
+ StyledEditApp::OpenDocument()
+ {
+-	new StyledEditWindow(sWindowRect, fNextUntitledWindow++, fOpenAsEncoding);
++	new StyledEditWindow(sWindowRect, GetNextUntitled(), fOpenAsEncoding);
+ 	cascade();
+ 	fWindowCount++;
+ }
+diff --git a/src/apps/stylededit/StyledEditApp.h b/src/apps/stylededit/StyledEditApp.h
+index 71f1f748bb..0de971fc07 100644
+--- a/src/apps/stylededit/StyledEditApp.h
++++ b/src/apps/stylededit/StyledEditApp.h
+@@ -49,7 +49,6 @@ private:
+ 			BMenu*				fOpenPanelEncodingMenu;
+ 			uint32				fOpenAsEncoding;
+ 			int32				fWindowCount;
+-			int32				fNextUntitledWindow;
+ 			bool				fBadArguments;
+ };
+ 
+-- 
+2.30.2
+

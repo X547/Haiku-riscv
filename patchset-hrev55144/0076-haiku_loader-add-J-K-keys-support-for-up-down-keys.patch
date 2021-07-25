@@ -1,0 +1,43 @@
+From ba198f635b9ccf48587fe30bd760ce6234c62084 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 13 Jun 2021 02:11:22 +0900
+Subject: haiku_loader: add J, K keys support for up/down keys
+
+Arrow keys are not available on some platforms.
+
+Change-Id: Ia38797eb12202668a0b0976b31f21f564d140901
+---
+ src/system/boot/platform/generic/text_menu.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/boot/platform/generic/text_menu.cpp b/src/system/boot/platform/generic/text_menu.cpp
+index 611268ce88..5826688ecb 100644
+--- a/src/system/boot/platform/generic/text_menu.cpp
++++ b/src/system/boot/platform/generic/text_menu.cpp
+@@ -412,7 +412,8 @@ run_menu(Menu* menu)
+ 
+ 		item = menu->ItemAt(selected);
+ 
+-		if (TEXT_CONSOLE_IS_CURSOR_KEY(key)) {
++		if (TEXT_CONSOLE_IS_CURSOR_KEY(key) || key == 'j' || key == 'J'
++			|| key == 'k' || key == 'K') {
+ 			if (item == NULL)
+ 				continue;
+ 
+@@ -420,9 +421,13 @@ run_menu(Menu* menu)
+ 
+ 			switch (key) {
+ 				case TEXT_CONSOLE_KEY_UP:
++				case 'k':
++				case 'K':
+ 					selected = select_previous_valid_item(menu, selected - 1);
+ 					break;
+ 				case TEXT_CONSOLE_KEY_DOWN:
++				case 'j':
++				case 'J':
+ 					selected = select_next_valid_item(menu, selected + 1);
+ 					break;
+ 				case TEXT_CONSOLE_KEY_PAGE_UP:
+-- 
+2.30.2
+

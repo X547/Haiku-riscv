@@ -1,0 +1,258 @@
+From db0baf29cdd154acb09c96bea72e27f01b474bd7 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 02:29:21 +0900
+Subject: kernel: add SiFive UART driver for riscv64
+
+Change-Id: I37a909b5bcdb18b3fa062961eca9ff2f5187867c
+---
+ .../kernel/arch/riscv64/arch_uart_sifive.h    | 100 +++++++++++++++++
+ src/system/kernel/arch/riscv64/Jamfile        |   5 +
+ .../kernel/arch/riscv64/arch_uart_sifive.cpp  | 106 ++++++++++++++++++
+ 3 files changed, 211 insertions(+)
+ create mode 100644 headers/private/kernel/arch/riscv64/arch_uart_sifive.h
+ create mode 100644 src/system/kernel/arch/riscv64/arch_uart_sifive.cpp
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_uart_sifive.h b/headers/private/kernel/arch/riscv64/arch_uart_sifive.h
+new file mode 100644
+index 0000000000..9c236a3502
+--- /dev/null
++++ b/headers/private/kernel/arch/riscv64/arch_uart_sifive.h
+@@ -0,0 +1,100 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++#ifndef _ARCH_UART_SIFIVE_H_
++#define _ARCH_UART_SIFIVE_H_
++
++
++#include <arch/generic/debug_uart.h>
++
++
++// UARTSifiveRegs.ie, ip
++enum {
++	kUartSifiveTxwm = 1 << 0,
++	kUartSifiveRxwm = 1 << 1,
++};
++
++
++struct UARTSifiveRegs {
++	union Txdata {
++		struct {
++			uint32 data:      8;
++			uint32 reserved: 23;
++			uint32 isFull:    1;
++		};
++		uint32 val;
++	} txdata;
++
++	union Rxdata {
++		struct {
++			uint32 data:      8;
++			uint32 reserved: 23;
++			uint32 isEmpty:   1;
++		};
++		uint32 val;
++	} rxdata;
++
++	union Txctrl {
++		struct {
++			uint32 enable:     1;
++			uint32 nstop:      1;
++			uint32 reserved1: 14;
++			uint32 cnt:        3;
++			uint32 reserved2: 13;
++		};
++		uint32 val;
++	} txctrl;
++
++	union Rxctrl {
++		struct {
++			uint32 enable:     1;
++			uint32 reserved1: 15;
++			uint32 cnt:        3;
++			uint32 reserved2: 13;
++		};
++		uint32 val;
++	} rxctrl;
++
++	uint32 ie; // interrupt enable
++	uint32 ip; // interrupt pending
++	uint32 div;
++	uint32 unused;
++};
++
++
++class ArchUARTSifive : public DebugUART {
++public:
++							ArchUARTSifive(addr_t base, int64 clock);
++							~ArchUARTSifive();
++
++	virtual	void			InitEarly();
++	virtual	void			Init();
++	virtual	void			InitPort(uint32 baud);
++
++	virtual	void			Enable();
++	virtual	void			Disable();
++
++	virtual	int				PutChar(char ch);
++	virtual	int				GetChar(bool wait);
++
++	virtual	void			FlushTx();
++	virtual	void			FlushRx();
++
++protected:
++	virtual	void			Barrier();
++
++	inline volatile UARTSifiveRegs*
++							Regs();
++};
++
++
++volatile UARTSifiveRegs*
++ArchUARTSifive::Regs()
++{
++	return (volatile UARTSifiveRegs*)Base();
++}
++
++
++#endif	// _ARCH_UART_SIFIVE_H_
+diff --git a/src/system/kernel/arch/riscv64/Jamfile b/src/system/kernel/arch/riscv64/Jamfile
+index 1a6b74b5dd..305bed6e73 100644
+--- a/src/system/kernel/arch/riscv64/Jamfile
++++ b/src/system/kernel/arch/riscv64/Jamfile
+@@ -3,6 +3,8 @@ SubDir HAIKU_TOP src system kernel arch riscv64 ;
+ SubDirHdrs $(SUBDIR) $(DOTDOT) generic ;
+ UsePrivateKernelHeaders ;
+ 
++SEARCH_SOURCE += [ FDirName $(SUBDIR) $(DOTDOT) generic ] ;
++
+ KernelMergeObject kernel_arch_riscv64.o :
+         arch_asm.S
+         arch_traps.S
+@@ -24,6 +26,9 @@ KernelMergeObject kernel_arch_riscv64.o :
+         RISCV64VMTranslationMap.cpp
+         Htif.cpp
+         sbi_syscalls.S
++
++        debug_uart_8250.cpp
++        arch_uart_sifive.cpp
+         :
+         $(TARGET_KERNEL_PIC_CCFLAGS) -Wno-unused
+         :
+diff --git a/src/system/kernel/arch/riscv64/arch_uart_sifive.cpp b/src/system/kernel/arch/riscv64/arch_uart_sifive.cpp
+new file mode 100644
+index 0000000000..97a5ddd383
+--- /dev/null
++++ b/src/system/kernel/arch/riscv64/arch_uart_sifive.cpp
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++#include <arch/riscv64/arch_uart_sifive.h>
++
++
++ArchUARTSifive::ArchUARTSifive(addr_t base, int64 clock)
++	:
++	DebugUART(base, clock)
++{
++}
++
++
++ArchUARTSifive::~ArchUARTSifive()
++{
++}
++
++
++void
++ArchUARTSifive::InitEarly()
++{
++	//Regs()->ie = 0;
++	//Enable();
++}
++
++
++void
++ArchUARTSifive::Init()
++{
++}
++
++
++void
++ArchUARTSifive::InitPort(uint32 baud)
++{
++	uint64 quotient = (Clock() + baud - 1) / baud;
++
++	if (quotient == 0)
++		Regs()->div = 0;
++	else
++		Regs()->div = (uint32)(quotient - 1);
++}
++
++
++void
++ArchUARTSifive::Enable()
++{
++	//Regs()->txctrl.enable = 1;
++	//Regs()->rxctrl.enable = 1;
++	DebugUART::Enable();
++}
++
++
++void
++ArchUARTSifive::Disable()
++{
++	//Regs()->txctrl.enable = 0;
++	//Regs()->rxctrl.enable = 0;
++	DebugUART::Disable();
++}
++
++
++int
++ArchUARTSifive::PutChar(char ch)
++{
++	while (Regs()->txdata.isFull) {}
++	Regs()->txdata.val = ch;
++	return 0;
++}
++
++
++int
++ArchUARTSifive::GetChar(bool wait)
++{
++	if (wait) {
++		uint32 val;
++		while ((val = GetChar(false)) < 0) {}
++		return val;
++	}
++	UARTSifiveRegs::Rxdata data = {.val = Regs()->rxdata.val};
++	if (data.isEmpty)
++		return -1;
++
++	return data.data;
++}
++
++
++void
++ArchUARTSifive::FlushTx()
++{
++}
++
++
++void
++ArchUARTSifive::FlushRx()
++{
++}
++
++
++void
++ArchUARTSifive::Barrier()
++{
++	asm volatile ("" : : : "memory");
++}
+-- 
+2.30.2
+

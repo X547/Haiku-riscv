@@ -1,0 +1,80 @@
+From a597696d5da7e083610f8f114fadf8053298ecd9 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:31:52 +0900
+Subject: virtio_mmio: add (2)
+
+Change-Id: I235118b5b569d4d77b5dabba50976ac2ba94beee
+---
+ .../busses/virtio/virtio_mmio/VirtioDevice.cpp |  2 +-
+ .../busses/virtio/virtio_mmio/virtio_mmio.cpp  | 18 ++++++++++++++----
+ 2 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.cpp b/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.cpp
+index 491c8aa4ad..ac9bbfacd4 100644
+--- a/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.cpp
++++ b/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.cpp
+@@ -114,7 +114,7 @@ status_t VirtioQueue::Enqueue(
+ 	void* cookie
+ )
+ {
+-	int32 firstDesc = -1, lastDesc;
++	int32 firstDesc = -1, lastDesc = -1;
+ 	size_t count = readVectorCount + writtenVectorCount;
+ 	if (count == 0)
+ 		return B_OK;
+diff --git a/src/add-ons/kernel/busses/virtio/virtio_mmio/virtio_mmio.cpp b/src/add-ons/kernel/busses/virtio/virtio_mmio/virtio_mmio.cpp
+index d54f186bc8..35921420b2 100644
+--- a/src/add-ons/kernel/busses/virtio/virtio_mmio/virtio_mmio.cpp
++++ b/src/add-ons/kernel/busses/virtio/virtio_mmio/virtio_mmio.cpp
+@@ -15,6 +15,7 @@
+ #include <drivers/bus/FDT.h>
+ 
+ #include <debug.h>
++#include <AutoDeleterDrivers.h>
+ 
+ #include <virtio.h>
+ #include <virtio_defs.h>
+@@ -91,7 +92,7 @@ virtio_device_register_device(device_node* parent)
+ 	}
+ 
+ 	if (mappedRegs->signature != kVirtioSignature) {
+-		ERROR("bad signature: 0x%08" B_PRIx32 ", should be 0x%08" B_PRIx32 "\n", mappedRegs->signature, kVirtioSignature);
++		ERROR("bad signature: 0x%08" B_PRIx32 ", should be 0x%08" B_PRIx32 "\n", mappedRegs->signature, (uint32)kVirtioSignature);
+ 		return B_ERROR;
+ 	}
+ 
+@@ -119,10 +120,10 @@ virtio_device_init_device(device_node* node, void** cookie)
+ {
+ 	TRACE("init_device(%p)\n", node);
+ 
+-	device_node* parent = gDeviceManager->get_parent_node(node);
++	DeviceNodePutter<&gDeviceManager> parent(gDeviceManager->get_parent_node(node));
+ 	fdt_device_module_info *parentModule;
+ 	fdt_device* parentDev;
+-	if (gDeviceManager->get_driver(parent, (driver_module_info**)&parentModule, (void**)&parentDev))
++	if (gDeviceManager->get_driver(parent.Get(), (driver_module_info**)&parentModule, (void**)&parentDev))
+ 		panic("can't get parent node driver");
+ 
+ 	dprintf("  bus: %p\n", parentModule->get_bus(parentDev));
+@@ -315,8 +316,17 @@ virtio_device_free_queues(virtio_device cookie)
+ 	dev->fQueueCnt = 0;
+ }
+ 
+-
++#ifdef __riscv
+ void WritePC(addr_t adr);
++#else
++
++static inline void
++WritePC(addr_t adr)
++{
++	dprintf("%#" B_PRIxADDR, adr);
++}
++
++#endif
+ 
+ static status_t
+ virtio_device_setup_interrupt(virtio_device cookie,
+-- 
+2.30.2
+

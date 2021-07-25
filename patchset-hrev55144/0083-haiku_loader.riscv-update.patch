@@ -1,0 +1,1512 @@
+From aa0572dbeaabcf3e7288d3d694eab22a09b92ca8 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 00:45:30 +0900
+Subject: haiku_loader.riscv: update
+
+* Moved machine mode code from kernel.
+
+* Added MMU page table generation.
+
+* Added QEMU ramfb video driver.
+
+Change-Id: Icd67cd2e8dbf2b568d81ab8dd0d6127ca3cd97a8
+---
+ src/system/boot/platform/riscv/FwCfg.cpp   | 148 +++++++++
+ src/system/boot/platform/riscv/FwCfg.h     |  86 +++++
+ src/system/boot/platform/riscv/Jamfile     |   3 +
+ src/system/boot/platform/riscv/cpu.cpp     |   8 +-
+ src/system/boot/platform/riscv/entry.S     |  24 +-
+ src/system/boot/platform/riscv/fdt.cpp     | 125 ++++++--
+ src/system/boot/platform/riscv/mmu.cpp     | 355 +++++++++++++++++++--
+ src/system/boot/platform/riscv/mmu.h       |  26 +-
+ src/system/boot/platform/riscv/smp.cpp     |   7 +
+ src/system/boot/platform/riscv/smp.h       |  40 +++
+ src/system/boot/platform/riscv/start.cpp   |  80 ++++-
+ src/system/boot/platform/riscv/traps.cpp   | 164 ++++++++++
+ src/system/boot/platform/riscv/traps.h     |   8 +
+ src/system/boot/platform/riscv/traps_asm.S |  57 ++++
+ src/system/boot/platform/riscv/video.cpp   |   4 +-
+ src/system/boot/platform/riscv/virtio.cpp  |  13 +-
+ 16 files changed, 1077 insertions(+), 71 deletions(-)
+ create mode 100644 src/system/boot/platform/riscv/FwCfg.cpp
+ create mode 100644 src/system/boot/platform/riscv/FwCfg.h
+ create mode 100644 src/system/boot/platform/riscv/smp.cpp
+ create mode 100644 src/system/boot/platform/riscv/smp.h
+ create mode 100644 src/system/boot/platform/riscv/traps.cpp
+ create mode 100644 src/system/boot/platform/riscv/traps.h
+ create mode 100644 src/system/boot/platform/riscv/traps_asm.S
+
+diff --git a/src/system/boot/platform/riscv/FwCfg.cpp b/src/system/boot/platform/riscv/FwCfg.cpp
+new file mode 100644
+index 0000000000..07c62bc645
+--- /dev/null
++++ b/src/system/boot/platform/riscv/FwCfg.cpp
+@@ -0,0 +1,148 @@
++#include "FwCfg.h"
++
++#include <stdlib.h>
++#include <string.h>
++#include <malloc.h>
++
++#include <Htif.h>
++#include <KernelExport.h>
++
++#include "graphics.h"
++
++
++FwCfgRegs *volatile gFwCfgRegs = NULL;
++
++
++#define _B(n)	((unsigned long long)((uint8_t *)&x)[n])
++static inline uint16_t SwapEndian16(uint16_t x)
++{
++	return (_B(0) << 8) | _B(1);
++}
++
++static inline uint32_t SwapEndian32(uint32_t x)
++{
++	return (_B(0) << 24) | (_B(1) << 16) | (_B(2) << 8) | _B(3);
++}
++
++static inline uint64_t SwapEndian64(uint64_t x)
++{
++	return (_B(0) << 56) | (_B(1) << 48) | (_B(2) << 40) | (_B(3) << 32)
++		| (_B(4) << 24) | (_B(5) << 16) | (_B(6) << 8) | _B(7);
++}
++#undef _B
++
++
++namespace FwCfg {
++
++void Select(uint16_t selector)
++{
++	// GCC, why are you so crazy?
++	// gFwCfgRegs->selector = SwapEndian16(selector);
++	*(uint16*)0x10100008 = SwapEndian16(selector);
++}
++
++void DmaOp(uint8_t *bytes, size_t count, uint32_t op)
++{
++	__attribute__ ((aligned (8))) FwCfgDmaAccess volatile dma;
++	dma.control = SwapEndian32(1 << op);
++	dma.length = SwapEndian32(count);
++	dma.address = SwapEndian64((addr_t)bytes);
++	// gFwCfgRegs->dmaAdr = SwapEndian64((addr_t)&dma);
++	*(uint64*)0x10100010 = SwapEndian64((addr_t)&dma);
++	while (uint32_t control = SwapEndian32(dma.control) != 0) {
++		if (((1 << fwCfgDmaFlagsError) & control) != 0)
++			abort();
++	}
++}
++
++void ReadBytes(uint8_t *bytes, size_t count)
++{
++	DmaOp(bytes, count, fwCfgDmaFlagsRead);
++}
++
++void WriteBytes(uint8_t *bytes, size_t count)
++{
++	DmaOp(bytes, count, fwCfgDmaFlagsWrite);
++}
++
++uint8_t  Read8 () {uint8_t  val; ReadBytes(          &val, sizeof(val)); return val;}
++uint16_t Read16() {uint16_t val; ReadBytes((uint8_t*)&val, sizeof(val)); return val;}
++uint32_t Read32() {uint32_t val; ReadBytes((uint8_t*)&val, sizeof(val)); return val;}
++uint64_t Read64() {uint64_t val; ReadBytes((uint8_t*)&val, sizeof(val)); return val;}
++
++
++void ListDir()
++{
++	uint32_t count = SwapEndian32(Read32());
++	dprintf("count: %" B_PRIu32 "\n", count);
++	for (uint32_t i = 0; i < count; i++) {
++		FwCfgFile file;
++		ReadBytes((uint8_t*)&file, sizeof(file));
++		file.size = SwapEndian32(file.size);
++		file.select = SwapEndian16(file.select);
++		file.reserved = SwapEndian16(file.reserved);
++		dprintf("\n");
++		dprintf("size: %" B_PRIu32 "\n", file.size);
++		dprintf("select: %" B_PRIu32 "\n", file.select);
++		dprintf("reserved: %" B_PRIu32 "\n", file.reserved);
++		dprintf("name: %s\n", file.name);
++	}
++}
++
++bool ThisFile(FwCfgFile& file, uint16_t dir, const char *name)
++{
++	Select(dir);
++	uint32_t count = SwapEndian32(Read32());
++	for (uint32_t i = 0; i < count; i++) {
++		ReadBytes((uint8_t*)&file, sizeof(file));
++		file.size = SwapEndian32(file.size);
++		file.select = SwapEndian16(file.select);
++		file.reserved = SwapEndian16(file.reserved);
++		if (strcmp(file.name, name) == 0)
++			return true;
++	}
++	return false;
++}
++
++void InitFramebuffer()
++{
++	FwCfgFile file;
++	if (!ThisFile(file, fwCfgSelectFileDir, "etc/ramfb")) {
++		dprintf("[!] ramfb not found\n");
++		return;
++	}
++	dprintf("file.select: %" B_PRIu16 "\n", file.select);
++
++	RamFbCfg cfg;
++	uint32_t width = 1024, height = 768;
++
++	gFramebuf.colors = (uint32_t*)malloc(4*width*height);
++	gFramebuf.stride = width;
++	gFramebuf.width = width;
++	gFramebuf.height = height;
++
++	cfg.addr = SwapEndian64((size_t)gFramebuf.colors);
++	cfg.fourcc = SwapEndian32(ramFbFormatXrgb8888);
++	cfg.flags = SwapEndian32(0);
++	cfg.width = SwapEndian32(width);
++	cfg.height = SwapEndian32(height);
++	cfg.stride = SwapEndian32(4*width);
++	Select(file.select);
++	WriteBytes((uint8_t*)&cfg, sizeof(cfg));
++}
++
++void Init()
++{
++	dprintf("gFwCfgRegs: 0x%08" B_PRIx64 "\n", (addr_t)gFwCfgRegs);
++	if (gFwCfgRegs == NULL)
++		return;
++	Select(fwCfgSelectSignature);
++	dprintf("fwCfgSelectSignature: 0x%08" B_PRIx32 "\n", Read32());
++	Select(fwCfgSelectId);
++	dprintf("fwCfgSelectId: : 0x%08" B_PRIx32 "\n", Read32());
++	Select(fwCfgSelectFileDir);
++	ListDir();
++	InitFramebuffer();
++}
++
++};
+diff --git a/src/system/boot/platform/riscv/FwCfg.h b/src/system/boot/platform/riscv/FwCfg.h
+new file mode 100644
+index 0000000000..d99c6b52e7
+--- /dev/null
++++ b/src/system/boot/platform/riscv/FwCfg.h
+@@ -0,0 +1,86 @@
++#ifndef _FWCFG_H_
++#define _FWCFG_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++enum {
++	fwCfgSelectSignature = 0x0000,
++	fwCfgSelectId        = 0x0001,
++	fwCfgSelectFileDir   = 0x0019,
++	fwCfgSelectFileFirst = 0x0020,
++};
++
++enum {
++	fwCfgSignature = 0x554D4551,
++
++	fwCfgIdTraditional   = 0,
++	fwCfgIdDma           = 1,
++};
++
++enum {
++	fwCfgDmaFlagsError  = 0,
++	fwCfgDmaFlagsRead   = 1,
++	fwCfgDmaFlagsSkip   = 2,
++	fwCfgDmaFlagsSelect = 3,
++	fwCfgDmaFlagsWrite  = 4,
++};
++
++// integer values are big endian
++struct __attribute__((packed)) FwCfgFile {
++    uint32_t size;
++    uint16_t select;
++    uint16_t reserved;
++    char name[56]; // '/0' terminated
++};
++
++struct __attribute__((packed)) FwCfgFiles {
++    uint32_t count;
++    FwCfgFile f[];
++};
++
++struct __attribute__((packed)) FwCfgDmaAccess {
++    uint32_t control;
++    uint32_t length;
++    uint64_t address;
++};
++
++
++struct __attribute__((packed)) FwCfgRegs {
++	uint64_t data;
++	uint16_t selector;
++	uint16_t unused1;
++	uint32_t unused2;
++	uint64_t dmaAdr;
++};
++
++
++// ramfb
++
++enum {
++	ramFbFormatXrgb8888 =  ((uint32_t)('X') | ((uint32_t)('R') << 8) | ((uint32_t)('2') << 16) | ((uint32_t)('4') << 24)),
++};
++
++// all fields are big endian
++struct __attribute__((packed)) RamFbCfg {
++	uint64_t addr;
++	uint32_t fourcc;
++	uint32_t flags;
++	uint32_t width;
++	uint32_t height;
++	uint32_t stride;
++};
++
++
++extern FwCfgRegs *volatile gFwCfgRegs;
++
++
++namespace FwCfg {
++
++void Init();
++
++};
++
++
++#endif	// _FWCFG_H_
+diff --git a/src/system/boot/platform/riscv/Jamfile b/src/system/boot/platform/riscv/Jamfile
+index f68b501b0f..c1349cfb1b 100644
+--- a/src/system/boot/platform/riscv/Jamfile
++++ b/src/system/boot/platform/riscv/Jamfile
+@@ -38,7 +38,10 @@ for platform in [ MultiBootSubDirSetup riscv ] {
+ 			graphics.cpp
+ 			fixed_font.S
+ 			htif.cpp
++			FwCfg.cpp
+ 			virtio.cpp
++			traps.cpp
++			traps_asm.S
+ 			entry.S
+ 
+ 			: :
+diff --git a/src/system/boot/platform/riscv/cpu.cpp b/src/system/boot/platform/riscv/cpu.cpp
+index af19c5d768..4c41f9fdb2 100644
+--- a/src/system/boot/platform/riscv/cpu.cpp
++++ b/src/system/boot/platform/riscv/cpu.cpp
+@@ -35,10 +35,10 @@ cpu_init()
+ {
+ 	gKernelArgs.num_cpus = 1;
+ 
+-	// enable FPU
+-	MstatusReg status(Mstatus());
+-	status.fs = extStatusInitial;
+-	SetMstatus(status.val);
++	SstatusReg status(Sstatus());
++	status.fs = extStatusInitial; // enable FPU
++	status.xs = extStatusOff;
++	SetSstatus(status.val);
+ }
+ 
+ 
+diff --git a/src/system/boot/platform/riscv/entry.S b/src/system/boot/platform/riscv/entry.S
+index 185c000ddb..2c1dc948b4 100644
+--- a/src/system/boot/platform/riscv/entry.S
++++ b/src/system/boot/platform/riscv/entry.S
+@@ -7,24 +7,30 @@
+ 
+     .text
+ 
+-/*  status_t arch_enter_kernel(struct kernel_args* kernelArgs,
++/*  status_t arch_enter_kernel(uint64 satp, struct kernel_args *kernelArgs,
+         addr_t kernelEntry, addr_t kernelStackTop);
+ 
+-    a0  - kernelArgs
+-    a1  - kernelEntry
+-    a2  - kernelStackTop
++    a0  - SATP register value
++    a1  - kernelArgs
++    a2  - kernelEntry
++    a3  - kernelStackTop
+ */
+ FUNCTION(arch_enter_kernel):
++	csrw satp, a0
++	sfence.vma
++
+ 	// set the kernel stack
+-	mv	sp,a2
++	mv	sp, a3
++#	li	fp, 0
++#	li  ra, 0
+ 
+ 	// Setup kernel args
+-	//mv	a0,a0	// kernelArgs
+-	mv	a4,a1
+-	li	a1,0	// currentCPU=0
++	mv	a0, a1	// kernelArgs
++	mv	t0, a2
++	li	a1, 0	// currentCPU=0
+ 
+ 	// call the kernel
+-	jr	a4
++	jr	t0
+ 
+ 	// return
+ 	li	a0,-1  // B_ERROR
+diff --git a/src/system/boot/platform/riscv/fdt.cpp b/src/system/boot/platform/riscv/fdt.cpp
+index d7d656a873..80cb0692e9 100644
+--- a/src/system/boot/platform/riscv/fdt.cpp
++++ b/src/system/boot/platform/riscv/fdt.cpp
+@@ -17,45 +17,117 @@ extern "C" {
+ #include "mmu.h"
+ #include "graphics.h"
+ #include "virtio.h"
++#include "Htif.h"
++#include "Clint.h"
++#include "FwCfg.h"
+ 
+ 
+ void* gFdt = NULL;
++ClintRegs *volatile gClintRegs = NULL;
++
++static uint64 sTimerFrequrency = 10000000;
++
++static addr_range sPlic = {0};
++static addr_range sClint = {0};
++static ArchUart sUart = {.kind = kUartKindNone};
++
++
++static bool
++HasFdtString(const char* prop, int size, const char* pattern)
++{
++	int patternLen = strlen(pattern);
++	const char* propEnd = prop + size;
++	while (propEnd - prop > 0) {
++		int curLen = strlen(prop);
++		if (curLen == patternLen && memcmp(prop, pattern, curLen + 1) == 0)
++			return true;
++		prop += curLen + 1;
++	}
++	return false;
++}
++
++
++static uint32
++GetInterrupt(const void* fdt, int node)
++{
++	if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "interrupts-extended", NULL)) {
++		return fdt32_to_cpu(*(prop + 1));
++	}
++	if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "interrupts", NULL)) {
++		return fdt32_to_cpu(*prop);
++	}
++	dprintf("[!] no interrupt field\n");
++	return 0;
++}
+ 
+ 
+ static void
+-HandleFdt(const void* fdt, int node, uint32_t addressCells, uint32_t sizeCells,
+-	uint32_t interruptCells /* from parent node */)
++HandleFdt(const void* fdt, int node, uint32 addressCells, uint32 sizeCells,
++	uint32 interruptCells /* from parent node */)
+ {
+ 	// TODO: handle different field sizes
+ 
++	const char* name = fdt_get_name(fdt, node, NULL);
++	if (strcmp(name, "cpus") == 0) {
++		if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "timebase-frequency", NULL))
++			sTimerFrequrency = fdt32_to_cpu(*prop);
++	}
++
+ 	const char* device_type = (const char*)fdt_getprop(fdt, node,
+ 		"device_type", NULL);
+ 	if (device_type != NULL && strcmp(device_type, "memory") == 0) {
+-		gMemBase = (uint8*)fdt64_to_cpu(*((uint64_t*)fdt_getprop(fdt, node,
++		gMemBase = (uint8*)fdt64_to_cpu(*((uint64*)fdt_getprop(fdt, node,
+ 			"reg", NULL) + 0));
+-		gTotalMem = fdt64_to_cpu(*((uint64_t*)fdt_getprop(fdt, node,
++		gTotalMem = fdt64_to_cpu(*((uint64*)fdt_getprop(fdt, node,
+ 			"reg", NULL) + 1));
+ 		return;
+ 	}
++	int compatibleLen;
+ 	const char* compatible = (const char*)fdt_getprop(fdt, node,
+-		"compatible", NULL);
++		"compatible", &compatibleLen);
+ 	if (compatible == NULL) return;
+-	if (strcmp(compatible, "virtio,mmio") == 0) {
++	if (HasFdtString(compatible, compatibleLen, "riscv,clint0")) {
++		uint64* reg = (uint64*)fdt_getprop(fdt, node, "reg", NULL);
++		sClint.start = fdt64_to_cpu(*(reg + 0));
++		sClint.size  = fdt64_to_cpu(*(reg + 1));
++		gClintRegs = (ClintRegs*)sClint.start;
++	} else if (HasFdtString(compatible, compatibleLen, "riscv,plic0")) {
++		uint64* reg = (uint64*)fdt_getprop(fdt, node, "reg", NULL);
++		sPlic.start = fdt64_to_cpu(*(reg + 0));
++		sPlic.size  = fdt64_to_cpu(*(reg + 1));
++	} else if (HasFdtString(compatible, compatibleLen, "virtio,mmio")) {
++		uint64* reg = (uint64*)fdt_getprop(fdt, node, "reg", NULL);
+ 		virtio_register(
+-			fdt64_to_cpu(*((uint64_t*)fdt_getprop(fdt, node, "reg", NULL) + 0)),
+-			fdt64_to_cpu(*((uint64_t*)fdt_getprop(fdt, node, "reg", NULL) + 1)),
+-			fdt32_to_cpu(*((uint32_t*)fdt_getprop(fdt, node,
+-				"interrupts-extended", NULL) + 1))
+-		);
+-	} else if (strcmp(compatible, "simple-framebuffer") == 0) {
+-		gFramebuf.colors = (uint32_t*)fdt64_to_cpu(
+-			*(uint64_t*)fdt_getprop(fdt, node, "reg", NULL));
++			fdt64_to_cpu(*(reg + 0)), fdt64_to_cpu(*(reg + 1)),
++			GetInterrupt(fdt, node));
++	} else if (
++		sUart.kind == kUartKindNone && (
++			HasFdtString(compatible, compatibleLen, "ns16550a") ||
++			HasFdtString(compatible, compatibleLen, "sifive,uart0"))
++	) {
++		if (HasFdtString(compatible, compatibleLen, "ns16550a"))
++			sUart.kind = kUartKind8250;
++		else if (HasFdtString(compatible, compatibleLen, "sifive,uart0"))
++			sUart.kind = kUartKindSifive;
++
++		uint64* reg = (uint64*)fdt_getprop(fdt, node, "reg", NULL);
++		sUart.regs.start = fdt64_to_cpu(*(reg + 0));
++		sUart.regs.size  = fdt64_to_cpu(*(reg + 1));
++		sUart.irq = GetInterrupt(fdt, node);
++		const void* prop = fdt_getprop(fdt, node, "clock-frequency", NULL);
++		sUart.clock = (prop == NULL) ? 0 : fdt32_to_cpu(*(uint32*)prop);
++	} else if (HasFdtString(compatible, compatibleLen, "qemu,fw-cfg-mmio")) {
++		gFwCfgRegs = (FwCfgRegs *volatile)
++			fdt64_to_cpu(*(uint64*)fdt_getprop(fdt, node, "reg", NULL));
++	} else if (HasFdtString(compatible, compatibleLen, "simple-framebuffer")) {
++		gFramebuf.colors = (uint32*)fdt64_to_cpu(
++			*(uint64*)fdt_getprop(fdt, node, "reg", NULL));
+ 		gFramebuf.stride = fdt32_to_cpu(
+-			*(uint32_t*)fdt_getprop(fdt, node, "stride", NULL)) / 4;
++			*(uint32*)fdt_getprop(fdt, node, "stride", NULL)) / 4;
+ 		gFramebuf.width = fdt32_to_cpu(
+-			*(uint32_t*)fdt_getprop(fdt, node, "width", NULL));
++			*(uint32*)fdt_getprop(fdt, node, "width", NULL));
+ 		gFramebuf.height = fdt32_to_cpu(
+-			*(uint32_t*)fdt_getprop(fdt, node, "height", NULL));
++			*(uint32*)fdt_getprop(fdt, node, "height", NULL));
+ 	}
+ }
+ 
+@@ -74,9 +146,9 @@ fdt_init(void* fdt)
+ 	dprintf("FDT valid, size: %" B_PRIu32 "\n", fdt_totalsize(gFdt));
+ 
+ 	int node = -1;
+-	int depth = 0;
+-	while ((node = fdt_next_node(gFdt, node, &depth)) >= 0) {
+-		HandleFdt(gFdt, node, 2, 2, 2);
++	int depth = -1;
++	while ((node = fdt_next_node(gFdt, node, &depth)) >= 0 && depth >= 0) {
++		HandleFdt(gFdt, node, 2, 2, 1);
+ 	}
+ }
+ 
+@@ -85,8 +157,17 @@ void
+ fdt_set_kernel_args()
+ {
+ 	gKernelArgs.arch_args.fdt = kernel_args_malloc(fdt_totalsize(gFdt));
+-	if (gKernelArgs.arch_args.fdt != NULL) {
++	if (gKernelArgs.arch_args.fdt != NULL)
+ 		memcpy(gKernelArgs.arch_args.fdt, gFdt, fdt_totalsize(gFdt));
+-	} else
++	else
+ 		panic("unable to malloc for FDT!\n");
++
++	gKernelArgs.arch_args.timerFrequrency = 1000000/*sTimerFrequrency*/;
++
++	gKernelArgs.arch_args.htif.start = (addr_t)gHtifRegs;
++	gKernelArgs.arch_args.htif.size = sizeof(HtifRegs);
++
++	gKernelArgs.arch_args.plic  = sPlic;
++	gKernelArgs.arch_args.clint = sClint;
++	gKernelArgs.arch_args.uart  = sUart;
+ }
+diff --git a/src/system/boot/platform/riscv/mmu.cpp b/src/system/boot/platform/riscv/mmu.cpp
+index 4a9a95f744..21a6425eb6 100644
+--- a/src/system/boot/platform/riscv/mmu.cpp
++++ b/src/system/boot/platform/riscv/mmu.cpp
+@@ -15,31 +15,296 @@
+ #include <arch/cpu.h>
+ #include <arch_kernel.h>
+ #include <kernel.h>
++#include <AutoDeleter.h>
+ 
+ #include <OS.h>
+ 
+ #include <string.h>
+ 
++
++struct MemoryRegion
++{
++	MemoryRegion* next;
++	addr_t virtAdr;
++	phys_addr_t physAdr;
++	size_t size;
++	uint32 protection;
++};
++
++
+ extern uint8 gStackEnd;
+ 
+ uint8* gMemBase = NULL;
+ size_t gTotalMem = 0;
+ uint8* gFreeMem = &gStackEnd;
++addr_t gFreeVirtMem = KERNEL_LOAD_BASE_64_BIT;
++
++MemoryRegion* sRegions = NULL;
++
++ssize_t gVirtFromPhysOffset = 0;
++phys_addr_t sPageTable = 0;
++
++
++static void
++WritePteFlags(uint32 flags)
++{
++	bool first = true;
++	dprintf("{");
++	for (uint32 i = 0; i < 32; i++) {
++		if ((1 << i) & flags) {
++			if (first) first = false; else dprintf(", ");
++			switch (i) {
++			case pteValid:    dprintf("valid"); break;
++			case pteRead:     dprintf("read"); break;
++			case pteWrite:    dprintf("write"); break;
++			case pteExec:     dprintf("exec"); break;
++			case pteUser:     dprintf("user"); break;
++			case pteGlobal:   dprintf("global"); break;
++			case pteAccessed: dprintf("accessed"); break;
++			case pteDirty:    dprintf("dirty"); break;
++			default:          dprintf("%" B_PRIu32, i);
++			}
++		}
++	}
++	dprintf("}");
++}
++
++
++static phys_addr_t
++AllocPhysPages(size_t size)
++{
++	size = ROUNDUP(size, B_PAGE_SIZE);
++	phys_addr_t adr = ROUNDUP((addr_t)gFreeMem, B_PAGE_SIZE);
++
++	if (adr + size - (addr_t)gMemBase > gTotalMem)
++		return 0;
++
++	gFreeMem = (uint8*)(adr + size);
++
++	return adr;
++}
++
++
++static phys_addr_t
++AllocPhysPage()
++{
++	return AllocPhysPages(B_PAGE_SIZE);
++}
++
++
++static void
++FreePhysPages(phys_addr_t physAdr, size_t size)
++{
++	if (physAdr + size == (phys_addr_t)gFreeMem)
++		gFreeMem -= size;
++}
++
++
++static phys_addr_t
++AllocVirtPages(size_t size)
++{
++	size = ROUNDUP(size, B_PAGE_SIZE);
++	phys_addr_t adr = ROUNDUP(gFreeVirtMem, B_PAGE_SIZE);
++	gFreeVirtMem = adr + size;
++
++	return adr;
++}
++
++
++static void
++FreeVirtPages(addr_t virtAdr, size_t size)
++{
++	if (virtAdr + size == gFreeVirtMem)
++		gFreeVirtMem -= size;
++}
++
++
++static inline void*
++VirtFromPhys(phys_addr_t physAdr)
++{
++	return (void*)physAdr;
++}
++
++
++static inline phys_addr_t
++PhysFromVirt(void* virtAdr)
++{
++	return (phys_addr_t)virtAdr;
++}
++
++
++static Pte*
++LookupPte(addr_t virtAdr, bool alloc)
++{
++	Pte *pte = (Pte*)VirtFromPhys(sPageTable);
++	for (int level = 2; level > 0; level--) {
++		pte += VirtAdrPte(virtAdr, level);
++		if (!((1 << pteValid) & pte->flags)) {
++			if (!alloc)
++				return NULL;
++			pte->ppn = AllocPhysPage() / B_PAGE_SIZE;
++			if (pte->ppn == 0)
++				return NULL;
++			memset((Pte*)VirtFromPhys(B_PAGE_SIZE * pte->ppn), 0, B_PAGE_SIZE);
++			pte->flags |= (1 << pteValid);
++		}
++		pte = (Pte*)VirtFromPhys(B_PAGE_SIZE * pte->ppn);
++	}
++	pte += VirtAdrPte(virtAdr, 0);
++	return pte;
++}
++
++
++static void
++Map(addr_t virtAdr, phys_addr_t physAdr, uint64 flags)
++{
++	// dprintf("Map(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR ")\n", virtAdr, physAdr);
++	Pte* pte = LookupPte(virtAdr, true);
++	if (pte == NULL)
++		panic("can't allocate page table");
++
++	pte->ppn = physAdr / B_PAGE_SIZE;
++	pte->flags = (1 << pteValid) | (1 << pteAccessed) | (1 << pteDirty) | flags;
++}
++
++
++static void
++MapRange(addr_t virtAdr, phys_addr_t physAdr, size_t size, uint64 flags)
++{
++	dprintf("MapRange(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR ", 0x%"
++		B_PRIxADDR ", ", virtAdr, physAdr, size);
++	WritePteFlags(flags);
++	dprintf(")\n");
++	for (size_t i = 0; i < size; i += B_PAGE_SIZE)
++		Map(virtAdr + i, physAdr + i, flags);
++
++	ASSERT_ALWAYS(insert_virtual_allocated_range(virtAdr, size) >= B_OK);
++}
++
++
++static void
++MapRangeIdentity(addr_t adr, size_t size, uint64 flags)
++{
++	MapRange(adr, adr, size, flags);
++}
++
++
++static void
++MapAddrRange(addr_range& range, uint64 flags)
++{
++	phys_addr_t physAdr = range.start;
++	range.start = AllocVirtPages(range.size);
++
++	MapRange(range.start, physAdr, range.size, flags);
++
++	if (gKernelArgs.arch_args.num_virtual_ranges_to_keep
++		>= MAX_VIRTUAL_RANGES_TO_KEEP)
++		panic("too many virtual ranges to keep");
++
++	gKernelArgs.arch_args.virtual_ranges_to_keep[
++		gKernelArgs.arch_args.num_virtual_ranges_to_keep++] = range;
++}
++
++
++static void
++PreallocKernelRange()
++{
++	Pte *root = (Pte*)VirtFromPhys(sPageTable);
++	for (uint64 i = VirtAdrPte(KERNEL_BASE, 2); i <= VirtAdrPte(KERNEL_TOP, 2);
++		i++) {
++		Pte* pte = &root[i];
++		pte->ppn = AllocPhysPage() / B_PAGE_SIZE;
++		if (pte->ppn == 0) panic("can't alloc early physical page");
++		memset(VirtFromPhys(B_PAGE_SIZE * pte->ppn), 0, B_PAGE_SIZE);
++		pte->flags |= (1 << pteValid);
++	}
++}
++
++
++static void
++SetupPageTable()
++{
++	sPageTable = AllocPhysPage();
++	memset(VirtFromPhys(sPageTable), 0, B_PAGE_SIZE);
++
++	PreallocKernelRange();
++
++	// Physical memory mapping
++	gKernelArgs.arch_args.physMap.size
++		= gKernelArgs.physical_memory_range[0].size;
++	gKernelArgs.arch_args.physMap.start = KERNEL_TOP + 1
++		- gKernelArgs.arch_args.physMap.size;
++	MapRange(gKernelArgs.arch_args.physMap.start,
++		gKernelArgs.physical_memory_range[0].start,
++		gKernelArgs.arch_args.physMap.size,
++		(1 << pteRead) | (1 << pteWrite));
++
++	// Boot loader
++	MapRangeIdentity((addr_t)gMemBase, &gStackEnd - gMemBase,
++		(1 << pteRead) | (1 << pteWrite) | (1 << pteExec));
++
++	// Memory regions
++	MemoryRegion* region;
++	for (region = sRegions; region != NULL; region = region->next) {
++		uint64 flags = 0;
++		if ((region->protection & B_READ_AREA) != 0)
++			flags |= (1 << pteRead);
++		if ((region->protection & B_WRITE_AREA) != 0)
++			flags |= (1 << pteWrite);
++		if ((region->protection & B_EXECUTE_AREA) != 0)
++			flags |= (1 << pteExec);
++		MapRange(region->virtAdr, region->physAdr, region->size, flags);
++	}
++
++	// Devices
++	MapAddrRange(gKernelArgs.arch_args.clint, (1 << pteRead) | (1 << pteWrite));
++	MapAddrRange(gKernelArgs.arch_args.htif, (1 << pteRead) | (1 << pteWrite));
++	MapAddrRange(gKernelArgs.arch_args.plic, (1 << pteRead) | (1 << pteWrite));
++	if (gKernelArgs.arch_args.uart.kind != kUartKindNone) {
++		MapAddrRange(gKernelArgs.arch_args.uart.regs,
++			(1 << pteRead) | (1 << pteWrite));
++	}
++}
++
++
++static uint64
++GetSatp()
++{
++	SatpReg satp;
++	satp.ppn = sPageTable / B_PAGE_SIZE;
++	satp.asid = 0;
++	satp.mode = satpModeSv39;
++	return satp.val;
++}
+ 
+ 
+ //	#pragma mark -
+ 
+ extern "C" status_t
+-platform_allocate_region(void** _address, size_t size, uint8 protection,
++platform_allocate_region(void** address, size_t size, uint8 protection,
+ 	bool exactAddress)
+ {
++	size = ROUNDUP(size, B_PAGE_SIZE);
++
+ 	if (exactAddress)
+ 		return B_ERROR;
+ 
+-	gFreeMem = (uint8*)(((addr_t)gFreeMem
+-		+ (B_PAGE_SIZE - 1)) / B_PAGE_SIZE * B_PAGE_SIZE);
+-	*_address = gFreeMem;
+-	gFreeMem += size;
++	ObjectDeleter<MemoryRegion> region(new(std::nothrow) MemoryRegion());
++	if (!region.IsSet())
++		return B_NO_MEMORY;
++
++	region->physAdr = AllocPhysPages(size);
++	if (region->physAdr == 0)
++		return B_NO_MEMORY;
++
++	region->virtAdr = AllocVirtPages(size);
++	region->size = size;
++	region->protection = protection;
++
++	*address = (void*)region->physAdr;
++
++	region->next = sRegions;
++	sRegions = region.Detach();
+ 
+ 	return B_OK;
+ }
+@@ -48,6 +313,25 @@ platform_allocate_region(void** _address, size_t size, uint8 protection,
+ extern "C" status_t
+ platform_free_region(void* address, size_t size)
+ {
++	MemoryRegion* prev = NULL;
++	MemoryRegion* region = sRegions;
++	while (region != NULL && !(region->physAdr == (phys_addr_t)address)) {
++		prev = region;
++		region = region->next;
++	}
++	if (region == NULL) {
++		panic("platform_free_region: address %p is not allocated\n", address);
++		return B_ERROR;
++	}
++	FreePhysPages(region->physAdr, region->size);
++	FreeVirtPages(region->virtAdr, region->size);
++	if (prev == NULL)
++		sRegions = region->next;
++	else
++		prev->next = region->next;
++
++	delete region;
++
+ 	return B_OK;
+ }
+ 
+@@ -61,27 +345,44 @@ platform_release_heap(struct stage2_args* args, void* base)
+ status_t
+ platform_init_heap(struct stage2_args* args, void** _base, void** _top)
+ {
+-	void* heap = (void*)gFreeMem;
+-	gFreeMem += args->heap_size;
++	addr_t heap = AllocPhysPages(args->heap_size);
++	if (heap == 0)
++		return B_NO_MEMORY;
+ 
+-	*_base = heap;
+-	*_top = (void*)((int8*)heap + args->heap_size);
++	*_base = (void*)heap;
++	*_top = (void*)(heap + args->heap_size);
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-platform_bootloader_address_to_kernel_address(void* address, addr_t* _result)
++platform_bootloader_address_to_kernel_address(void* address, addr_t* result)
+ {
+-	*_result = (addr_t)address;
++	MemoryRegion* region = sRegions;
++	while (region != NULL && !((phys_addr_t)address >= region->physAdr
++		&& (phys_addr_t)address < region->physAdr + region->size))
++		region = region->next;
++
++	if (region == NULL)
++		return B_ERROR;
++
++	*result = (addr_t)address - region->physAdr + region->virtAdr;
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-platform_kernel_address_to_bootloader_address(addr_t address, void** _result)
++platform_kernel_address_to_bootloader_address(addr_t address, void** result)
+ {
+-	*_result = (void*)address;
++	MemoryRegion* region = sRegions;
++	while (region != NULL && !((phys_addr_t)address >= region->virtAdr
++		&& (phys_addr_t)address < region->virtAdr + region->size))
++		region = region->next;
++
++	if (region == NULL)
++		return B_ERROR;
++
++	*result = (void*)(address - region->virtAdr + region->physAdr);
+ 	return B_OK;
+ }
+ 
+@@ -95,29 +396,33 @@ mmu_init(void)
+ 
+ 
+ void
+-mmu_init_for_kernel(void)
++mmu_init_for_kernel(addr_t& satp)
+ {
+ 	// map in a kernel stack
+ 	void* stack_address = NULL;
+ 	if (platform_allocate_region(&stack_address,
+-		KERNEL_STACK_SIZE + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE, 0, false)
++		KERNEL_STACK_SIZE + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE,
++		B_READ_AREA | B_WRITE_AREA, false)
+ 		!= B_OK) {
+ 		panic("Unabled to allocate a stack");
+ 	}
+-	gKernelArgs.cpu_kstack[0].start = (addr_t)stack_address;
++	gKernelArgs.cpu_kstack[0].start = fix_address((addr_t)stack_address);
+ 	gKernelArgs.cpu_kstack[0].size = KERNEL_STACK_SIZE
+ 		+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE;
+ 	dprintf("Kernel stack at %#lx\n", gKernelArgs.cpu_kstack[0].start);
+ 
+-	gKernelArgs.physical_memory_range[0].start = (addr_t)gMemBase;
+-	gKernelArgs.physical_memory_range[0].size = gTotalMem;
+-	gKernelArgs.num_physical_memory_ranges = 1;
++	gKernelArgs.num_physical_memory_ranges = 0;
++	insert_physical_memory_range((addr_t)gMemBase, gTotalMem);
++
++	gKernelArgs.num_virtual_allocated_ranges = 0;
++	gKernelArgs.arch_args.num_virtual_ranges_to_keep = 0;
++
++	SetupPageTable();
++	satp = GetSatp();
++	dprintf("satp: %#" B_PRIx64 "\n", satp);
+ 
+-	gKernelArgs.physical_allocated_range[0].start = (addr_t)gMemBase;
+-	gKernelArgs.physical_allocated_range[0].size = gFreeMem - gMemBase;
+-	gKernelArgs.num_physical_allocated_ranges = 1;
++	gKernelArgs.num_physical_allocated_ranges = 0;
++	insert_physical_allocated_range((addr_t)gMemBase, gFreeMem - gMemBase);
+ 
+-	gKernelArgs.virtual_allocated_range[0].start = (addr_t)gMemBase;
+-	gKernelArgs.virtual_allocated_range[0].size = gFreeMem - gMemBase;
+-	gKernelArgs.num_virtual_allocated_ranges = 1;
++	sort_address_ranges(gKernelArgs.virtual_allocated_range, gKernelArgs.num_virtual_allocated_ranges);
+ }
+diff --git a/src/system/boot/platform/riscv/mmu.h b/src/system/boot/platform/riscv/mmu.h
+index 17f202f987..6b66fcecdd 100644
+--- a/src/system/boot/platform/riscv/mmu.h
++++ b/src/system/boot/platform/riscv/mmu.h
+@@ -10,13 +10,37 @@
+ 
+ #include <SupportDefs.h>
+ 
++#include <boot/platform.h>
++#include <util/FixedWidthPointer.h>
++
+ 
+ extern uint8* gMemBase;
+ extern size_t gTotalMem;
+ 
+ 
+ void mmu_init();
+-void mmu_init_for_kernel();
++void mmu_init_for_kernel(addr_t& satp);
++
++
++inline addr_t
++fix_address(addr_t address)
++{
++	addr_t result;
++	if (platform_bootloader_address_to_kernel_address((void *)address, &result)
++		!= B_OK)
++		return address;
++
++	return result;
++}
++
++
++template<typename Type>
++inline void
++fix_address(FixedWidthPointer<Type>& p)
++{
++	if (p != NULL)
++		p.SetTo(fix_address(p.Get()));
++}
+ 
+ 
+ #endif	/* MMU_H */
+diff --git a/src/system/boot/platform/riscv/smp.cpp b/src/system/boot/platform/riscv/smp.cpp
+new file mode 100644
+index 0000000000..39e91d8ed5
+--- /dev/null
++++ b/src/system/boot/platform/riscv/smp.cpp
+@@ -0,0 +1,7 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "smp.h"
+diff --git a/src/system/boot/platform/riscv/smp.h b/src/system/boot/platform/riscv/smp.h
+new file mode 100644
+index 0000000000..21103dd8d3
+--- /dev/null
++++ b/src/system/boot/platform/riscv/smp.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#ifndef _SMP_H_
++#define _SMP_H_
++
++
++#include <SupportDefs.h>
++
++
++struct Mutex
++{
++	int32 fLock;
++	
++	Mutex(): fLock(0) {}
++
++	bool TryLock()
++	{
++		return atomic_test_and_set(&fLock, -1, 0) == 0;
++	}
++
++	bool Lock()
++	{
++		while (!TryLock()) {}
++		if (atomic_add(&fLock, -1) < 0) {
++		}
++		return true;
++	}
++	
++	void Unlock()
++	{
++		atomic_add(&fLock, 1);
++	}
++};
++
++
++#endif	// _SMP_H_
+diff --git a/src/system/boot/platform/riscv/start.cpp b/src/system/boot/platform/riscv/start.cpp
+index fc21aa14d6..686dec70fc 100644
+--- a/src/system/boot/platform/riscv/start.cpp
++++ b/src/system/boot/platform/riscv/start.cpp
+@@ -16,6 +16,8 @@
+ #include "console.h"
+ #include "cpu.h"
+ #include "mmu.h"
++#include "smp.h"
++#include "traps.h"
+ #include "fdt.h"
+ #include "Htif.h"
+ #include "virtio.h"
+@@ -32,8 +34,8 @@ extern uint8 _end;
+ 
+ extern "C" int main(stage2_args* args);
+ extern "C" void _start(int hartId, void* fdt);
+-extern "C" status_t arch_enter_kernel(struct kernel_args* kernelArgs,
+-	addr_t kernelEntry, addr_t kernelStackTop);;
++extern "C" status_t arch_enter_kernel(uint64 satp,
++	struct kernel_args* kernelArgs, addr_t kernelEntry, addr_t kernelStackTop);
+ 
+ 
+ static uint32 sBootOptions;
+@@ -90,10 +92,70 @@ platform_boot_options(void)
+ }
+ 
+ 
++static void
++convert_preloaded_image(preloaded_elf64_image* image)
++{
++	fix_address(image->next);
++	fix_address(image->name);
++	fix_address(image->debug_string_table);
++	fix_address(image->syms);
++	fix_address(image->rel);
++	fix_address(image->rela);
++	fix_address(image->pltrel);
++	fix_address(image->debug_symbols);
++}
++
++
++static void
++convert_kernel_args()
++{
++	if (gKernelArgs.kernel_image->elf_class != ELFCLASS64)
++		return;
++
++	fix_address(gKernelArgs.boot_volume);
++	fix_address(gKernelArgs.vesa_modes);
++	fix_address(gKernelArgs.edid_info);
++	fix_address(gKernelArgs.debug_output);
++	fix_address(gKernelArgs.boot_splash);
++	#if defined(__x86_64__) || defined(__x86__)
++	fix_address(gKernelArgs.ucode_data);
++	fix_address(gKernelArgs.arch_args.apic);
++	fix_address(gKernelArgs.arch_args.hpet);
++	#endif
++	fix_address(gKernelArgs.arch_args.fdt);
++
++	convert_preloaded_image(static_cast<preloaded_elf64_image*>(
++		gKernelArgs.kernel_image.Pointer()));
++	fix_address(gKernelArgs.kernel_image);
++
++	// Iterate over the preloaded images. Must save the next address before
++	// converting, as the next pointer will be converted.
++	preloaded_image* image = gKernelArgs.preloaded_images;
++	fix_address(gKernelArgs.preloaded_images);
++	while (image != NULL) {
++		preloaded_image* next = image->next;
++		convert_preloaded_image(static_cast<preloaded_elf64_image*>(image));
++		image = next;
++	}
++
++	// Fix driver settings files.
++	driver_settings_file* file = gKernelArgs.driver_settings;
++	fix_address(gKernelArgs.driver_settings);
++	while (file != NULL) {
++		driver_settings_file* next = file->next;
++		fix_address(file->next);
++		fix_address(file->buffer);
++		file = next;
++	}
++}
++
++
+ extern "C" void
+ platform_start_kernel(void)
+ {
+ 	static struct kernel_args* args = &gKernelArgs;
++	// platform_bootloader_address_to_kernel_address(&gKernelArgs, (addr_t*)&args);
++
+ 	preloaded_elf64_image* image = static_cast<preloaded_elf64_image*>(
+ 		gKernelArgs.kernel_image.Pointer());
+ 
+@@ -105,14 +167,21 @@ platform_start_kernel(void)
+ 	// Avoid interrupts from virtio devices before kernel driver takes control.
+ 	virtio_fini();
+ 
++	gKernelArgs.arch_args.platform1 = kPlatform1Riscv;
++	gKernelArgs.arch_args.platform2 = kPlatform2Riscv;
++
+ 	fdt_set_kernel_args();
+-	mmu_init_for_kernel();
+ 
+-	dprintf("kernel entry at %lx\n", image->elf_header.e_entry);
++	convert_kernel_args();
++	uint64 satp;
++	mmu_init_for_kernel(satp);
++
++	dprintf("kernel entry: %lx\n", image->elf_header.e_entry);
++	dprintf("args: %lx\n", (addr_t)args);
+ 
+ 	addr_t stackTop
+ 		= gKernelArgs.cpu_kstack[0].start + gKernelArgs.cpu_kstack[0].size;
+-	arch_enter_kernel(args, image->elf_header.e_entry, stackTop);
++	arch_enter_kernel(satp, args, image->elf_header.e_entry, stackTop);
+ 
+ 	panic("kernel returned!\n");
+ 
+@@ -139,6 +208,7 @@ _start(int hartId, void* fdt)
+ 	args.heap_size = HEAP_SIZE;
+ 	args.arguments = NULL;
+ 
++	traps_init();
+ 	// console_init();
+ 	// virtio_init();
+ 	cpu_init();
+diff --git a/src/system/boot/platform/riscv/traps.cpp b/src/system/boot/platform/riscv/traps.cpp
+new file mode 100644
+index 0000000000..1294d04963
+--- /dev/null
++++ b/src/system/boot/platform/riscv/traps.cpp
+@@ -0,0 +1,164 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++#include "traps.h"
++#include <KernelExport.h>
++#include <arch_cpu_defs.h>
++#include <arch_int.h>
++#include <Htif.h>
++#include <Clint.h>
++
++
++// TODO: Put machine mode code in separate section and keep it loaded when
++// kernel is running.
++
++
++struct iframe {
++	uint64 ra;
++	uint64 t6;
++	uint64 sp;
++	uint64 gp;
++	uint64 tp;
++	uint64 t0;
++	uint64 t1;
++	uint64 t2;
++	uint64 t5;
++	uint64 s1;
++	uint64 a0;
++	uint64 a1;
++	uint64 a2;
++	uint64 a3;
++	uint64 a4;
++	uint64 a5;
++	uint64 a6;
++	uint64 a7;
++	uint64 s2;
++	uint64 s3;
++	uint64 s4;
++	uint64 s5;
++	uint64 s6;
++	uint64 s7;
++	uint64 s8;
++	uint64 s9;
++	uint64 s10;
++	uint64 s11;
++	uint64 t3;
++	uint64 t4;
++	uint64 fp;
++	uint64 epc;
++};
++
++
++__attribute__ ((aligned (16))) char sMStack[64*1024];
++
++
++extern "C" void MVec();
++extern "C" void MVecS();
++
++static void
++InitPmp()
++{
++	// Setup physical memory protecton. By default physical memory can be only
++	// accessed from machine mode.
++
++	// We allow access to whole physical memory from non-machine mode.
++
++	SetPmpaddr0((~0L) >> 10);
++	SetPmpcfg0((1 << pmpR) | (1 << pmpW) | (1 << pmpX) | (pmpMatchNapot));
++}
++
++
++extern "C" status_t __attribute__((naked))
++MSyscall(uint64 op, ...)
++{
++	asm volatile("ecall");
++	asm volatile("ret");
++}
++
++
++extern "C" void
++MTrap(iframe* frame)
++{
++	uint64 cause = Mcause();
++/*
++	HtifOutString("MTrap("); WriteCause(Mcause()); HtifOutString(")\n");
++	dprintf("  mstatus: "); WriteMstatus(Mstatus()); dprintf("\n");
++	dprintf("  mie: "); WriteInterruptSet(Mie()); dprintf("\n");
++	dprintf("  mip: "); WriteInterruptSet(Mip()); dprintf("\n");
++	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
++	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
++	dprintf("  mscratch: 0x%" B_PRIxADDR "\n", Mscratch());
++	DoStackTrace(Fp(), 0);
++*/
++	switch (cause) {
++		case causeMEcall:
++		case causeSEcall: {
++			frame->epc += 4;
++			uint64 op = frame->a0;
++			switch (op) {
++				case kMSyscallSwitchToSmode: {
++					HtifOutString("switchToSmodeMmodeSyscall()\n");
++					if (cause != causeMEcall) {
++						frame->a0 = B_NOT_ALLOWED;
++						return;
++					}
++					MstatusReg status(Mstatus());
++					status.mpp = modeS;
++					SetMedeleg(
++						0xffff & ~((1 << causeMEcall) | (1 << causeSEcall)));
++					SetMideleg(0xffff & ~(1 << mTimerInt));
++					SetMstatus(status.val);
++					dprintf("modeM stack: 0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
++						"\n", (addr_t)sMStack,
++						(addr_t)(sMStack + sizeof(sMStack)));
++					SetMscratch((addr_t)(sMStack + sizeof(sMStack)));
++					SetMtvec((uint64)MVecS);
++					frame->a0 = B_OK;
++					return;
++				}
++				case kMSyscallSetTimer: {
++					bool enable = frame->a1 != 0;
++					/*
++					dprintf("setTimerMmodeSyscall(%d, %" B_PRIu64 ")\n",
++						enable, frame->a2);
++					*/
++					// dprintf("  mtime: %" B_PRIu64 "\n", gClintRegs->mTime);
++					SetMip(Mip() & ~(1 << sTimerInt));
++					if (!enable) {
++						SetMie(Mie() & ~(1 << mTimerInt));
++					} else {
++						gClintRegs->mtimecmp[0] = frame->a2;
++						SetMie(Mie() | (1 << mTimerInt));
++					}
++					frame->a0 = B_OK;
++					return;
++				}
++				default:
++					frame->a0 = B_NOT_SUPPORTED;
++					return;
++			}
++			break;
++		}
++		case causeInterrupt + mTimerInt: {
++			SetMie(Mie() & ~(1 << mTimerInt));
++			SetMip(Mip() | (1 << sTimerInt));
++			return;
++		}
++	}
++	HtifOutString("unhandled MTrap\n");
++	HtifShutdown();
++}
++
++
++void
++traps_init()
++{
++	SetMtvec((uint64)MVec);
++	MstatusReg mstatus(Mstatus());
++	mstatus.ie = 1 << modeM;
++	SetMstatus(mstatus.val);
++	InitPmp();
++	MSyscall(kMSyscallSwitchToSmode);
++}
+diff --git a/src/system/boot/platform/riscv/traps.h b/src/system/boot/platform/riscv/traps.h
+new file mode 100644
+index 0000000000..42b60d6deb
+--- /dev/null
++++ b/src/system/boot/platform/riscv/traps.h
+@@ -0,0 +1,8 @@
++#ifndef _TRAPS_H_
++#define _TRAPS_H_
++
++
++void traps_init();
++
++
++#endif	// _TRAPS_H_
+diff --git a/src/system/boot/platform/riscv/traps_asm.S b/src/system/boot/platform/riscv/traps_asm.S
+new file mode 100644
+index 0000000000..610fabd0e7
+--- /dev/null
++++ b/src/system/boot/platform/riscv/traps_asm.S
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include <arch_traps.h>
++
++
++.globl MVec
++.type  MVec, @function
++.align 4
++MVec:
++	PushTrapFrame
++	sd fp, 2*8(sp)
++	csrr t0, mepc
++	sd   t0, 31*8(sp)
++
++	mv a0, sp
++	call MTrap
++
++	ld t0, 31*8(sp)
++	csrw mepc, t0
++	PopTrapFrame
++	mret
++.size	MVec, .-MVec
++
++
++.globl MVecS
++.type  MVecS, @function
++.align 4
++MVecS:
++	csrrw sp, mscratch, sp
++
++	PushTrapFrame
++
++	csrr t0, mscratch
++	sd t0, 2*8(sp) # save supervisor SP
++	csrw mscratch, fp
++
++	csrr t0, mepc
++	sd   t0, 31*8(sp)
++
++	la   t0,    MVec
++	csrw mtvec, t0
++
++	mv a0, sp
++	call MTrap
++
++	la   t0,    MVecS
++	csrw mtvec, t0
++
++	ld t0, 31*8(sp)
++	csrw mepc, t0
++	PopTrapFrame
++	mret
++.size	MVecS, .-MVecS
+diff --git a/src/system/boot/platform/riscv/video.cpp b/src/system/boot/platform/riscv/video.cpp
+index 95ceb8a9c2..f9ed28aafc 100644
+--- a/src/system/boot/platform/riscv/video.cpp
++++ b/src/system/boot/platform/riscv/video.cpp
+@@ -10,6 +10,7 @@
+ //#include "images.h"
+ #include "graphics.h"
+ #include "virtio.h"
++#include "FwCfg.h"
+ 
+ #include <arch/cpu.h>
+ #include <boot/stage2.h>
+@@ -94,7 +95,7 @@ platform_switch_to_logo(void)
+ 	gKernelArgs.frame_buffer.height = gFramebuf.height;
+ 	gKernelArgs.frame_buffer.depth = 32;
+ 	gKernelArgs.frame_buffer.bytes_per_row = 4 * gFramebuf.stride;
+-	gKernelArgs.frame_buffer.enabled = true;
++	gKernelArgs.frame_buffer.enabled = gFramebuf.width > 0 && gFramebuf.height > 0;
+ 
+ 	video_display_splash(gKernelArgs.frame_buffer.physical_buffer.start);
+ }
+@@ -110,6 +111,7 @@ platform_switch_to_text_mode(void)
+ extern "C" status_t
+ platform_init_video(void)
+ {
++	FwCfg::Init();
+ 	virtio_init(); // we want heap initalized
+ 	Clear(gFramebuf, 0xff000000);
+ 	console_init();
+diff --git a/src/system/boot/platform/riscv/virtio.cpp b/src/system/boot/platform/riscv/virtio.cpp
+index 091546abb9..01f04c41ba 100644
+--- a/src/system/boot/platform/riscv/virtio.cpp
++++ b/src/system/boot/platform/riscv/virtio.cpp
+@@ -22,7 +22,6 @@ int32_t gVirtioDevListLen = 0;
+ 
+ DoublyLinkedList<VirtioDevice> gVirtioDevices;
+ VirtioDevice* gKeyboardDev = NULL;
+-VirtioDevice* gDiskDev = NULL;
+ 
+ 
+ void*
+@@ -251,9 +250,12 @@ virtio_init()
+ 			gKeyboardDev = new(std::nothrow) VirtioDevice(*devRes);
+ 	}
+ 	dprintf("virtio_input count: %d\n", i);
+-	for (int i = 0; i < 4; i++)
+-		gKeyboardDev->ScheduleIO(new(std::nothrow) IORequest(ioOpWrite,
+-			malloc(sizeof(VirtioInputPacket)), sizeof(VirtioInputPacket)));
++	if (gKeyboardDev != NULL) {
++		for (int i = 0; i < 4; i++) {
++			gKeyboardDev->ScheduleIO(new(std::nothrow) IORequest(ioOpWrite,
++				malloc(sizeof(VirtioInputPacket)), sizeof(VirtioInputPacket)));
++		}
++	}
+ }
+ 
+ 
+@@ -270,6 +272,9 @@ virtio_fini()
+ int
+ virtio_input_get_key()
+ {
++	if (gKeyboardDev == NULL)
++		return 0;
++
+ 	IORequest* req = gKeyboardDev->ConsumeIO();
+ 	if (req == NULL)
+ 		return 0;
+-- 
+2.30.2
+

@@ -1,0 +1,34 @@
+From 277c776e3b3e082bd3302bb0ce484f12487da262 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 29 Nov 2020 20:29:27 +0900
+Subject: app_server: [WIP] fix alpha mask clipping
+
+Change-Id: Iad1e0f3c59b04ef92049d0992a45d18215a63c09
+---
+ src/servers/app/drawing/AlphaMask.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/servers/app/drawing/AlphaMask.cpp b/src/servers/app/drawing/AlphaMask.cpp
+index 78b1708e6a..caecce27c4 100644
+--- a/src/servers/app/drawing/AlphaMask.cpp
++++ b/src/servers/app/drawing/AlphaMask.cpp
+@@ -320,12 +320,16 @@ VectorAlphaMask<VectorMaskType>::_RenderSource(const IntRect& canvasBounds)
+ {
+ 	fBounds = static_cast<VectorMaskType*>(this)->DetermineBoundingBox();
+ 
++#if 0
+ 	if (fBounds.Width() > canvasBounds.Width()
+ 		|| fBounds.Height() > canvasBounds.Height()) {
+ 		fBounds = fBounds & canvasBounds;
+ 		fClippedToCanvas = true;
+ 	} else
+ 		fClippedToCanvas = false;
++#else
++	fClippedToCanvas = false;
++#endif
+ 
+ 	if (fPreviousMask != NULL)
+ 		fBounds = fBounds & _PreviousMaskBounds();
+-- 
+2.30.2
+

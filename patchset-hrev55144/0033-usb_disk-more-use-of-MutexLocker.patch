@@ -1,0 +1,286 @@
+From d914ee5ca8972960a9714d83b2bda5b7d6359cee Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 24 Jan 2021 11:40:33 +0900
+Subject: usb_disk: more use of MutexLocker
+
+Change-Id: Ifa0ae2a858c7878606c05212389fd45da88b1422
+---
+ .../drivers/disk/usb/usb_disk/usb_disk.cpp    | 163 +++++++++---------
+ 1 file changed, 77 insertions(+), 86 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp b/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
+index 351f791a4c..526783380e 100644
+--- a/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
+@@ -1459,23 +1459,24 @@ usb_disk_device_added(usb_device newDevice, void **cookie)
+ 		return result;
+ 	}
+ 
+-	mutex_lock(&gDeviceListLock);
+-	device->device_number = 0;
+-	disk_device *other = gDeviceList;
+-	while (other != NULL) {
+-		if (other->device_number >= device->device_number)
+-			device->device_number = other->device_number + 1;
+-
+-		other = (disk_device *)other->link;
++	{
++		MutexLocker locker(&gDeviceListLock);
++		device->device_number = 0;
++		disk_device *other = gDeviceList;
++		while (other != NULL) {
++			if (other->device_number >= device->device_number)
++				device->device_number = other->device_number + 1;
++	
++			other = (disk_device *)other->link;
++		}
++	
++		device->link = (void *)gDeviceList;
++		gDeviceList = device;
++		gLunCount += device->lun_count;
++		for (uint8 i = 0; i < device->lun_count; i++)
++			sprintf(device->luns[i]->name, DEVICE_NAME, device->device_number, i);
+ 	}
+ 
+-	device->link = (void *)gDeviceList;
+-	gDeviceList = device;
+-	gLunCount += device->lun_count;
+-	for (uint8 i = 0; i < device->lun_count; i++)
+-		sprintf(device->luns[i]->name, DEVICE_NAME, device->device_number, i);
+-	mutex_unlock(&gDeviceListLock);
+-
+ 	TRACE("new device: 0x%p\n", device);
+ 	*cookie = (void *)device;
+ 	return B_OK;
+@@ -1488,7 +1489,7 @@ usb_disk_device_removed(void *cookie)
+ 	TRACE("device_removed(0x%p)\n", cookie);
+ 	disk_device *device = (disk_device *)cookie;
+ 
+-	mutex_lock(&gDeviceListLock);
++	MutexLocker locker(&gDeviceListLock);
+ 	if (gDeviceList == device) {
+ 		gDeviceList = (disk_device *)device->link;
+ 	} else {
+@@ -1511,7 +1512,6 @@ usb_disk_device_removed(void *cookie)
+ 	if (device->open_count == 0)
+ 		usb_disk_free_device_and_luns(device);
+ 
+-	mutex_unlock(&gDeviceListLock);
+ 	return B_OK;
+ }
+ 
+@@ -1689,21 +1689,18 @@ usb_disk_open(const char *name, uint32 flags, void **cookie)
+ 	strcat(rawName, "raw");
+ 	TRACE("opening raw device %s for %s\n", rawName, name);
+ 
+-	mutex_lock(&gDeviceListLock);
++	MutexLocker locker(&gDeviceListLock);
+ 	disk_device *device = gDeviceList;
+ 	while (device) {
+ 		for (uint8 i = 0; i < device->lun_count; i++) {
+ 			device_lun *lun = device->luns[i];
+ 			if (strncmp(rawName, lun->name, 32) == 0) {
+ 				// found the matching device/lun
+-				if (device->removed) {
+-					mutex_unlock(&gDeviceListLock);
++				if (device->removed)
+ 					return B_ERROR;
+-				}
+ 
+ 				device->open_count++;
+ 				*cookie = lun;
+-				mutex_unlock(&gDeviceListLock);
+ 				return B_OK;
+ 			}
+ 		}
+@@ -1711,7 +1708,6 @@ usb_disk_open(const char *name, uint32 flags, void **cookie)
+ 		device = (disk_device *)device->link;
+ 	}
+ 
+-	mutex_unlock(&gDeviceListLock);
+ 	return B_NAME_NOT_FOUND;
+ }
+ 
+@@ -1723,10 +1719,9 @@ usb_disk_close(void *cookie)
+ 	device_lun *lun = (device_lun *)cookie;
+ 	disk_device *device = lun->device;
+ 
+-	mutex_lock(&device->lock);
++	MutexLocker locker(&device->lock);
+ 	if (!device->removed)
+ 		usb_disk_synchronize(lun, false);
+-	mutex_unlock(&device->lock);
+ 
+ 	return B_OK;
+ }
+@@ -1736,7 +1731,7 @@ static status_t
+ usb_disk_free(void *cookie)
+ {
+ 	TRACE("free()\n");
+-	mutex_lock(&gDeviceListLock);
++	MutexLocker locker(&gDeviceListLock);
+ 
+ 	device_lun *lun = (device_lun *)cookie;
+ 	disk_device *device = lun->device;
+@@ -1747,7 +1742,6 @@ usb_disk_free(void *cookie)
+ 		usb_disk_free_device_and_luns(device);
+ 	}
+ 
+-	mutex_unlock(&gDeviceListLock);
+ 	return B_OK;
+ }
+ 
+@@ -2005,36 +1999,35 @@ usb_disk_read(void *cookie, off_t position, void *buffer, size_t *length)
+ 	TRACE("read(%" B_PRIdOFF ", %ld)\n", position, *length);
+ 	device_lun *lun = (device_lun *)cookie;
+ 	disk_device *device = lun->device;
+-	mutex_lock(&device->lock);
+-	if (device->removed) {
+-		*length = 0;
+-		mutex_unlock(&device->lock);
+-		return B_DEV_NOT_READY;
+-	}
+-
+ 	status_t result = B_ERROR;
+-	uint32 blockPosition = 0;
+-	uint16 blockCount = 0;
+-	bool needsPartial = usb_disk_needs_partial_buffer(lun, position, *length,
+-		blockPosition, blockCount);
+-	if (needsPartial) {
+-		void *partialBuffer = NULL;
+-		void *blockBuffer = NULL;
+-		result = usb_disk_prepare_partial_buffer(lun, position, *length,
+-			partialBuffer, blockBuffer, blockPosition, blockCount);
+-		if (result == B_OK) {
+-			if (IS_USER_ADDRESS(buffer))
+-				result = user_memcpy(buffer, partialBuffer, *length);
+-			else
+-				memcpy(buffer, partialBuffer, *length);
+-			free(blockBuffer);
++	{
++		MutexLocker locker(&device->lock);
++		if (device->removed) {
++			*length = 0;
++			return B_DEV_NOT_READY;
++		}
++	
++		uint32 blockPosition = 0;
++		uint16 blockCount = 0;
++		bool needsPartial = usb_disk_needs_partial_buffer(lun, position, *length,
++			blockPosition, blockCount);
++		if (needsPartial) {
++			void *partialBuffer = NULL;
++			void *blockBuffer = NULL;
++			result = usb_disk_prepare_partial_buffer(lun, position, *length,
++				partialBuffer, blockBuffer, blockPosition, blockCount);
++			if (result == B_OK) {
++				if (IS_USER_ADDRESS(buffer))
++					result = user_memcpy(buffer, partialBuffer, *length);
++				else
++					memcpy(buffer, partialBuffer, *length);
++				free(blockBuffer);
++			}
++		} else {
++			result = usb_disk_block_read(lun, blockPosition, blockCount, buffer,
++				length);
+ 		}
+-	} else {
+-		result = usb_disk_block_read(lun, blockPosition, blockCount, buffer,
+-			length);
+ 	}
+-
+-	mutex_unlock(&device->lock);
+ 	if (result == B_OK) {
+ 		lun->read_bytes += *length;
+ 		TRACE("read successful with %ld bytes\n", *length);
+@@ -2057,41 +2050,40 @@ usb_disk_write(void *cookie, off_t position, const void *buffer,
+ 	TRACE("write(%" B_PRIdOFF", %ld)\n", position, *length);
+ 	device_lun *lun = (device_lun *)cookie;
+ 	disk_device *device = lun->device;
+-	mutex_lock(&device->lock);
+-	if (device->removed) {
+-		*length = 0;
+-		mutex_unlock(&device->lock);
+-		return B_DEV_NOT_READY;
+-	}
+-
+ 	status_t result = B_ERROR;
+-	uint32 blockPosition = 0;
+-	uint16 blockCount = 0;
+-	bool needsPartial = usb_disk_needs_partial_buffer(lun, position,
+-		*length, blockPosition, blockCount);
+-	if (needsPartial) {
+-		void *partialBuffer = NULL;
+-		void *blockBuffer = NULL;
+-		result = usb_disk_prepare_partial_buffer(lun, position, *length,
+-			partialBuffer, blockBuffer, blockPosition, blockCount);
+-		if (result == B_OK) {
+-			if (IS_USER_ADDRESS(buffer))
+-				result = user_memcpy(partialBuffer, buffer, *length);
+-			else
+-				memcpy(partialBuffer, buffer, *length);
++	{
++		MutexLocker locker(&device->lock);
++		if (device->removed) {
++			*length = 0;
++			return B_DEV_NOT_READY;
+ 		}
+-		if (result == B_OK) {
+-			size_t blockLength = blockCount * lun->block_size;
++	
++		uint32 blockPosition = 0;
++		uint16 blockCount = 0;
++		bool needsPartial = usb_disk_needs_partial_buffer(lun, position,
++			*length, blockPosition, blockCount);
++		if (needsPartial) {
++			void *partialBuffer = NULL;
++			void *blockBuffer = NULL;
++			result = usb_disk_prepare_partial_buffer(lun, position, *length,
++				partialBuffer, blockBuffer, blockPosition, blockCount);
++			if (result == B_OK) {
++				if (IS_USER_ADDRESS(buffer))
++					result = user_memcpy(partialBuffer, buffer, *length);
++				else
++					memcpy(partialBuffer, buffer, *length);
++			}
++			if (result == B_OK) {
++				size_t blockLength = blockCount * lun->block_size;
++				result = usb_disk_block_write(lun, blockPosition, blockCount,
++					blockBuffer, &blockLength);
++				free(blockBuffer);
++			}
++		} else {
+ 			result = usb_disk_block_write(lun, blockPosition, blockCount,
+-				blockBuffer, &blockLength);
+-			free(blockBuffer);
++				(void *)buffer, length);
+ 		}
+-	} else {
+-		result = usb_disk_block_write(lun, blockPosition, blockCount,
+-			(void *)buffer, length);
+ 	}
+-
+-	mutex_unlock(&device->lock);
+ 	if (result == B_OK) {
+ 		lun->write_bytes += *length;
+ 		TRACE("write successful with %ld bytes\n", *length);
+@@ -2188,7 +2180,7 @@ publish_devices()
+ 		return NULL;
+ 
+ 	int32 index = 0;
+-	mutex_lock(&gDeviceListLock);
++	MutexLocker locker(&gDeviceListLock);
+ 	disk_device *device = gDeviceList;
+ 	while (device) {
+ 		for (uint8 i = 0; i < device->lun_count; i++)
+@@ -2198,7 +2190,6 @@ publish_devices()
+ 	}
+ 
+ 	gDeviceNames[index++] = NULL;
+-	mutex_unlock(&gDeviceListLock);
+ 	return (const char **)gDeviceNames;
+ }
+ 
+-- 
+2.30.2
+

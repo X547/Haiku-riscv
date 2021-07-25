@@ -1,0 +1,86 @@
+From 7848a355eaac1cb02ed4e7252054405123383c6a Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:26:11 +0900
+Subject: libroot/os: implement arch-specific parts for riscv64 (2)
+
+Change-Id: I963e517671a59bca5f918eadc499c464b8002948
+---
+ .../libroot/os/arch/riscv64/system_time.cpp   | 38 ++++++++++++-------
+ src/system/libroot/os/arch/riscv64/time.cpp   |  5 +--
+ 2 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/src/system/libroot/os/arch/riscv64/system_time.cpp b/src/system/libroot/os/arch/riscv64/system_time.cpp
+index 8ad65c6944..92e090f86b 100644
+--- a/src/system/libroot/os/arch/riscv64/system_time.cpp
++++ b/src/system/libroot/os/arch/riscv64/system_time.cpp
+@@ -9,24 +9,36 @@
+ #include <OS.h>
+ 
+ #include <arch_cpu.h>
++#include <arch_cpu_defs.h>
+ #include <libroot_private.h>
+ #include <real_time_data.h>
+ 
++#ifdef _KERNEL_MODE
++#include <KernelExport.h>
++#endif
+ 
+-bigtime_t
+-system_time(void)
+-{
+-	// TODO: units conversion
+-
+-	// Currently TinyEMU implementation just use host system system_time() to
+-	// implement `utime` register. Specification don't define units.
++static uint64_t cv_factor = 0;
+ 
+-	// Spec says: The execution environment should provide a means of
+-	// determining the period of the real-time counter (seconds/tick).
+-	// The period must be constant.
+ 
+-	bigtime_t time;
+-	asm volatile("csrr %0, time" : "=r" (time));
+-	return time;
++extern "C" void
++__riscv64_setup_system_time(uint64 cv)
++{
++	cv_factor = cv;
+ }
+ 
++
++[[gnu::optimize("omit-frame-pointer")]] bigtime_t
++system_time()
++{
++	return CpuTime();
++/*
++	uint64 time = CpuTime();
++	uint64 lo = (uint32)time;
++	uint64 hi = time >> 32;
++	return ((lo * cv_factor) >> 32) + hi * cv_factor;
++*/
++/*
++	__uint128_t time = static_cast<__uint128_t>(CpuTime()) * cv_factor;
++	return time >> 32;
++*/
++}
+diff --git a/src/system/libroot/os/arch/riscv64/time.cpp b/src/system/libroot/os/arch/riscv64/time.cpp
+index d898887325..517d989d44 100644
+--- a/src/system/libroot/os/arch/riscv64/time.cpp
++++ b/src/system/libroot/os/arch/riscv64/time.cpp
+@@ -17,11 +17,10 @@ __arch_init_time(struct real_time_data *data, bool setDefaults)
+ {
+ 	sRealTimeData = &data->arch_data;
+ 
+-	if (setDefaults) {
++	if (setDefaults)
+ 		sRealTimeData->system_time_conversion_factor = 1000000000LL;
+-	}
+ 
+-	// __riscv64_setup_system_time(&sRealTimeData->system_time_conversion_factor);
++	__riscv64_setup_system_time(sRealTimeData->system_time_conversion_factor);
+ }
+ 
+ 
+-- 
+2.30.2
+

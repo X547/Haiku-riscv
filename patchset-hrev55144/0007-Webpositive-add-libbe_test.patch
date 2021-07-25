@@ -1,0 +1,25 @@
+From bed6c027f63821e6d8f0ffbccd554c8c6f6f4313 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Fri, 22 May 2020 11:08:56 +0900
+Subject: Webpositive: add libbe_test
+
+Change-Id: Iea616e17d8c6de0202568446886ba474ccc75a7d
+---
+ src/apps/webpositive/Jamfile | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/apps/webpositive/Jamfile b/src/apps/webpositive/Jamfile
+index 5e2c335dc7..894eb67d0a 100644
+--- a/src/apps/webpositive/Jamfile
++++ b/src/apps/webpositive/Jamfile
+@@ -1,5 +1,7 @@
+ SubDir HAIKU_TOP src apps webpositive ;
+ 
++AddSubDirSupportedPlatforms libbe_test ;
++
+ SubDirC++Flags $(defines) -Wno-error=sequence-point -Wno-error=format-truncation ;
+ SubDirCcFlags $(defines) -Wno-error=sequence-point -Wno-error=format-truncation ;
+ 
+-- 
+2.30.2
+

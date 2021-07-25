@@ -1,0 +1,156 @@
+From 22965d4e66324c9d3f10e90405c017cabb5fd16e Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:04:33 +0900
+Subject: kernel/arch/cpu: implement for riscv64 (2)
+
+Change-Id: Ic989e5ff664d29d3240215496351eef3d506af47
+---
+ .../private/kernel/arch/riscv64/arch_cpu.h    | 32 +++++++++++++------
+ .../kernel/boot/platform/efi/arch_smp.h       | 15 +++++++++
+ src/system/kernel/arch/riscv64/arch_cpu.cpp   | 23 +++++++++++++
+ 3 files changed, 60 insertions(+), 10 deletions(-)
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_cpu.h b/headers/private/kernel/arch/riscv64/arch_cpu.h
+index 5b1414898c..2b0dff4ded 100644
+--- a/headers/private/kernel/arch/riscv64/arch_cpu.h
++++ b/headers/private/kernel/arch/riscv64/arch_cpu.h
+@@ -16,20 +16,29 @@
+ #define CACHE_LINE_SIZE		64
+ 
+ 
+-inline void set_ac()
++static inline bool
++get_ac()
+ {
+-	return;
+-	SstatusReg sstatus(Sstatus());
+-	sstatus.sum = 1;
+-	SetSstatus(sstatus.val);
++	SstatusReg status(Sstatus());
++	return status.sum != 0;
+ }
+ 
+-inline void clear_ac()
++
++static inline void
++set_ac()
+ {
+-	return;
+-	SstatusReg sstatus(Sstatus());
+-	sstatus.sum = 0;
+-	SetSstatus(sstatus.val);
++	SstatusReg status(Sstatus());
++	status.sum = 1;
++	SetSstatus(status.val);
++}
++
++
++static inline void
++clear_ac()
++{
++	SstatusReg status(Sstatus());
++	status.sum = 0;
++	SetSstatus(status.val);
+ }
+ 
+ 
+@@ -43,6 +52,9 @@ extern "C" {
+ #endif
+ 
+ 
++void __riscv64_setup_system_time(uint64 conversionFactor);
++
++
+ static inline void
+ arch_cpu_pause(void)
+ {
+diff --git a/headers/private/kernel/boot/platform/efi/arch_smp.h b/headers/private/kernel/boot/platform/efi/arch_smp.h
+index c95a9e19e9..4a87605391 100644
+--- a/headers/private/kernel/boot/platform/efi/arch_smp.h
++++ b/headers/private/kernel/boot/platform/efi/arch_smp.h
+@@ -8,9 +8,24 @@
+ #include <boot/menu.h>
+ 
+ 
++#ifdef __riscv
++
++struct CpuInfo {
++	uint32 id;
++};
++
++void arch_smp_register_cpu(CpuInfo** cpu);
++
++#endif
++
++
+ int arch_smp_get_current_cpu(void);
+ void arch_smp_init_other_cpus(void);
++#ifdef __riscv
++void arch_smp_boot_other_cpus(uint64 satp, uint64 kernel_entry);
++#else
+ void arch_smp_boot_other_cpus(uint32 pml4, uint64 kernel_entry);
++#endif
+ void arch_smp_add_safemode_menus(Menu *menu);
+ void arch_smp_init(void);
+ 
+diff --git a/src/system/kernel/arch/riscv64/arch_cpu.cpp b/src/system/kernel/arch/riscv64/arch_cpu.cpp
+index 0bd867a9a6..d6a8000c69 100644
+--- a/src/system/kernel/arch/riscv64/arch_cpu.cpp
++++ b/src/system/kernel/arch/riscv64/arch_cpu.cpp
+@@ -8,9 +8,15 @@
+ 
+ #include <arch/cpu.h>
+ #include <boot/kernel_args.h>
++#include <vm/VMAddressSpace.h>
+ #include <commpage.h>
+ #include <elf.h>
+ #include <Htif.h>
++#include <platform/sbi/sbi_syscalls.h>
++
++
++extern uint32 gPlatform1;
++extern uint32 gPlatform2;
+ 
+ 
+ status_t
+@@ -33,6 +39,12 @@ arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
+ status_t
+ arch_cpu_init(kernel_args *args)
+ {
++/*
++	uint64 conversionFactor
++		= (1LL << 32) * 1000000LL / args->arch_args.timerFrequrency;
++
++	__riscv64_setup_system_time(conversionFactor);
++*/
+ 	return B_OK;
+ }
+ 
+@@ -40,6 +52,11 @@ arch_cpu_init(kernel_args *args)
+ status_t
+ arch_cpu_init_post_vm(kernel_args *args)
+ {
++	// Set address space ownership to currently running threads
++	for (uint32 i = 0; i < args->num_cpus; i++) {
++		VMAddressSpace::Kernel()->Get();
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -96,6 +113,12 @@ arch_cpu_user_TLB_invalidate(void)
+ status_t
+ arch_cpu_shutdown(bool reboot)
+ {
++	if (gPlatform1 == kPlatform1Sbi) {
++		sbi_system_reset(
++			reboot ? SBI_RESET_TYPE_COLD_REBOOT : SBI_RESET_TYPE_SHUTDOWN,
++			SBI_RESET_REASON_NONE);
++	}
++
+ 	HtifShutdown();
+ 	return B_ERROR;
+ }
+-- 
+2.30.2
+

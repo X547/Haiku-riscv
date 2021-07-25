@@ -1,0 +1,658 @@
+From bb6e76a5b935a4b2600c0651a3883ae0a555a45c Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 22:15:18 +0900
+Subject: kernel/arch/thread: implement for riscv64
+
+Change-Id: I3effa598626b32c29606299cd0edee390d430baf
+---
+ headers/posix/arch/riscv64/signal.h           |   2 +-
+ .../private/kernel/arch/riscv64/arch_thread.h |  14 +-
+ .../kernel/arch/riscv64/arch_thread_types.h   |  80 +++++-
+ src/system/kernel/arch/riscv64/arch_asm.S     | 152 +++++++++++
+ .../kernel/arch/riscv64/arch_thread.cpp       | 243 +++++++++++++++++-
+ 5 files changed, 453 insertions(+), 38 deletions(-)
+
+diff --git a/headers/posix/arch/riscv64/signal.h b/headers/posix/arch/riscv64/signal.h
+index a394b48c07..37fafae524 100644
+--- a/headers/posix/arch/riscv64/signal.h
++++ b/headers/posix/arch/riscv64/signal.h
+@@ -16,7 +16,7 @@ struct vregs {
+ 	ulong x[31];
+ 	ulong pc;
+ 	double f[32];
+-	char fcsr;
++	ulong fcsr;
+ };
+ #endif /* defined(__RISCV64__) */
+ 
+diff --git a/headers/private/kernel/arch/riscv64/arch_thread.h b/headers/private/kernel/arch/riscv64/arch_thread.h
+index 5da6ac7fa9..3b9e8e5ced 100644
+--- a/headers/private/kernel/arch/riscv64/arch_thread.h
++++ b/headers/private/kernel/arch/riscv64/arch_thread.h
+@@ -11,30 +11,24 @@
+ 
+ #include <arch/cpu.h>
+ 
+-#warning IMPLEMENT arch_thread.h
+-
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-void riscv64_push_iframe(struct iframe_stack* stack, struct iframe* frame);
+-void riscv64_pop_iframe(struct iframe_stack* stack);
+-struct iframe* riscv64_get_user_iframe(void);
+-
+ 
+ static inline Thread*
+ arch_thread_get_current_thread(void)
+ {
+-#warning IMPLEMENT arch_thread_get_current_thread
+-    Thread* t = NULL;
+-    return t;
++	Thread* t;
++	asm volatile("mv %0, tp" : "=r" (t));
++	return t;
+ }
+ 
+ 
+ static inline void
+ arch_thread_set_current_thread(Thread* t)
+ {
+-#warning IMPLEMENT arch_thread_set_current_thread
++	asm volatile("mv tp, %0" : : "r" (t));
+ }
+ 
+ 
+diff --git a/headers/private/kernel/arch/riscv64/arch_thread_types.h b/headers/private/kernel/arch/riscv64/arch_thread_types.h
+index cbcd9f70c8..a0c99bc8b3 100644
+--- a/headers/private/kernel/arch/riscv64/arch_thread_types.h
++++ b/headers/private/kernel/arch/riscv64/arch_thread_types.h
+@@ -7,20 +7,65 @@
+ 
+ #include <kernel.h>
+ 
+-#define	IFRAME_TRACE_DEPTH 4
+ 
+-struct iframe_stack {
+-	struct iframe *frames[IFRAME_TRACE_DEPTH];
+-	int32	index;
++namespace BKernel {
++	struct Thread;
++}
++
++
++struct iframe {
++	uint64 ra;
++	uint64 t6;
++	uint64 sp;
++	uint64 gp;
++	uint64 tp;
++	uint64 t0;
++	uint64 t1;
++	uint64 t2;
++	uint64 t5;
++	uint64 s1;
++	uint64 a0;
++	uint64 a1;
++	uint64 a2;
++	uint64 a3;
++	uint64 a4;
++	uint64 a5;
++	uint64 a6;
++	uint64 a7;
++	uint64 s2;
++	uint64 s3;
++	uint64 s4;
++	uint64 s5;
++	uint64 s6;
++	uint64 s7;
++	uint64 s8;
++	uint64 s9;
++	uint64 s10;
++	uint64 s11;
++	uint64 t3;
++	uint64 t4;
++	uint64 fp;
++	uint64 epc;
+ };
+ 
+-// architecture specific thread info
+-struct arch_thread {
+-	void	*sp;	// stack pointer
+-	void	*interrupt_stack;
++struct arch_context {
++	uint64 ra;    //  0
++	uint64 s[12]; // 12
++	uint64 sp;    // 13
++	uint64 satp;  // 14
++};
+ 
+-	// used to track interrupts on this thread
+-	struct iframe_stack	iframes;
++struct fpu_context {
++	double f[32];
++	uint64 fcsr;
++};
++
++
++struct arch_thread {
++	BKernel::Thread* thread;
++	arch_context context;
++	fpu_context fpuContext;
++	iframe* userFrame;
+ };
+ 
+ struct arch_team {
+@@ -31,10 +76,17 @@ struct arch_team {
+ };
+ 
+ struct arch_fork_arg {
+-	// gcc treats empty structures as zero-length in C, but as if they contain
+-	// a char in C++. So we have to put a dummy in to be able to use the struct
+-	// from both in a consistent way.
+-	char	dummy;
++	iframe frame;
+ };
+ 
++
++extern "C" int arch_setjmp(arch_context* ctx);
++extern "C" void arch_longjmp(arch_context* ctx, int val);
++extern "C" void save_fpu(fpu_context* ctx);
++extern "C" void restore_fpu(fpu_context* ctx);
++extern "C" void arch_thread_entry();
++extern "C" void arch_enter_userspace(void *arg1, void *arg2, addr_t sp);
++extern "C" void arch_longjmp_iframe(iframe* frame);
++
++
+ #endif	/* KERNEL_ARCH_RISCV64_THREAD_TYPES_H */
+diff --git a/src/system/kernel/arch/riscv64/arch_asm.S b/src/system/kernel/arch/riscv64/arch_asm.S
+index f345a1167b..f4d9d6284a 100644
+--- a/src/system/kernel/arch/riscv64/arch_asm.S
++++ b/src/system/kernel/arch/riscv64/arch_asm.S
+@@ -8,3 +8,155 @@
+ 
+ 
+ .text
++
++
++FUNCTION(MSyscall):
++	ecall
++	ret
++FUNCTION_END(MSyscall)
++
++
++FUNCTION(arch_setjmp):
++	sd ra,   0*8(a0)
++	sd s0,   1*8(a0)
++	sd s1,   2*8(a0)
++	sd s2,   3*8(a0)
++	sd s3,   4*8(a0)
++	sd s4,   5*8(a0)
++	sd s5,   6*8(a0)
++	sd s6,   7*8(a0)
++	sd s7,   8*8(a0)
++	sd s8,   9*8(a0)
++	sd s9,  10*8(a0)
++	sd s10, 11*8(a0)
++	sd s11, 12*8(a0)
++	sd sp,  13*8(a0)
++	csrr t0, satp
++	sd t0,  14*8(a0)
++
++	li    a0, 0
++	ret
++FUNCTION_END(arch_setjmp)
++
++
++FUNCTION(arch_longjmp):
++	ld ra,   0*8(a0)
++	ld s0,   1*8(a0)
++	ld s1,   2*8(a0)
++	ld s2,   3*8(a0)
++	ld s3,   4*8(a0)
++	ld s4,   5*8(a0)
++	ld s5,   6*8(a0)
++	ld s6,   7*8(a0)
++	ld s7,   8*8(a0)
++	ld s8,   9*8(a0)
++	ld s9,  10*8(a0)
++	ld s10, 11*8(a0)
++	ld s11, 12*8(a0)
++	ld sp,  13*8(a0)
++	ld t0,  14*8(a0)
++	csrw satp, t0
++	sfence.vma
++
++	seqz a0, a1
++	add  a0, a0, a1   # a0 = (a1 == 0) ? 1 : a1
++	ret
++FUNCTION_END(arch_longjmp)
++
++
++FUNCTION(save_fpu):
++	fsd f0,   0*8(a0)
++	fsd f1,   1*8(a0)
++	fsd f2,   2*8(a0)
++	fsd f3,   3*8(a0)
++	fsd f4,   4*8(a0)
++	fsd f5,   5*8(a0)
++	fsd f6,   6*8(a0)
++	fsd f7,   7*8(a0)
++	fsd f8,   8*8(a0)
++	fsd f9,   9*8(a0)
++	fsd f10, 10*8(a0)
++	fsd f11, 11*8(a0)
++	fsd f12, 12*8(a0)
++	fsd f13, 13*8(a0)
++	fsd f14, 14*8(a0)
++	fsd f15, 15*8(a0)
++	fsd f16, 16*8(a0)
++	fsd f17, 17*8(a0)
++	fsd f18, 18*8(a0)
++	fsd f19, 19*8(a0)
++	fsd f20, 20*8(a0)
++	fsd f21, 21*8(a0)
++	fsd f22, 22*8(a0)
++	fsd f23, 23*8(a0)
++	fsd f24, 24*8(a0)
++	fsd f25, 25*8(a0)
++	fsd f26, 26*8(a0)
++	fsd f27, 27*8(a0)
++	fsd f28, 28*8(a0)
++	fsd f29, 29*8(a0)
++	fsd f30, 30*8(a0)
++	fsd f31, 31*8(a0)
++	frcsr t0
++	sd  t0,  32*8(a0)
++
++	ret
++FUNCTION_END(save_fpu)
++
++
++FUNCTION(restore_fpu):
++	fld f0,   0*8(a0)
++	fld f1,   1*8(a0)
++	fld f2,   2*8(a0)
++	fld f3,   3*8(a0)
++	fld f4,   4*8(a0)
++	fld f5,   5*8(a0)
++	fld f6,   6*8(a0)
++	fld f7,   7*8(a0)
++	fld f8,   8*8(a0)
++	fld f9,   9*8(a0)
++	fld f10, 10*8(a0)
++	fld f11, 11*8(a0)
++	fld f12, 12*8(a0)
++	fld f13, 13*8(a0)
++	fld f14, 14*8(a0)
++	fld f15, 15*8(a0)
++	fld f16, 16*8(a0)
++	fld f17, 17*8(a0)
++	fld f18, 18*8(a0)
++	fld f19, 19*8(a0)
++	fld f20, 20*8(a0)
++	fld f21, 21*8(a0)
++	fld f22, 22*8(a0)
++	fld f23, 23*8(a0)
++	fld f24, 24*8(a0)
++	fld f25, 25*8(a0)
++	fld f26, 26*8(a0)
++	fld f27, 27*8(a0)
++	fld f28, 28*8(a0)
++	fld f29, 29*8(a0)
++	fld f30, 30*8(a0)
++	fld f31, 31*8(a0)
++	ld  t0,  32*8(a0)
++	fscsr t0
++
++	ret
++FUNCTION_END(restore_fpu)
++
++
++FUNCTION(arch_thread_entry):
++	mv a0, s2
++	JALR s1
++FUNCTION_END(arch_thread_entry)
++
++
++FUNCTION(arch_enter_userspace):
++	mv sp, a2
++	sret
++FUNCTION_END(arch_enter_userspace)
++
++
++FUNCTION(arch_longjmp_iframe):
++	mv sp, a0
++	call SVecURet
++FUNCTION_END(arch_longjmp_iframe)
+diff --git a/src/system/kernel/arch/riscv64/arch_thread.cpp b/src/system/kernel/arch/riscv64/arch_thread.cpp
+index eda19a1cd2..2a17506e9e 100644
+--- a/src/system/kernel/arch/riscv64/arch_thread.cpp
++++ b/src/system/kernel/arch/riscv64/arch_thread.cpp
+@@ -10,7 +10,23 @@
+ #include <boot/stage2.h>
+ #include <kernel.h>
+ #include <thread.h>
++#include <team.h>
++#include <tls.h>
++#include <commpage.h>
+ #include <vm/vm_types.h>
++#include <vm/VMAddressSpace.h>
++#include "RISCV64VMTranslationMap.h"
++#include <arch_debug.h>
++
++
++extern "C" void SVecU();
++
++
++extern "C" void RestoreUserRegs()
++{
++	SetSscratch((addr_t)&thread_get_current_thread()->arch_info);
++	SetTp(thread_get_current_thread()->user_local_storage);
++}
+ 
+ 
+ status_t
+@@ -34,9 +50,7 @@ arch_team_init_team_struct(Team *team, bool kernel)
+ status_t
+ arch_thread_init_thread_struct(Thread *thread)
+ {
+-	// set up an initial state (stack & fpu)
+-	//memcpy(&thread->arch_info, &sInitialState, sizeof(struct arch_thread));
+-
++	thread->arch_info.thread = thread;
+ 	return B_OK;
+ }
+ 
+@@ -45,22 +59,52 @@ void
+ arch_thread_init_kthread_stack(Thread* thread, void* _stack, void* _stackTop,
+ 	void (*function)(void*), const void* data)
+ {
+-	#warning RISCV64: Implement thread init kthread
+-	panic("arch_thread_init_kthread_stack(): Implement me!");
++	dprintf("arch_thread_init_kthread_stack(%p(%s))\n", thread, thread->name);
++	memset(&thread->arch_info.context, 0, sizeof(arch_context));
++	thread->arch_info.context.sp = (addr_t)_stackTop;
++	thread->arch_info.context.s[0] = 0; // fp
++	thread->arch_info.context.s[1] = (addr_t)function;
++	thread->arch_info.context.s[2] = (addr_t)data;
++	thread->arch_info.context.ra = (addr_t)arch_thread_entry;
++	VMTranslationMap* map = (thread->team == team_get_kernel_team())
++		? VMAddressSpace::Kernel()->TranslationMap()
++		: thread->team->address_space->TranslationMap();
++	thread->arch_info.context.satp = ((RISCV64VMTranslationMap*)map)->Satp();
+ }
+ 
+ 
+ status_t
+ arch_thread_init_tls(Thread *thread)
+ {
+-	// TODO: Implement!
+-	return B_OK;
++	addr_t tls[TLS_FIRST_FREE_SLOT];
++
++	thread->user_local_storage = thread->user_stack_base
++		+ thread->user_stack_size;
++
++	// initialize default TLS fields
++	memset(tls, 0, sizeof(tls));
++	tls[TLS_BASE_ADDRESS_SLOT] = thread->user_local_storage;
++	tls[TLS_THREAD_ID_SLOT] = thread->id;
++	tls[TLS_USER_THREAD_SLOT] = (addr_t)thread->user_thread;
++
++	return user_memcpy((void*)thread->user_local_storage, tls, sizeof(tls));
+ }
+ 
+ 
+ void
+ arch_thread_context_switch(Thread *from, Thread *to)
+ {
++	/*
++	dprintf("arch_thread_context_switch(%p(%s), %p(%s))\n", from, from->name,
++		to, to->name);
++	*/
++	if (arch_setjmp(&from->arch_info.context) == 0) {
++		// TODO: save/restore FPU only if needed
++		save_fpu(&from->arch_info.fpuContext);
++		arch_longjmp(&to->arch_info.context, 1);
++	} else {
++		restore_fpu(&from->arch_info.fpuContext);
++	}
+ }
+ 
+ 
+@@ -71,9 +115,25 @@ arch_thread_dump_info(void *info)
+ 
+ 
+ status_t
+-arch_thread_enter_userspace(Thread *thread, addr_t entry, void *arg1, void *arg2)
++arch_thread_enter_userspace(Thread *thread, addr_t entry, void *arg1,
++	void *arg2)
+ {
+-	panic("arch_thread_enter_uspace(): not yet implemented\n");
++	dprintf("arch_thread_enter_uspace()\n");
++
++	disable_interrupts();
++	if (arch_setjmp(&thread->arch_info.context) == 0) {
++		SstatusReg status(Sstatus());
++		status.pie = (1 << modeS); // enable interrupts when enter userspace
++		status.spp = modeU;
++		SetSstatus(status.val);
++		SetStvec((addr_t)SVecU);
++		SetSepc(entry);
++		RestoreUserRegs();
++		arch_enter_userspace(arg1, arg2,
++			thread->user_stack_base + thread->user_stack_size);
++	} else {
++		panic("return from userspace");
++	}
+ 	return B_ERROR;
+ }
+ 
+@@ -81,7 +141,35 @@ arch_thread_enter_userspace(Thread *thread, addr_t entry, void *arg1, void *arg2
+ bool
+ arch_on_signal_stack(Thread *thread)
+ {
+-	return false;
++	struct iframe* frame = thread->arch_info.userFrame;
++	if (frame == NULL) {
++		panic("arch_on_signal_stack(): No user iframe!");
++		return false;
++	}
++
++	return frame->sp >= thread->signal_stack_base
++		&& frame->sp < thread->signal_stack_base
++			+ thread->signal_stack_size;
++}
++
++
++static uint8*
++get_signal_stack(Thread* thread, struct iframe* frame,
++	struct sigaction* action, size_t spaceNeeded)
++{
++	// use the alternate signal stack if we should and can
++	if (
++		thread->signal_stack_enabled &&
++		(action->sa_flags & SA_ONSTACK) != 0 && (
++			frame->sp < thread->signal_stack_base ||
++			frame->sp >= thread->signal_stack_base + thread->signal_stack_size
++		)
++	) {
++		addr_t stackTop = thread->signal_stack_base
++			+ thread->signal_stack_size;
++		return (uint8*)ROUNDDOWN(stackTop - spaceNeeded, 16);
++	}
++	return (uint8*)ROUNDDOWN(frame->sp - spaceNeeded, 16);
+ }
+ 
+ 
+@@ -89,20 +177,132 @@ status_t
+ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
+ 	struct signal_frame_data *signalFrameData)
+ {
+-	return B_ERROR;
++	dprintf("arch_setup_signal_frame()\n");
++	iframe* frame = thread->arch_info.userFrame;
++
++	// fill signal context
++	signalFrameData->context.uc_mcontext.x[ 0] = frame->ra;
++	signalFrameData->context.uc_mcontext.x[ 1] = frame->sp;
++	signalFrameData->context.uc_mcontext.x[ 2] = frame->gp;
++	signalFrameData->context.uc_mcontext.x[ 3] = frame->tp;
++	signalFrameData->context.uc_mcontext.x[ 4] = frame->t0;
++	signalFrameData->context.uc_mcontext.x[ 5] = frame->t1;
++	signalFrameData->context.uc_mcontext.x[ 6] = frame->t2;
++	signalFrameData->context.uc_mcontext.x[ 7] = frame->fp;
++	signalFrameData->context.uc_mcontext.x[ 8] = frame->s1;
++	signalFrameData->context.uc_mcontext.x[ 9] = frame->a0;
++	signalFrameData->context.uc_mcontext.x[10] = frame->a1;
++	signalFrameData->context.uc_mcontext.x[11] = frame->a2;
++	signalFrameData->context.uc_mcontext.x[12] = frame->a3;
++	signalFrameData->context.uc_mcontext.x[13] = frame->a4;
++	signalFrameData->context.uc_mcontext.x[14] = frame->a5;
++	signalFrameData->context.uc_mcontext.x[15] = frame->a6;
++	signalFrameData->context.uc_mcontext.x[16] = frame->a7;
++	signalFrameData->context.uc_mcontext.x[17] = frame->s2;
++	signalFrameData->context.uc_mcontext.x[18] = frame->s3;
++	signalFrameData->context.uc_mcontext.x[19] = frame->s4;
++	signalFrameData->context.uc_mcontext.x[20] = frame->s5;
++	signalFrameData->context.uc_mcontext.x[21] = frame->s6;
++	signalFrameData->context.uc_mcontext.x[22] = frame->s7;
++	signalFrameData->context.uc_mcontext.x[23] = frame->s8;
++	signalFrameData->context.uc_mcontext.x[24] = frame->s9;
++	signalFrameData->context.uc_mcontext.x[25] = frame->s10;
++	signalFrameData->context.uc_mcontext.x[26] = frame->s11;
++	signalFrameData->context.uc_mcontext.x[27] = frame->t3;
++	signalFrameData->context.uc_mcontext.x[28] = frame->t4;
++	signalFrameData->context.uc_mcontext.x[29] = frame->t5;
++	signalFrameData->context.uc_mcontext.x[30] = frame->t6;
++	signalFrameData->context.uc_mcontext.pc = frame->epc;
++	// TODO: don't assume that kernel code don't use FPU
++	save_fpu((fpu_context*)&signalFrameData->context.uc_mcontext.f[0]);
++	// end of fill signal context
++
++	signal_get_user_stack(frame->sp, &signalFrameData->context.uc_stack);
++
++	dprintf("  thread->signal_stack_enabled: %d\n",
++		thread->signal_stack_enabled);
++	if (thread->signal_stack_enabled) {
++		dprintf("  signal stack: 0x%" B_PRIxADDR " - 0x%" B_PRIxADDR "\n",
++			thread->signal_stack_base,
++			thread->signal_stack_base + thread->signal_stack_size
++		);
++	}
++
++	uint8* userStack = get_signal_stack(thread, frame, sa,
++		sizeof(*signalFrameData));
++	dprintf("  user stack: 0x%" B_PRIxADDR "\n", (addr_t)userStack);
++	status_t res = user_memcpy(userStack, signalFrameData,
++		sizeof(*signalFrameData));
++	if (res < B_OK)
++		return res;
++
++	addr_t commpageAdr = (addr_t)thread->team->commpage_address;
++	dprintf("  commpageAdr: 0x%" B_PRIxADDR "\n", commpageAdr);
++	addr_t signalHandlerAddr;
++	ASSERT(user_memcpy(&signalHandlerAddr,
++		&((addr_t*)commpageAdr)[COMMPAGE_ENTRY_RISCV64_SIGNAL_HANDLER],
++		sizeof(signalHandlerAddr)) >= B_OK);
++	signalHandlerAddr += commpageAdr;
++
++	frame->ra = frame->epc;
++	frame->sp = (addr_t)userStack;
++	frame->epc = signalHandlerAddr;
++	frame->a0 = frame->sp;
++
++	// WriteTrapInfo();
++
++	return B_OK;
+ }
+ 
+ 
+ int64
+ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
+ {
+-	return 0;
++	dprintf("arch_restore_signal_frame()\n");
++	iframe* frame = thread_get_current_thread()->arch_info.userFrame;
++
++	frame->ra  = signalFrameData->context.uc_mcontext.x[ 0];
++	frame->sp  = signalFrameData->context.uc_mcontext.x[ 1];
++	frame->gp  = signalFrameData->context.uc_mcontext.x[ 2];
++	frame->tp  = signalFrameData->context.uc_mcontext.x[ 3];
++	frame->t0  = signalFrameData->context.uc_mcontext.x[ 4];
++	frame->t1  = signalFrameData->context.uc_mcontext.x[ 5];
++	frame->t2  = signalFrameData->context.uc_mcontext.x[ 6];
++	frame->fp  = signalFrameData->context.uc_mcontext.x[ 7];
++	frame->s1  = signalFrameData->context.uc_mcontext.x[ 8];
++	frame->a0  = signalFrameData->context.uc_mcontext.x[ 9];
++	frame->a1  = signalFrameData->context.uc_mcontext.x[10];
++	frame->a2  = signalFrameData->context.uc_mcontext.x[11];
++	frame->a3  = signalFrameData->context.uc_mcontext.x[12];
++	frame->a4  = signalFrameData->context.uc_mcontext.x[13];
++	frame->a5  = signalFrameData->context.uc_mcontext.x[14];
++	frame->a6  = signalFrameData->context.uc_mcontext.x[15];
++	frame->a7  = signalFrameData->context.uc_mcontext.x[16];
++	frame->s2  = signalFrameData->context.uc_mcontext.x[17];
++	frame->s3  = signalFrameData->context.uc_mcontext.x[18];
++	frame->s4  = signalFrameData->context.uc_mcontext.x[19];
++	frame->s5  = signalFrameData->context.uc_mcontext.x[20];
++	frame->s6  = signalFrameData->context.uc_mcontext.x[21];
++	frame->s7  = signalFrameData->context.uc_mcontext.x[22];
++	frame->s8  = signalFrameData->context.uc_mcontext.x[23];
++	frame->s9  = signalFrameData->context.uc_mcontext.x[24];
++	frame->s10 = signalFrameData->context.uc_mcontext.x[25];
++	frame->s11 = signalFrameData->context.uc_mcontext.x[26];
++	frame->t3  = signalFrameData->context.uc_mcontext.x[27];
++	frame->t4  = signalFrameData->context.uc_mcontext.x[28];
++	frame->t5  = signalFrameData->context.uc_mcontext.x[29];
++	frame->t6  = signalFrameData->context.uc_mcontext.x[30];
++	frame->epc = signalFrameData->context.uc_mcontext.pc;
++	restore_fpu((fpu_context*)&signalFrameData->context.uc_mcontext.f[0]);
++
++	return frame->a0;
+ }
+ 
+ 
+ void
+ arch_check_syscall_restart(Thread *thread)
+ {
++	panic("arch_check_syscall_restart(): not yet implemented\n");
+ }
+ 
+ 
+@@ -114,6 +314,13 @@ arch_check_syscall_restart(Thread *thread)
+ void
+ arch_store_fork_frame(struct arch_fork_arg *arg)
+ {
++	dprintf("arch_store_fork_frame()\n");
++	dprintf("  arg: %p\n", arg);
++	dprintf("  userFrame: %p\n",
++		thread_get_current_thread()->arch_info.userFrame);
++	memcpy(&arg->frame, thread_get_current_thread()->arch_info.userFrame,
++		sizeof(iframe));
++	arg->frame.a0 = 0; // fork return value
+ }
+ 
+ 
+@@ -128,5 +335,15 @@ arch_store_fork_frame(struct arch_fork_arg *arg)
+ void
+ arch_restore_fork_frame(struct arch_fork_arg *arg)
+ {
++	dprintf("arch_restore_fork_frame(%p)\n", arg);
++	disable_interrupts();
++	if (arch_setjmp(&thread_get_current_thread()->arch_info.context) == 0) {
++		SstatusReg status(Sstatus());
++		status.pie = (1 << modeS); // enable interrupts when enter userspace
++		status.spp = modeU;
++		SetSstatus(status.val);
++		arch_longjmp_iframe(&arg->frame);
++	} else {
++		panic("return from userspace");
++	}
+ }
+-
+-- 
+2.30.2
+

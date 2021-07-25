@@ -1,0 +1,297 @@
+From f339a452a148ad7c2c520dc0dd9602cf3eda7907 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Tue, 18 Feb 2020 05:35:52 +0900
+Subject: DriveSetup: Add creating virtual disk and RAM disk support
+
+TODO:
+* Implement path, size dialog for RAM disk.
+* Implement file choose dialog for virtual disk.
+* Implement eject.
+
+Add functionality of "diskimage" and "ramdisk" command line utilities to
+DriveSetup.
+
+Virtual and RAM disks can be created by Disk > Create virtual/RAM disk menu.
+
+Disk can be detached by Disk > Eject menu.
+
+Change-Id: I0010428de0357b55617d51c89941f7a85daf50c0
+---
+ src/apps/drivesetup/CreateRamDiskPanel.cpp | 66 +++++++++++++++++++++
+ src/apps/drivesetup/CreateRamDiskPanel.h   | 27 +++++++++
+ src/apps/drivesetup/Jamfile                |  1 +
+ src/apps/drivesetup/MainWindow.cpp         | 69 ++++++++++++++++++++++
+ src/apps/drivesetup/MainWindow.h           |  5 ++
+ 5 files changed, 168 insertions(+)
+ create mode 100644 src/apps/drivesetup/CreateRamDiskPanel.cpp
+ create mode 100644 src/apps/drivesetup/CreateRamDiskPanel.h
+
+diff --git a/src/apps/drivesetup/CreateRamDiskPanel.cpp b/src/apps/drivesetup/CreateRamDiskPanel.cpp
+new file mode 100644
+index 0000000000..6cc0e2bd91
+--- /dev/null
++++ b/src/apps/drivesetup/CreateRamDiskPanel.cpp
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2020 Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT license.
++ */
++
++
++#include "CreateRamDiskPanel.h"
++
++#include <Catalog.h>
++#include <LayoutBuilder.h>
++#include <GroupLayout.h>
++#include <Button.h>
++#include <TextControl.h>
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "CreateRamDiskPanel"
++
++
++static const uint32 kMsgOk = 'okok';
++
++
++CreateRamDiskPanel::CreateRamDiskPanel(BWindow* window)
++	:
++	BWindow(BRect(300.0, 200.0, 600.0, 300.0), "Create RAM disk", B_TITLED_WINDOW,
++		B_ASYNCHRONOUS_CONTROLS | B_AUTO_UPDATE_SIZE_LIMITS)
++{
++	fPathControl = new BTextControl("Path", B_TRANSLATE("Mount point:"), "", NULL);
++	fSizeControl = new BTextControl("Size", B_TRANSLATE("Size:"), "", NULL);
++
++	BLayoutBuilder::Group<> builder = BLayoutBuilder::Group<>(this, B_VERTICAL);
++
++	BLayoutBuilder::Group<>::GridBuilder gridBuilder = builder.AddGrid(0.0, B_USE_DEFAULT_SPACING);
++
++	gridBuilder.Add(fPathControl->CreateLabelLayoutItem(), 0, 0)
++		.Add(fPathControl->CreateTextViewLayoutItem(), 1, 0);
++	gridBuilder.Add(fSizeControl->CreateLabelLayoutItem(), 0, 1)
++		.Add(fSizeControl->CreateTextViewLayoutItem(), 1, 1);
++
++	BButton* okButton;
++	builder.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
++			.AddGlue()
++			.Add(new BButton(B_TRANSLATE("Cancel"), new BMessage(B_CANCEL)))
++			.Add(okButton = new BButton(B_TRANSLATE("OK"), new BMessage(kMsgOk)))
++		.End()
++		.SetInsets(B_USE_DEFAULT_SPACING);
++
++	SetDefaultButton(okButton);
++}
++
++
++CreateRamDiskPanel::~CreateRamDiskPanel()
++{
++}
++
++void CreateRamDiskPanel::MessageReceived(BMessage* msg)
++{
++	switch (msg->what) {
++	case B_OK:
++		break;
++	case B_CANCEL:
++		PostMessage(B_QUIT_REQUESTED);
++		break;
++	}
++}
++
+diff --git a/src/apps/drivesetup/CreateRamDiskPanel.h b/src/apps/drivesetup/CreateRamDiskPanel.h
+new file mode 100644
+index 0000000000..aa1c0e789b
+--- /dev/null
++++ b/src/apps/drivesetup/CreateRamDiskPanel.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2020 Haiku Inc. All rights reserved.
++ * Distributed under the terms of the MIT license.
++ */
++#ifndef _CREATERAMDISKPANEL_H_
++#define _CREATERAMDISKPANEL_H_
++
++
++#include <Window.h>
++
++class BTextControl;
++
++
++class CreateRamDiskPanel : public BWindow {
++public:
++								CreateRamDiskPanel(BWindow* window);
++	virtual						~CreateRamDiskPanel();
++
++private:
++	void				MessageReceived(BMessage* msg);
++
++	BTextControl*		fPathControl;
++	BTextControl*		fSizeControl;
++};
++
++
++#endif	// _CREATERAMDISKPANEL_H_
+diff --git a/src/apps/drivesetup/Jamfile b/src/apps/drivesetup/Jamfile
+index de36f2da3b..3505479b40 100644
+--- a/src/apps/drivesetup/Jamfile
++++ b/src/apps/drivesetup/Jamfile
+@@ -8,6 +8,7 @@ Preference DriveSetup :
+ 	AbstractParametersPanel.cpp
+ 	ChangeParametersPanel.cpp
+ 	CreateParametersPanel.cpp
++	CreateRamDiskPanel.cpp
+ 	DiskView.cpp
+ 	DriveSetup.cpp
+ 	EncryptionUtils.cpp
+diff --git a/src/apps/drivesetup/MainWindow.cpp b/src/apps/drivesetup/MainWindow.cpp
+index 272189fd62..a35748ade5 100644
+--- a/src/apps/drivesetup/MainWindow.cpp
++++ b/src/apps/drivesetup/MainWindow.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <errno.h>
+ 
+ #include <Alert.h>
+ #include <Application.h>
+@@ -40,6 +41,8 @@
+ #include <VolumeRoster.h>
+ 
+ #include <fs_volume.h>
++#include <file_systems/ram_disk/ram_disk.h>
++#include <AutoDeleter.h>
+ #include <tracker_private.h>
+ 
+ #include "ChangeParametersPanel.h"
+@@ -49,6 +52,7 @@
+ #include "InitParametersPanel.h"
+ #include "PartitionList.h"
+ #include "Support.h"
++#include "CreateRamDiskPanel.h"
+ 
+ 
+ #undef B_TRANSLATION_CONTEXT
+@@ -63,6 +67,9 @@ enum {
+ 	MSG_CREATE					= 'crtp',
+ 	MSG_CHANGE					= 'chgp',
+ 	MSG_INITIALIZE				= 'init',
++	MSG_CREATE_VIRTUAL_DISK		= 'ctvd',
++	MSG_OPEN_VIRTUAL_DISK		= 'opvd',
++	MSG_CREATE_RAM_DISK			= 'ctrd',
+ 	MSG_DELETE					= 'delt',
+ 	MSG_EJECT					= 'ejct',
+ 	MSG_OPEN_DISKPROBE			= 'opdp',
+@@ -214,6 +221,12 @@ MainWindow::MainWindow()
+ 	fMenuBar = new BMenuBar(Bounds(), "root menu");
+ 
+ 	// create all the menu items
++	fCreateVirtualDiskMenuItem = new BMenuItem(B_TRANSLATE("Create virtual disk" B_UTF8_ELLIPSIS),
++		new BMessage(MSG_CREATE_VIRTUAL_DISK));
++	fOpenVirtualDiskMenuItem = new BMenuItem(B_TRANSLATE("Open virtual disk" B_UTF8_ELLIPSIS),
++		new BMessage(MSG_OPEN_VIRTUAL_DISK));
++	fCreateRamDiskMenuItem = new BMenuItem(B_TRANSLATE("Create RAM disk" B_UTF8_ELLIPSIS),
++		new BMessage(MSG_CREATE_RAM_DISK));
+ 	fWipeMenuItem = new BMenuItem(B_TRANSLATE("Wipe (not implemented)"),
+ 		new BMessage(MSG_FORMAT));
+ 	fEjectMenuItem = new BMenuItem(B_TRANSLATE("Eject"),
+@@ -251,6 +264,10 @@ MainWindow::MainWindow()
+ 
+ 	fDiskMenu->AddSeparatorItem();
+ 
++	fDiskMenu->AddItem(fCreateVirtualDiskMenuItem);
++	fDiskMenu->AddItem(fOpenVirtualDiskMenuItem);
++	fDiskMenu->AddItem(fCreateRamDiskMenuItem);
++	fDiskMenu->AddSeparatorItem();
+ 	fDiskMenu->AddItem(fEjectMenuItem);
+ 	// fDiskMenu->AddItem(fSurfaceTestMenuItem);
+ 	fDiskMenu->AddItem(fRescanMenuItem);
+@@ -384,6 +401,21 @@ MainWindow::MessageReceived(BMessage* message)
+ 			break;
+ 		}
+ 
++		case MSG_CREATE_VIRTUAL_DISK:
++			_CreateVirtualDisk();
++			break;
++
++		case MSG_OPEN_VIRTUAL_DISK:
++			printf("MSG_OPEN_VIRTUAL_DISK\n");
++			break;
++
++		case MSG_CREATE_RAM_DISK: {
++			BWindow *wnd = new CreateRamDiskPanel(this);
++			wnd->Show();
++			//_CreateRamDisk();
++			break;
++		}
++
+ 		case MSG_CHANGE:
+ 			_ChangeParameters(fCurrentDisk, fCurrentPartitionID);
+ 			break;
+@@ -1473,3 +1505,40 @@ MainWindow::_UpdateWindowZoomLimits()
+ 	SetZoomLimits(maxWidth, maxHeight);
+ }
+ 
++
++void
++MainWindow::_CreateVirtualDisk()
++{
++	const char *path = "/boot/home/downloads/haiku-master-hrev53759-x86_gcc2h-anyboot/haiku-master-hrev53759-x86_gcc2h-anyboot.iso";
++	BDiskDeviceRoster roster;
++	partition_id id = roster.RegisterFileDevice(path);
++	if (id < 0) {
++		fprintf(stderr, "Error: Failed to register file disk device: %s\n",
++			strerror(id));
++	}
++}
++
++
++void
++MainWindow::_CreateRamDisk()
++{
++	const char *ctrlDevPath = "/dev/" RAM_DISK_CONTROL_DEVICE_NAME;
++
++	ram_disk_ioctl_register request;
++	request.size = 1024*1024*1024 /* 1GB */;
++	request.path[0] = '\0';
++	request.id = -1;
++
++	int fd = open(ctrlDevPath, O_RDONLY);
++	if (fd < 0) {
++		fprintf(stderr, "Error: Failed to open RAM disk control device \"%s\": "
++			"%s\n", ctrlDevPath, strerror(errno));
++		return;
++	}
++	FileDescriptorCloser fdCloser(fd);
++
++	// issue the request
++	if (ioctl(fd, RAM_DISK_IOCTL_REGISTER, &request) < 0)
++		fprintf(stderr, "Error: Failed to create RAM disk device: %s\n",
++			strerror(errno));
++}
+diff --git a/src/apps/drivesetup/MainWindow.h b/src/apps/drivesetup/MainWindow.h
+index 4e0823208d..769d66e37d 100644
+--- a/src/apps/drivesetup/MainWindow.h
++++ b/src/apps/drivesetup/MainWindow.h
+@@ -81,6 +81,8 @@ private:
+ 			float				_ColumnListViewHeight(BColumnListView* list,
+ 									BRow* currentRow);
+ 			void				_UpdateWindowZoomLimits();
++			void				_CreateVirtualDisk();
++			void				_CreateRamDisk();
+ 
+ private:
+ 			BDiskDeviceRoster	fDiskDeviceRoster;
+@@ -100,6 +102,9 @@ private:
+ 
+ 			BMenuBar* 			fMenuBar;
+ 
++			BMenuItem*			fCreateVirtualDiskMenuItem;
++			BMenuItem*			fOpenVirtualDiskMenuItem;
++			BMenuItem*			fCreateRamDiskMenuItem;
+ 			BMenuItem*			fWipeMenuItem;
+ 			BMenuItem*			fEjectMenuItem;
+ 			BMenuItem*			fSurfaceTestMenuItem;
+-- 
+2.30.2
+

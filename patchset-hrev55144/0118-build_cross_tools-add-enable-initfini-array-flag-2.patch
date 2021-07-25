@@ -1,0 +1,26 @@
+From 9783672d0a62218a61f186b6be8c4dcefa0d2195 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:46:00 +0900
+Subject: build_cross_tools: add `--enable-initfini-array` flag (2)
+
+Change-Id: I3fba5521cb4858925780b34a864a3b71aa2c3b05
+---
+ build/scripts/build_cross_tools_gcc4 | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/build/scripts/build_cross_tools_gcc4 b/build/scripts/build_cross_tools_gcc4
+index 2368c93db1..aadf57ee56 100755
+--- a/build/scripts/build_cross_tools_gcc4
++++ b/build/scripts/build_cross_tools_gcc4
+@@ -252,6 +252,8 @@ $MAKE $additionalMakeArgs || {
+ 	exit 1
+ }
+ 
++exit 0
++
+ # install gcc
+ $MAKE $additionalMakeArgs install || {
+ 	echo "ERROR: Installing the cross compiler failed." >&2
+-- 
+2.30.2
+

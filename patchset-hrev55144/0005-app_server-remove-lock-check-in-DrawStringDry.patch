@@ -1,0 +1,39 @@
+From 0b044e5c0c5dbbbb1c7169fe28e85c2e76299972 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sat, 16 May 2020 19:28:42 +0900
+Subject: app_server: remove lock check in DrawStringDry
+
+It doesn't perform actual drawing so locking is not needed.
+
+Fixes #16036.
+
+Change-Id: I5ec8118c95c10d10afa1e18210f673669c8f1bb8
+---
+ src/servers/app/drawing/DrawingEngine.cpp | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/src/servers/app/drawing/DrawingEngine.cpp b/src/servers/app/drawing/DrawingEngine.cpp
+index fe61307121..e970b6af1a 100644
+--- a/src/servers/app/drawing/DrawingEngine.cpp
++++ b/src/servers/app/drawing/DrawingEngine.cpp
+@@ -1430,8 +1430,6 @@ BPoint
+ DrawingEngine::DrawStringDry(const char* string, int32 length,
+ 	const BPoint& pt, escapement_delta* delta)
+ {
+-	ASSERT_PARALLEL_LOCKED();
+-
+ 	BPoint penLocation = pt;
+ 
+ 	// try a fast path first
+@@ -1451,8 +1449,6 @@ BPoint
+ DrawingEngine::DrawStringDry(const char* string, int32 length,
+ 	const BPoint* offsets)
+ {
+-	ASSERT_PARALLEL_LOCKED();
+-
+ 	BPoint penLocation;
+ 	fPainter->BoundingBox(string, length, offsets, &penLocation, NULL);
+ 
+-- 
+2.30.2
+

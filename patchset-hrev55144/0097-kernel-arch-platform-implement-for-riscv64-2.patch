@@ -1,0 +1,94 @@
+From 38db205d88b98d685a960c8d2d3ac8b37cd1f86f Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:05:28 +0900
+Subject: kernel/arch/platform: implement for riscv64 (2)
+
+Change-Id: I745728d62eec011e8ec12dc669b527bc4486f672
+---
+ .../kernel/arch/riscv64/arch_platform.cpp     | 56 ++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/riscv64/arch_platform.cpp b/src/system/kernel/arch/riscv64/arch_platform.cpp
+index aae0d4b6fd..b8c5636112 100644
+--- a/src/system/kernel/arch/riscv64/arch_platform.cpp
++++ b/src/system/kernel/arch/riscv64/arch_platform.cpp
+@@ -5,15 +5,54 @@
+ 
+ #include <arch/platform.h>
+ #include <boot/kernel_args.h>
++#include <Htif.h>
++#include <Plic.h>
++#include <Clint.h>
++#include <platform/sbi/sbi_syscalls.h>
+ 
++#include <debug.h>
++
++
++uint32 gPlatform1;
++uint32 gPlatform2;
+ 
+ void* gFDT = NULL;
+ 
++HtifRegs  *volatile gHtifRegs  = (HtifRegs *volatile)0x40008000;
++PlicRegs  *volatile gPlicRegs;
++ClintRegs *volatile gClintRegs;
++
+ 
+ status_t
+-arch_platform_init(struct kernel_args *kernelArgs)
++arch_platform_init(struct kernel_args *args)
+ {
+-	gFDT = kernelArgs->arch_args.fdt;
++	gPlatform1 = args->arch_args.platform1;
++	gPlatform2 = args->arch_args.platform2;
++
++	debug_early_boot_message("platform1: ");
++	switch (gPlatform1) {
++		case kPlatform1Riscv: debug_early_boot_message("riscv"); break;
++		case kPlatform1Sbi:   debug_early_boot_message("sbi"); break;
++		default: debug_early_boot_message("?"); break;
++	}
++	debug_early_boot_message("\n");
++
++	debug_early_boot_message("platform2: ");
++	switch (gPlatform1) {
++		case kPlatform2Riscv: debug_early_boot_message("riscv"); break;
++		case kPlatform2Efi:   debug_early_boot_message("efi"); break;
++		case kPlatform2UBoot: debug_early_boot_message("uBoot"); break;
++		default: debug_early_boot_message("?"); break;
++	}
++	debug_early_boot_message("\n");
++
++
++	gFDT = args->arch_args.fdt;
++
++	gHtifRegs  = (HtifRegs  *volatile)args->arch_args.htif.start;
++	gPlicRegs  = (PlicRegs  *volatile)args->arch_args.plic.start;
++	gClintRegs = (ClintRegs *volatile)args->arch_args.clint.start;
++
+ 	return B_OK;
+ }
+ 
+@@ -21,6 +60,19 @@ arch_platform_init(struct kernel_args *kernelArgs)
+ status_t
+ arch_platform_init_post_vm(struct kernel_args *kernelArgs)
+ {
++	if (gPlatform1 == kPlatform1Sbi) {
++		sbiret res;
++		res = sbi_get_spec_version();
++		dprintf("SBI spec version: %#lx\n", res.value);
++		res = sbi_get_impl_id();
++		dprintf("SBI implementation ID: %#lx\n", res.value);
++		res = sbi_get_impl_version();
++		dprintf("SBI implementation version: %#lx\n", res.value);
++		res = sbi_get_mvendorid();
++		dprintf("SBI vendor ID: %#lx\n", res.value);
++		res = sbi_get_marchid();
++		dprintf("SBI arch ID: %#lx\n", res.value);
++	}
+ 	return B_OK;
+ }
+ 
+-- 
+2.30.2
+

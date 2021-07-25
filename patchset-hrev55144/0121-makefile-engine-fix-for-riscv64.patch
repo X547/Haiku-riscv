@@ -1,0 +1,26 @@
+From f898546db660b13b56440621c457df2d148e14c4 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:48:19 +0900
+Subject: makefile-engine: fix for riscv64
+
+Change-Id: I85c18ce812db65606ef6aba64f81b80872618263
+---
+ data/develop/makefile-engine | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/data/develop/makefile-engine b/data/develop/makefile-engine
+index 7ca3e7bf7e..dd4d1f718c 100644
+--- a/data/develop/makefile-engine
++++ b/data/develop/makefile-engine
+@@ -144,7 +144,7 @@ VPATH :=
+ VPATH += $(addprefix :, $(subst  ,:, $(filter-out $($(subst, :, ,$(VPATH))), $(SRC_PATHS))))
+ 
+ # Set up the local & system include paths and C++ stdlibs.
+-ifneq (,$(filter $(CPU),x86 x86_64))
++ifneq (,$(filter $(CPU),x86 x86_64 riscv64))
+ 	LOC_INCLUDES = $(foreach path, $(SRC_PATHS) $(LOCAL_INCLUDE_PATHS), $(addprefix -I, $(path)))
+  ifeq ($(CC_VER), 2)
+ 	INCLUDES = $(LOC_INCLUDES)
+-- 
+2.30.2
+

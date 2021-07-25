@@ -1,0 +1,26 @@
+From 7a35bb92ba1c286ecf75c5f564fb05e3ed5c0433 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:43:06 +0900
+Subject: DevicesView: make connection tree a default option
+
+Change-Id: I5472f2b5fa9ae7662977d9871a79ef00eee4a844
+---
+ src/apps/devices/DevicesView.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/apps/devices/DevicesView.cpp b/src/apps/devices/DevicesView.cpp
+index a487813710..514b0074f5 100644
+--- a/src/apps/devices/DevicesView.cpp
++++ b/src/apps/devices/DevicesView.cpp
+@@ -68,7 +68,7 @@ DevicesView::CreateLayout()
+ 		new BMessage(kMsgOrderCategory));
+ 	BMenuItem* byConnection = new BMenuItem(B_TRANSLATE("Connection"),
+ 		new BMessage(kMsgOrderConnection));
+-	byCategory->SetMarked(true);
++	byConnection->SetMarked(true);
+ 	fOrderBy = byCategory->IsMarked() ? ORDER_BY_CATEGORY :
+ 		ORDER_BY_CONNECTION;
+ 	orderByPopupMenu->AddItem(byCategory);
+-- 
+2.30.2
+

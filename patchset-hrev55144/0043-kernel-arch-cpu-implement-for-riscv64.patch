@@ -1,0 +1,113 @@
+From c61049ff2ee9ed8b51909c44cb9202793e491067 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 22:51:53 +0900
+Subject: kernel/arch/cpu: implement for riscv64
+
+Change-Id: Ib4dd636f9ebb62931f77c809185ea810485d801e
+---
+ .../private/kernel/arch/riscv64/arch_atomic.h | 11 +++++-----
+ .../private/kernel/arch/riscv64/arch_cpu.h    | 20 ++++++++++++++++---
+ src/system/kernel/arch/riscv64/arch_cpu.cpp   |  2 ++
+ 3 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_atomic.h b/headers/private/kernel/arch/riscv64/arch_atomic.h
+index 5ecc1e8749..8a10e814ed 100644
+--- a/headers/private/kernel/arch/riscv64/arch_atomic.h
++++ b/headers/private/kernel/arch/riscv64/arch_atomic.h
+@@ -12,24 +12,23 @@
+ static inline void
+ memory_read_barrier_inline(void)
+ {
+-	asm volatile ("nop;" : : : "memory");
+-#warning RISCV64: check memory_read_barrier_inline (FNOP ?)
++	// TODO: investigate reparate read/write barriers
++	__sync_synchronize();
+ }
+ 
+ 
+ static inline void
+ memory_write_barrier_inline(void)
+ {
+-	asm volatile ("nop;" : : : "memory");
+-#warning RISCV64: check memory_write_barrier_inline (FNOP ?)
++	// TODO: investigate reparate read/write barriers
++	__sync_synchronize();
+ }
+ 
+ 
+ static inline void
+ memory_full_barrier_inline(void)
+ {
+-	asm volatile ("nop;" : : : "memory");
+-#warning RISCV64: check memory_full_barrier_inline (FNOP ?)
++	__sync_synchronize();
+ }
+ 
+ 
+diff --git a/headers/private/kernel/arch/riscv64/arch_cpu.h b/headers/private/kernel/arch/riscv64/arch_cpu.h
+index e5efc8ac63..5b1414898c 100644
+--- a/headers/private/kernel/arch/riscv64/arch_cpu.h
++++ b/headers/private/kernel/arch/riscv64/arch_cpu.h
+@@ -8,6 +8,7 @@
+ 
+ 
+ #include <arch/riscv64/arch_thread_types.h>
++#include <arch_cpu_defs.h>
+ #include <kernel.h>
+ 
+ 
+@@ -15,8 +16,21 @@
+ #define CACHE_LINE_SIZE		64
+ 
+ 
+-#define set_ac()
+-#define clear_ac()
++inline void set_ac()
++{
++	return;
++	SstatusReg sstatus(Sstatus());
++	sstatus.sum = 1;
++	SetSstatus(sstatus.val);
++}
++
++inline void clear_ac()
++{
++	return;
++	SstatusReg sstatus(Sstatus());
++	sstatus.sum = 0;
++	SetSstatus(sstatus.val);
++}
+ 
+ 
+ typedef struct arch_cpu_info {
+@@ -39,7 +53,7 @@ arch_cpu_pause(void)
+ static inline void
+ arch_cpu_idle(void)
+ {
+-	// TODO: CPU idle call
++	Wfi();
+ }
+ 
+ 
+diff --git a/src/system/kernel/arch/riscv64/arch_cpu.cpp b/src/system/kernel/arch/riscv64/arch_cpu.cpp
+index c8fa731a13..0bd867a9a6 100644
+--- a/src/system/kernel/arch/riscv64/arch_cpu.cpp
++++ b/src/system/kernel/arch/riscv64/arch_cpu.cpp
+@@ -10,6 +10,7 @@
+ #include <boot/kernel_args.h>
+ #include <commpage.h>
+ #include <elf.h>
++#include <Htif.h>
+ 
+ 
+ status_t
+@@ -95,5 +96,6 @@ arch_cpu_user_TLB_invalidate(void)
+ status_t
+ arch_cpu_shutdown(bool reboot)
+ {
++	HtifShutdown();
+ 	return B_ERROR;
+ }
+-- 
+2.30.2
+

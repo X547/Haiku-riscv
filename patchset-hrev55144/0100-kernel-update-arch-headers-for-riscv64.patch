@@ -1,0 +1,117 @@
+From 8fd2a13056c406fb89476b92d2674d4474649156 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:09:02 +0900
+Subject: kernel: update arch headers for riscv64
+
+Change-Id: Iaf1c253745412614f7e4a30019d96483cb0d3a12
+---
+ .../private/kernel/arch/riscv64/arch_kernel.h | 20 ++++----
+ .../kernel/arch/riscv64/arch_kernel_args.h    | 46 ++++++++++++++++++-
+ 2 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_kernel.h b/headers/private/kernel/arch/riscv64/arch_kernel.h
+index 058eb54c4f..8d4639675b 100644
+--- a/headers/private/kernel/arch/riscv64/arch_kernel.h
++++ b/headers/private/kernel/arch/riscv64/arch_kernel.h
+@@ -15,25 +15,21 @@
+ 
+ // memory layout
+ #define KERNEL_LOAD_BASE        0x80000000
+-#define KERNEL_LOAD_BASE_64_BIT 0xffffffff80000000ll
++#define KERNEL_LOAD_BASE_64_BIT 0xffffffc000000000
+ 
+ 
+ #if defined(__riscv64__)
+ 
+ // Base of the kernel address space.
+-#define KERNEL_BASE            (0x0000000000000000 + 0x1000)
+-#define KERNEL_TOP             (0x0000004000000000 - 1)
+-#define KERNEL_SIZE            ((KERNEL_TOP - KERNEL_BASE) + 1)
+-
+-// Kernel physical memory map area.
+-#define KERNEL_PMAP_BASE        0x0000003000000000
+-#define KERNEL_PMAP_SIZE        0x1000000000
++#define KERNEL_BASE               0xffffffc000000000
++#define KERNEL_SIZE               0x0000004000000000
++#define KERNEL_TOP                (KERNEL_BASE + (KERNEL_SIZE - 1))
+ 
+ // Userspace address space layout.
+-#define USER_BASE               0xffffffc000000000
+-#define USER_BASE_ANY           USER_BASE
+-#define USER_SIZE               0x0000004000000000
+-#define USER_TOP                (USER_BASE + (USER_SIZE - 1))
++#define USER_BASE            (0x0000000000000000 + 0x1000)
++#define USER_BASE_ANY         USER_BASE
++#define USER_TOP             (0x0000004000000000 - 1)
++#define USER_SIZE            (USER_TOP - USER_BASE + 1)
+ 
+ #define KERNEL_USER_DATA_BASE   (USER_BASE + 0x3000000000)
+ #define USER_STACK_REGION       (USER_BASE + 0x3000000000)
+diff --git a/headers/private/kernel/arch/riscv64/arch_kernel_args.h b/headers/private/kernel/arch/riscv64/arch_kernel_args.h
+index c8b888a3dd..279175bc24 100644
+--- a/headers/private/kernel/arch/riscv64/arch_kernel_args.h
++++ b/headers/private/kernel/arch/riscv64/arch_kernel_args.h
+@@ -18,15 +18,59 @@
+ #define MAX_VIRTUAL_RANGES_TO_KEEP      32
+ 
+ 
++enum {
++	kPlatform1None,
++	kPlatform1Riscv,
++	kPlatform1Sbi,
++};
++
++enum {
++	kPlatform2None,
++	kPlatform2Riscv,
++	kPlatform2Efi,
++	kPlatform2UBoot,
++};
++
++
++enum {
++	kUartKindNone,
++	kUartKind8250,
++	kUartKindSifive,
++	kUartKindPl011,
++};
++
++
++typedef struct {
++	uint32 kind;
++	addr_range regs;
++	uint32 irq;
++	int64 clock;
++} _PACKED ArchUart;
++
++
+ // kernel args
+ typedef struct {
++	// Virtual address range of RAM physical memory mapping region
++	addr_range physMap;
++
+ 	// The virtual ranges we want to keep in the kernel.
+ 	uint32		num_virtual_ranges_to_keep;
+ 	addr_range	virtual_ranges_to_keep[MAX_VIRTUAL_RANGES_TO_KEEP];
+ 
+-	// needed for UEFI, otherwise kernel acpi support can't find ACPI root
++	uint32 platform1;
++	uint32 platform2;
++
++	uint bootHart;
++	uint64 timerFrequrency; // in Hz
++
++	// All following address are virtual
+ 	FixedWidthPointer<void> acpi_root;
+ 	FixedWidthPointer<void> fdt;
++
++	addr_range	htif;
++	addr_range	plic;
++	addr_range	clint;
++	ArchUart    uart;
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_RISCV64_KERNEL_ARGS_H */
+-- 
+2.30.2
+

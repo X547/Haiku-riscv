@@ -1,0 +1,69 @@
+From fa962a69c687013b67313f996508192b0b306775 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 21:21:22 +0900
+Subject: package_daemon: add debug output
+
+Change-Id: Ica830f291d375ccd960976d1a926cca1f0d2c9ec
+---
+ .../package/CommitTransactionHandler.cpp      | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/servers/package/CommitTransactionHandler.cpp b/src/servers/package/CommitTransactionHandler.cpp
+index 1cbfbe117f..1623c86f6e 100644
+--- a/src/servers/package/CommitTransactionHandler.cpp
++++ b/src/servers/package/CommitTransactionHandler.cpp
+@@ -885,8 +885,10 @@ CommitTransactionHandler::_AddGlobalWritableFile(Package* package,
+ 		if (targetPath == "settings"
+ 			|| targetPath.StartsWith("settings/")) {
+ 			targetPath.Insert("/global", 8);
+-			if (targetPath.Length() == file.Path().Length())
++			if (targetPath.Length() == file.Path().Length()) {
++				debug_printf("(1)\n");
+ 				throw std::bad_alloc();
++			}
+ 		}
+ 	}
+ 
+@@ -898,12 +900,20 @@ CommitTransactionHandler::_AddGlobalWritableFile(Package* package,
+ 		sourceDirectory = &stackSourceDirectory;
+ 		BString sourceParentPath(file.Path(),
+ 			lastSlash - file.Path().String());
+-		if (sourceParentPath.Length() == 0)
++		if (sourceParentPath.Length() == 0) {
++			debug_printf("(2)\n");
+ 			throw std::bad_alloc();
++		}
+ 
+ 		status_t error = stackSourceDirectory.SetTo(
+ 			&extractedFilesDirectory, sourceParentPath);
+ 		if (error != B_OK) {
++			debug_printf("(3)\n");
++			debug_printf("  path1: \"%s\"\n", _GetPath(
++				FSUtils::Entry(extractedFilesDirectory, sourceParentPath),
++				sourceParentPath).String());
++			debug_printf("  package name: \"%s\"\n", package->FileName().String());
++			debug_printf("  error: 0x%" B_PRIx32 "(%s)\n", error, strerror(error));
+ 			throw Exception(B_TRANSACTION_FAILED_TO_OPEN_DIRECTORY)
+ 				.SetPath1(_GetPath(
+ 					FSUtils::Entry(extractedFilesDirectory, sourceParentPath),
+@@ -921,13 +931,16 @@ CommitTransactionHandler::_AddGlobalWritableFile(Package* package,
+ 	if (lastSlash != NULL) {
+ 		BString targetParentPath(targetPath,
+ 			lastSlash - targetPath.String());
+-		if (targetParentPath.Length() == 0)
++		if (targetParentPath.Length() == 0) {
++			debug_printf("(4)\n");
+ 			throw std::bad_alloc();
++		}
+ 
+ 		BDirectory targetDirectory;
+ 		status_t error = FSUtils::OpenSubDirectory(rootDirectory,
+ 			RelativePath(targetParentPath), true, targetDirectory);
+ 		if (error != B_OK) {
++			debug_printf("(5)\n");
+ 			throw Exception(B_TRANSACTION_FAILED_TO_OPEN_DIRECTORY)
+ 				.SetPath1(_GetPath(
+ 					FSUtils::Entry(rootDirectory, targetParentPath),
+-- 
+2.30.2
+

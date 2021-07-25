@@ -1,0 +1,275 @@
+From fa97658e3d5fdbc43a7be4bce7b73c32705e00c6 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 29 Jun 2020 13:31:43 +0900
+Subject: print_server: fix scripting
+
+* Refactor code to use BPropertyInfo::FindMatch.
+* Call base class when PrintServerApp don't support scripting message
+* Rename "Printers" to "Printer" and "Transports" to "Transport" to
+  follow scriptint property naming conventions.
+* Replace "OpenBeOS" to "Haiku" in scripting suite name.
+
+Change-Id: I19053799f60d71485297a1cbf0efacbb2a8eedb7
+---
+ .../print/PrintServerApp.Scripting.cpp        | 161 +++++++++---------
+ src/servers/print/PrintServerApp.cpp          |  12 +-
+ src/servers/print/Printer.Scripting.cpp       |   2 +-
+ src/servers/print/Transport.Scripting.cpp     |   2 +-
+ 4 files changed, 82 insertions(+), 95 deletions(-)
+
+diff --git a/src/servers/print/PrintServerApp.Scripting.cpp b/src/servers/print/PrintServerApp.Scripting.cpp
+index 531f7efc37..3c48a68aa1 100644
+--- a/src/servers/print/PrintServerApp.Scripting.cpp
++++ b/src/servers/print/PrintServerApp.Scripting.cpp
+@@ -35,12 +35,12 @@ static property_info prop_list[] = {
+ 	{ "Printer", { B_DELETE_PROPERTY }, { B_INDEX_SPECIFIER, B_NAME_SPECIFIER,
+ 		B_REVERSE_INDEX_SPECIFIER },
+ 		B_TRANSLATE_MARK("Delete a specific printer") },
+-	{ "Printers", { B_COUNT_PROPERTIES }, { B_DIRECT_SPECIFIER },
++	{ "Printer", { B_COUNT_PROPERTIES }, { B_DIRECT_SPECIFIER },
+ 		B_TRANSLATE_MARK("Return the number of available printers") },
+ 	{ "Transport", { B_GET_PROPERTY }, { B_INDEX_SPECIFIER, B_NAME_SPECIFIER,
+ 		B_REVERSE_INDEX_SPECIFIER },
+ 		B_TRANSLATE_MARK("Retrieve a specific transport") },
+-	{ "Transports", { B_COUNT_PROPERTIES }, { B_DIRECT_SPECIFIER },
++	{ "Transport", { B_COUNT_PROPERTIES }, { B_DIRECT_SPECIFIER },
+ 		B_TRANSLATE_MARK("Return the number of available transports") },
+ 	{ "UseConfigWindow", { B_GET_PROPERTY, B_SET_PROPERTY },
+ 		{ B_DIRECT_SPECIFIER },
+@@ -53,94 +53,87 @@ static property_info prop_list[] = {
+ void
+ PrintServerApp::HandleScriptingCommand(BMessage* msg)
+ {
+-	BString propName;
+-	BMessage spec;
+-	int32 idx;
++	BMessage reply(B_REPLY);
++	status_t err = B_BAD_SCRIPT_SYNTAX;
++	int32 index;
++	BMessage specifier;
++	int32 what;
++	const char* property;
++
++	if (msg->GetCurrentSpecifier(&index, &specifier, &what, &property)
++			!= B_OK) {
++		return Inherited::MessageReceived(msg);
++	}
+ 
+-	if (msg->GetCurrentSpecifier(&idx,&spec) == B_OK &&
+-		spec.FindString("property",&propName) == B_OK) {
+-		switch(msg->what) {
+-			case B_GET_PROPERTY:
+-				if (propName == "ActivePrinter") {
+-					BMessage reply(B_REPLY);
+-					reply.AddString("result", fDefaultPrinter
++	BPropertyInfo propInfo(prop_list);
++	switch (propInfo.FindMatch(msg, index, &specifier, what, property)) {
++		case 0: // ActivePrinter: GET, SET
++			switch (msg->what) {
++				case B_GET_PROPERTY:
++					err = reply.AddString("result", fDefaultPrinter
+ 						? fDefaultPrinter->Name() : "");
+-					reply.AddInt32("error", B_OK);
+-					msg->SendReply(&reply);
+-				} else if (propName == "UseConfigWindow") {
+-					BMessage reply(B_REPLY);
+-					reply.AddString("result", fUseConfigWindow
+-						? "true" : "false");
+-					reply.AddInt32("error", B_OK);
+-					msg->SendReply(&reply);
+-				}
+-				break;
+-
+-			case B_SET_PROPERTY:
+-				if (propName == "ActivePrinter") {
++					break;
++				case B_SET_PROPERTY: {
+ 					BString newActivePrinter;
+-					if (msg->FindString("data", &newActivePrinter) == B_OK) {
+-						BMessage reply(B_REPLY);
+-						reply.AddInt32("error",
+-							SelectPrinter(newActivePrinter.String()));
+-						msg->SendReply(&reply);
+-					}
+-				} else if (propName == "UseConfigWindow") {
++					err = msg->FindString("data", &newActivePrinter);
++					if (err >= B_OK)
++						err = SelectPrinter(newActivePrinter.String());
++					break;
++				}
++			}
++			break;
++		case 2: { // Printer: CREATE
++			BString name, driver, transport, config;
++			err = msg->FindString("name", &name);
++			if (err >= B_OK)
++				err = msg->FindString("driver", &driver);
++			if (err >= B_OK)
++				err = msg->FindString("transport", &transport);
++			if (err >= B_OK)
++				err = msg->FindString("config", &config);
++			if (err >= B_OK)
++				err = CreatePrinter(name, driver, "Local", transport, config);
++			break;
++		}
++		case 3: { // Printer: DELETE
++			Printer* printer = GetPrinterFromSpecifier(&specifier);
++			if (printer == NULL)
++				err = B_BAD_VALUE;
++			if (err >= B_OK)
++				err = printer->Remove();
++			break;
++		}
++		case 4: // Printers: COUNT
++			err = reply.AddInt32("result", Printer::CountPrinters());
++			break;
++		case 6: // Transports: COUNT
++			err = reply.AddInt32("result", Transport::CountTransports());
++			break;
++		case 7: // UseConfigWindow: GET, SET
++			switch (msg->what) {
++				case B_GET_PROPERTY:
++					err = reply.AddString("result", fUseConfigWindow ? "true"
++						: "false");
++					break;
++				case B_SET_PROPERTY:
+ 					bool useConfigWindow;
+-					if (msg->FindBool("data", &useConfigWindow) == B_OK) {
++					err = msg->FindBool("data", &useConfigWindow);
++					if (err >= B_OK)
+ 						fUseConfigWindow = useConfigWindow;
+-						BMessage reply(B_REPLY);
+-						reply.AddInt32("error", fUseConfigWindow);
+-						msg->SendReply(&reply);
+-					}
+-				}
+-				break;
+-
+-			case B_CREATE_PROPERTY:
+-				if (propName == "Printer") {
+-					BString name, driver, transport, config;
+-
+-					if (msg->FindString("name", &name) == B_OK
+-						&& msg->FindString("driver", &driver) == B_OK
+-						&& msg->FindString("transport", &transport) == B_OK
+-						&& msg->FindString("config", &config) == B_OK) {
+-						BMessage reply(B_REPLY);
+-						reply.AddInt32("error", CreatePrinter(name.String(),
+-							driver.String(), "Local", transport.String(),
+-							config.String()));
+-						msg->SendReply(&reply);
+-					}
+-				}
+-				break;
+-
+-			case B_DELETE_PROPERTY: {
+-					Printer* printer = GetPrinterFromSpecifier(&spec);
+-					status_t rc = B_BAD_VALUE;
+-
+-					if (printer != NULL)
+-						rc=printer->Remove();
++					break;
++			}
++			break;
++		default:
++			return Inherited::MessageReceived(msg);
++	}
+ 
+-					BMessage reply(B_REPLY);
+-					reply.AddInt32("error", rc);
+-					msg->SendReply(&reply);
+-				}
+-				break;
+-
+-			case B_COUNT_PROPERTIES:
+-				if (propName == "Printers") {
+-					BMessage reply(B_REPLY);
+-					reply.AddInt32("result", Printer::CountPrinters());
+-					reply.AddInt32("error", B_OK);
+-					msg->SendReply(&reply);
+-				} else if (propName == "Transports") {
+-					BMessage reply(B_REPLY);
+-					reply.AddInt32("result", Transport::CountTransports());
+-					reply.AddInt32("error", B_OK);
+-					msg->SendReply(&reply);
+-				}
+-				break;
+-		}
++	if (err < B_OK) {
++		reply.what = B_MESSAGE_NOT_UNDERSTOOD;
++		reply.AddString("message", strerror(err));
+ 	}
++
++	reply.AddInt32("error", err);
++	msg->SendReply(&reply);
+ }
+ 
+ 
+@@ -256,7 +249,7 @@ PrintServerApp::ResolveSpecifier(BMessage* msg, int32 index, BMessage* spec,
+ status_t
+ PrintServerApp::GetSupportedSuites(BMessage* msg)
+ {
+-	msg->AddString("suites", "suite/vnd.OpenBeOS-printserver");
++	msg->AddString("suites", "suite/vnd.Haiku-printserver");
+ 
+ 	static bool localized = false;
+ 	if (!localized) {
+diff --git a/src/servers/print/PrintServerApp.cpp b/src/servers/print/PrintServerApp.cpp
+index 4a5be6e316..e00f2ccc80 100644
+--- a/src/servers/print/PrintServerApp.cpp
++++ b/src/servers/print/PrintServerApp.cpp
+@@ -315,6 +315,9 @@ PrintServerApp::SetupPrinterList()
+ void
+ PrintServerApp::MessageReceived(BMessage* msg)
+ {
++	if (msg->HasSpecifiers())
++		return HandleScriptingCommand(msg);
++
+ 	switch(msg->what) {
+ 		case PSRV_GET_ACTIVE_PRINTER:
+ 		case PSRV_MAKE_PRINTER_ACTIVE_QUIETLY:
+@@ -327,15 +330,6 @@ PrintServerApp::MessageReceived(BMessage* msg)
+ 			Handle_BeOSR5_Message(msg);
+ 			break;
+ 
+-		case B_GET_PROPERTY:
+-		case B_SET_PROPERTY:
+-		case B_CREATE_PROPERTY:
+-		case B_DELETE_PROPERTY:
+-		case B_COUNT_PROPERTIES:
+-		case B_EXECUTE_PROPERTY:
+-			HandleScriptingCommand(msg);
+-			break;
+-
+ 		default:
+ 			Inherited::MessageReceived(msg);
+ 	}
+diff --git a/src/servers/print/Printer.Scripting.cpp b/src/servers/print/Printer.Scripting.cpp
+index bf386039ef..804ea38b65 100644
+--- a/src/servers/print/Printer.Scripting.cpp
++++ b/src/servers/print/Printer.Scripting.cpp
+@@ -105,7 +105,7 @@ Printer::ResolveSpecifier(BMessage* msg, int32 index, BMessage* spec,
+ status_t
+ Printer::GetSupportedSuites(BMessage* msg)
+ {
+-	msg->AddString("suites", "application/x-vnd.OpenBeOS-printer");
++	msg->AddString("suites", "application/x-vnd.Haiku-printer");
+ 
+ 	static bool localized = false;
+ 	if (!localized) {
+diff --git a/src/servers/print/Transport.Scripting.cpp b/src/servers/print/Transport.Scripting.cpp
+index 04f1f447eb..b4470f01cb 100644
+--- a/src/servers/print/Transport.Scripting.cpp
++++ b/src/servers/print/Transport.Scripting.cpp
+@@ -99,7 +99,7 @@ Transport::ResolveSpecifier(BMessage* msg, int32 index, BMessage* spec,
+ status_t
+ Transport::GetSupportedSuites(BMessage* msg)
+ {
+-	msg->AddString("suites", "application/x-vnd.OpenBeOS-transport");
++	msg->AddString("suites", "application/x-vnd.Haiku-transport");
+ 
+ 	static bool localized = false;
+ 	if (!localized) {
+-- 
+2.30.2
+

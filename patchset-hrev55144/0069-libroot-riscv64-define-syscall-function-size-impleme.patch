@@ -1,0 +1,45 @@
+From 45a2d248628554ef78e53c0b305185e79182a90b Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 21:09:19 +0900
+Subject: libroot/riscv64: define syscall function size, implement time
+
+Change-Id: Ib08b0b700506e3e1eb41d1b30b025bdf688342d9
+---
+ src/system/libroot/os/arch/riscv64/syscalls.inc | 3 ++-
+ src/system/libroot/os/arch/riscv64/time.cpp     | 5 ++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/libroot/os/arch/riscv64/syscalls.inc b/src/system/libroot/os/arch/riscv64/syscalls.inc
+index 76bee643a3..bcebdae486 100644
+--- a/src/system/libroot/os/arch/riscv64/syscalls.inc
++++ b/src/system/libroot/os/arch/riscv64/syscalls.inc
+@@ -10,7 +10,8 @@
+ name: \
+ 	li t0, n; \
+ 	ecall; \
+-	ret
++	ret; \
++.size	name, .-name
+ 
+ #define SYSCALL0(name, n) _SYSCALL(name, n)
+ #define SYSCALL1(name, n) _SYSCALL(name, n)
+diff --git a/src/system/libroot/os/arch/riscv64/time.cpp b/src/system/libroot/os/arch/riscv64/time.cpp
+index 236080fc79..d898887325 100644
+--- a/src/system/libroot/os/arch/riscv64/time.cpp
++++ b/src/system/libroot/os/arch/riscv64/time.cpp
+@@ -25,8 +25,11 @@ __arch_init_time(struct real_time_data *data, bool setDefaults)
+ }
+ 
+ 
++
++
+ bigtime_t
+ __arch_get_system_time_offset(struct real_time_data *data)
+ {
+-	return 0;
++	//we don't use atomic_get64 because memory is read-only, maybe find another way to lock
++	return data->arch_data.system_time_offset;
+ }
+-- 
+2.30.2
+

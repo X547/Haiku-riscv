@@ -1,0 +1,85 @@
+From 688e4e1cac6b5d37bca0bc19b1a023ace0b65e12 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:06:26 +0900
+Subject: kernel/arch/timer: implement for riscv64 (2)
+
+Change-Id: I0ed511ca8a223cc115f79218e6be3276ce00320b
+---
+ src/system/kernel/arch/riscv64/arch_timer.cpp | 39 ++++++++++++++-----
+ 1 file changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/src/system/kernel/arch/riscv64/arch_timer.cpp b/src/system/kernel/arch/riscv64/arch_timer.cpp
+index 33f8014fad..7510930b7f 100644
+--- a/src/system/kernel/arch/riscv64/arch_timer.cpp
++++ b/src/system/kernel/arch/riscv64/arch_timer.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ 
++#include <boot/kernel_args.h>
+ #include <kernel.h>
+ #include <debug.h>
+ #include <timer.h>
+@@ -14,19 +15,46 @@
+ #include <arch_int.h>
+ #include <arch_cpu_defs.h>
+ #include <Clint.h>
++#include <platform/sbi/sbi_syscalls.h>
++
++
++extern uint32 gPlatform1;
++extern uint32 gPlatform2;
+ 
+ 
+ void
+ arch_timer_set_hardware_timer(bigtime_t timeout)
+ {
+-	MSyscall(setTimerMmodeSyscall, true, gClintRegs->mTime + timeout/10);
++	// TODO: Read timer frequency from FDT
++	switch (gPlatform1) {
++		case kPlatform1Riscv:
++			MSyscall(kMSyscallSetTimer, true,
++				gClintRegs->mtime + timeout * 10);
++			break;
++		case kPlatform1Sbi: {
++			sbi_set_timer(CpuTime() + timeout);
++			break;
++		}
++		default:
++			;
++	}
+ }
+ 
+ 
+ void
+ arch_timer_clear_hardware_timer()
+ {
+-	MSyscall(setTimerMmodeSyscall, false);
++	switch (gPlatform1) {
++		case kPlatform1Riscv:
++			MSyscall(kMSyscallSetTimer, false);
++			break;
++		case kPlatform1Sbi: {
++			sbi_set_timer(CpuTime() + (uint64)10000000 * 3600);
++			break;
++		}
++		default:
++			;
++	}
+ }
+ 
+ 
+@@ -35,10 +63,3 @@ arch_init_timer(kernel_args *args)
+ {
+ 	return B_OK;
+ }
+-
+-
+-bigtime_t
+-system_time(void)
+-{
+-	return CpuTime();
+-}
+-- 
+2.30.2
+

@@ -1,0 +1,57 @@
+From 21d992b6abf5ee313cda91f03358b4de0e472599 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 23:07:20 +0900
+Subject: libdebug: add riscv64 support
+
+Change-Id: I9d9d1697bc67d2ab674f2fbe0dbf3a37ead58595
+---
+ src/kits/debug/arch/riscv64/arch_debug_support.cpp | 12 +++---------
+ 1 file changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/src/kits/debug/arch/riscv64/arch_debug_support.cpp b/src/kits/debug/arch/riscv64/arch_debug_support.cpp
+index 136b0e4e2d..21293d135a 100644
+--- a/src/kits/debug/arch/riscv64/arch_debug_support.cpp
++++ b/src/kits/debug/arch/riscv64/arch_debug_support.cpp
+@@ -20,17 +20,14 @@ status_t
+ arch_debug_get_instruction_pointer(debug_context *context, thread_id thread,
+ 	void **ip, void **stackFrameAddress)
+ {
+-	#warning TODO RISCV64 get instruction pointer
+-	#if 0
+ 	// get the CPU state
+ 	debug_cpu_state cpuState;
+ 	status_t error = debug_get_cpu_state(context, thread, NULL, &cpuState);
+ 	if (error != B_OK)
+ 		return error;
+ 
+-	*ip = (void*)cpuState.rip;
+-	*stackFrameAddress = (void*)cpuState.rbp;
+-	#endif
++	*ip = (void*)cpuState.pc;
++	*stackFrameAddress = (void*)cpuState.x[7];
+ 
+ 	return B_OK;
+ }
+@@ -40,10 +37,8 @@ status_t
+ arch_debug_get_stack_frame(debug_context *context, void *stackFrameAddress,
+ 	debug_stack_frame_info *stackFrameInfo)
+ {
+-	#warning TODO RISCV64 get stack frame
+-	#if 0
+ 	stack_frame stackFrame;
+-	ssize_t bytesRead = debug_read_memory(context, stackFrameAddress,
++	ssize_t bytesRead = debug_read_memory(context, (uint8*)stackFrameAddress - sizeof(stackFrame),
+ 		&stackFrame, sizeof(stackFrame));
+ 	if (bytesRead < B_OK)
+ 		return bytesRead;
+@@ -53,7 +48,6 @@ arch_debug_get_stack_frame(debug_context *context, void *stackFrameAddress,
+ 	stackFrameInfo->frame = stackFrameAddress;
+ 	stackFrameInfo->parent_frame = stackFrame.previous;
+ 	stackFrameInfo->return_address = stackFrame.return_address;
+-	#endif
+ 
+ 	return B_OK;
+ }
+-- 
+2.30.2
+

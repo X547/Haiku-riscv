@@ -1,0 +1,679 @@
+From 885db550622c2343bd23c20ebab837c8e7964bcd Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 22:20:49 +0900
+Subject: kernel/arch/int: implement for riscv64
+
+Change-Id: I62d9bff75d35a685983c626720514ff17b1cef00
+---
+ .../private/kernel/arch/riscv64/arch_int.h    |  27 +-
+ src/system/kernel/arch/riscv64/Jamfile        |   1 +
+ src/system/kernel/arch/riscv64/arch_int.cpp   | 417 +++++++++++++++++-
+ src/system/kernel/arch/riscv64/arch_traps.S   | 116 +++++
+ 4 files changed, 552 insertions(+), 9 deletions(-)
+ create mode 100644 src/system/kernel/arch/riscv64/arch_traps.S
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_int.h b/headers/private/kernel/arch/riscv64/arch_int.h
+index 3fd814d512..85331a8c0d 100644
+--- a/headers/private/kernel/arch/riscv64/arch_int.h
++++ b/headers/private/kernel/arch/riscv64/arch_int.h
+@@ -10,6 +10,7 @@
+ #define _KERNEL_ARCH_RISCV64_INT_H
+ 
+ #include <SupportDefs.h>
++#include <arch_cpu_defs.h>
+ 
+ #define NUM_IO_VECTORS	256
+ 
+@@ -17,30 +18,36 @@
+ static inline void
+ arch_int_enable_interrupts_inline(void)
+ {
+-	// TODO: implement
++	SstatusReg status(Sstatus());
++	status.ie |= (1 << modeS);
++	SetSstatus(status.val);
+ }
+ 
+ 
+ static inline int
+ arch_int_disable_interrupts_inline(void)
+ {
+-	// TODO: implement
+-	return 0;
++	SstatusReg status(Sstatus());
++	int oldState = ((1 << modeS) & status.ie) != 0;
++	status.ie &= ~(1 << modeS);
++	SetSstatus(status.val);
++	return oldState;
+ }
+ 
+ 
+ static inline void
+ arch_int_restore_interrupts_inline(int oldState)
+ {
+-	// TODO: implement
++	if (oldState)
++		arch_int_enable_interrupts_inline();
+ }
+ 
+ 
+ static inline bool
+ arch_int_are_interrupts_enabled_inline(void)
+ {
+-	// TODO: implement
+-	return false;
++	SstatusReg status(Sstatus());
++	return ((1 << modeS) & status.ie) != 0;
+ }
+ 
+ 
+@@ -53,4 +60,12 @@ arch_int_are_interrupts_enabled_inline(void)
+ 	arch_int_are_interrupts_enabled_inline()
+ 
+ 
++enum {
++	switchToSmodeMmodeSyscall = 0,
++	setTimerMmodeSyscall = 1,
++};
++
++extern "C" status_t MSyscall(...);
++
++
+ #endif /* _KERNEL_ARCH_RISCV64_INT_H */
+diff --git a/src/system/kernel/arch/riscv64/Jamfile b/src/system/kernel/arch/riscv64/Jamfile
+index e6d005b3ef..0371ebb210 100644
+--- a/src/system/kernel/arch/riscv64/Jamfile
++++ b/src/system/kernel/arch/riscv64/Jamfile
+@@ -5,6 +5,7 @@ UsePrivateKernelHeaders ;
+ 
+ KernelMergeObject kernel_arch_riscv64.o :
+         arch_asm.S
++        arch_traps.S
+         arch_commpage.cpp
+         arch_cpu.cpp
+         arch_debug.cpp
+diff --git a/src/system/kernel/arch/riscv64/arch_int.cpp b/src/system/kernel/arch/riscv64/arch_int.cpp
+index 885044d2aa..d4e382cfa4 100644
+--- a/src/system/kernel/arch/riscv64/arch_int.cpp
++++ b/src/system/kernel/arch/riscv64/arch_int.cpp
+@@ -8,24 +8,430 @@
+ 
+ 
+ #include <int.h>
++#include <cpu.h>
++#include <thread.h>
++#include <vm/vm_priv.h>
++#include <ksyscalls.h>
++#include <syscall_numbers.h>
++#include <arch_cpu_defs.h>
++#include <arch_thread_types.h>
++#include <arch/debug.h>
++#include <util/AutoLock.h>
++#include <Htif.h>
++#include <Plic.h>
++#include <Clint.h>
+ 
++#include <algorithm>
++
++
++__attribute__ ((aligned (16))) char sMStack[64*1024];
++
++
++extern "C" void MVec();
++extern "C" void MVecS();
++extern "C" void SVec();
++extern "C" void SVecU();
++
++
++//#pragma mark debug output
++
++void
++WriteMode(int mode)
++{
++	switch (mode) {
++		case modeU: dprintf("u"); break;
++		case modeS: dprintf("s"); break;
++		case modeM: dprintf("m"); break;
++		default: dprintf("%d", mode);
++	}
++}
++
++
++void
++WriteModeSet(uint32_t val)
++{
++	bool first = true;
++	dprintf("{");
++	for (int i = 0; i < 32; i++) {
++		if (((1LL << i) & val) != 0) {
++			if (first) first = false; else dprintf(", ");
++			WriteMode(i);
++		}
++	}
++	dprintf("}");
++}
++
++
++void
++WriteMstatus(uint64_t val)
++{
++	MstatusReg status(val);
++	dprintf("(");
++	dprintf("ie: "); WriteModeSet(status.ie);
++	dprintf(", pie: "); WriteModeSet(status.pie);
++	dprintf(", spp: "); WriteMode(status.spp);
++	dprintf(", mpp: "); WriteMode(status.mpp);
++	dprintf(", sum: %d", (int)status.sum);
++	dprintf(")");
++}
++
++
++void
++WriteSstatus(uint64_t val)
++{
++	SstatusReg status(val);
++	dprintf("(");
++	dprintf("ie: "); WriteModeSet(status.ie);
++	dprintf(", pie: "); WriteModeSet(status.pie);
++	dprintf(", spp: "); WriteMode(status.spp);
++	dprintf(", sum: %d", (int)status.sum);
++	dprintf(")");
++}
++
++
++void
++WriteInterrupt(uint64_t val)
++{
++	switch (val) {
++		case 0 + modeU: dprintf("uSoft"); break;
++		case 0 + modeS: dprintf("sSoft"); break;
++		case 0 + modeM: dprintf("mSoft"); break;
++		case 4 + modeU: dprintf("uTimer"); break;
++		case 4 + modeS: dprintf("sTimer"); break;
++		case 4 + modeM: dprintf("mTimer"); break;
++		case 8 + modeU: dprintf("uExtern"); break;
++		case 8 + modeS: dprintf("sExtern"); break;
++		case 8 + modeM: dprintf("mExtern"); break;
++		default: dprintf("%" B_PRId64, val);
++	}
++}
++
++
++void
++WriteInterruptSet(uint64_t val)
++{
++	bool first = true;
++	dprintf("{");
++	for (int i = 0; i < 64; i++) {
++		if (((1LL << i) & val) != 0) {
++			if (first) first = false; else dprintf(", ");
++			WriteInterrupt(i);
++		}
++	}
++	dprintf("}");
++}
++
++
++void
++WriteCause(uint64_t cause)
++{
++	if ((cause & causeInterrupt) == 0) {
++		dprintf("exception ");
++		switch (cause) {
++			case causeExecMisalign: dprintf("execMisalign"); break;
++			case causeExecAccessFault: dprintf("execAccessFault"); break;
++			case causeIllegalInst: dprintf("illegalInst"); break;
++			case causeBreakpoint: dprintf("breakpoint"); break;
++			case causeLoadMisalign: dprintf("loadMisalign"); break;
++			case causeLoadAccessFault: dprintf("loadAccessFault"); break;
++			case causeStoreMisalign: dprintf("storeMisalign"); break;
++			case causeStoreAccessFault: dprintf("storeAccessFault"); break;
++			case causeUEcall: dprintf("uEcall"); break;
++			case causeSEcall: dprintf("sEcall"); break;
++			case causeMEcall: dprintf("mEcall"); break;
++			case causeExecPageFault: dprintf("execPageFault"); break;
++			case causeLoadPageFault: dprintf("loadPageFault"); break;
++			case causeStorePageFault: dprintf("storePageFault"); break;
++			default: dprintf("%" B_PRId64, cause);
++			}
++	} else {
++		dprintf("interrupt "); WriteInterrupt(cause & ~causeInterrupt);
++	}
++}
++
++
++void
++WriteTrapInfo()
++{
++	dprintf("STrap("); WriteCause(Scause()); dprintf(")\n");
++	dprintf("  sstatus: "); WriteSstatus(Sstatus()); dprintf("\n");
++	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
++	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
++	dprintf("  stval: "); WritePC(Stval()); dprintf("\n");
++	dprintf("  tp: 0x%" B_PRIxADDR "(%s)\n", Tp(),
++		thread_get_current_thread()->name);
++	//dprintf("  stval: 0x%" B_PRIx64 "\n", Stval());
++}
++
++
++//#pragma mark -
++
++extern "C" void
++MTrap(iframe* frame)
++{
++	uint64 cause = Mcause();
++/*
++	HtifOutString("+MTrap("); WriteCause(Mcause()); HtifOutString(")\n");
++	dprintf("  mstatus: "); WriteMstatus(Mstatus()); dprintf("\n");
++	dprintf("  mie: "); WriteInterruptSet(Mie()); dprintf("\n");
++	dprintf("  mip: "); WriteInterruptSet(Mip()); dprintf("\n");
++	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
++	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
++	dprintf("  mscratch: 0x%" B_PRIxADDR "\n", Mscratch());
++	DoStackTrace(Fp(), 0);
++*/
++	switch (cause) {
++		case causeMEcall:
++		case causeSEcall: {
++			frame->epc += 4;
++			uint64 op = frame->a0;
++			switch (op) {
++				case switchToSmodeMmodeSyscall: {
++					HtifOutString("switchToSmodeMmodeSyscall()\n");
++					MstatusReg status(Mstatus());
++					status.mpp = modeS;
++					SetMedeleg(
++						0xffff & ~((1 << causeMEcall) | (1 << causeSEcall)));
++					SetMideleg(0xffff & ~(1 << mTimerInt));
++					SetMstatus(status.val);
++					dprintf("modeM stack: 0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
++						"\n", (addr_t)sMStack,
++						(addr_t)(sMStack + sizeof(sMStack)));
++					SetMscratch((addr_t)(sMStack + sizeof(sMStack)));
++					SetMtvec((uint64)MVecS);
++					frame->a0 = B_OK;
++					return;
++				}
++				case setTimerMmodeSyscall: {
++					// HtifOutString("setTimerMmodeSyscall()\n");
++					bool enable = frame->a1 != 0;
++					SetSip(Sip() & ~(1 << sTimerInt));
++					if (!enable) {
++						SetMie(Mie() & ~(1 << mTimerInt));
++					} else {
++						gClintRegs->mTimeCmp[0] = frame->a2;
++						SetMie(Mie() | (1 << mTimerInt));
++					}
++					frame->a0 = B_OK;
++					return;
++				}
++				default:
++					frame->a0 = B_NOT_SUPPORTED;
++					return;
++			}
++			break;
++		}
++		case causeInterrupt + mTimerInt: {
++			disable_interrupts();
++			SetMie(Mie() & ~(1 << mTimerInt));
++			SetMip(Mip() | (1 << sTimerInt));
++			return;
++		}
++	}
++	HtifOutString("unhandled MTrap\n");
++	// DoStackTrace(Fp(), 0);
++	HtifShutdown();
++}
++
++
++static void
++SendSignal(debug_exception_type type, uint32 signalNumber, int32 signalCode,
++	addr_t signalAddress = 0, int32 signalError = B_ERROR)
++{
++	if (SstatusReg(Sstatus()).spp == modeU) {
++		struct sigaction action;
++		Thread* thread = thread_get_current_thread();
++
++		WriteTrapInfo();
++		DoStackTrace(Fp(), 0);
++
++		enable_interrupts();
++
++		// If the thread has a signal handler for the signal, we simply send it
++		// the signal. Otherwise we notify the user debugger first.
++		if ((sigaction(signalNumber, NULL, &action) == 0
++				&& action.sa_handler != SIG_DFL
++				&& action.sa_handler != SIG_IGN)
++			|| user_debug_exception_occurred(type, signalNumber)) {
++			Signal signal(signalNumber, signalCode, signalError,
++				thread->team->id);
++			signal.SetAddress((void*)signalAddress);
++			send_signal_to_thread(thread, signal, 0);
++		}
++	} else {
++		WriteTrapInfo();
++		panic("Unexpected exception occurred in kernel mode!");
++	}
++}
++
++
++static void
++AfterInterrupt()
++{
++	Thread* thread = thread_get_current_thread();
++	cpu_status state = disable_interrupts();
++	if (thread->cpu->invoke_scheduler) {
++		SpinLocker schedulerLocker(thread->scheduler_lock);
++		scheduler_reschedule(B_THREAD_READY);
++		schedulerLocker.Unlock();
++		restore_interrupts(state);
++	} else if (thread->post_interrupt_callback != NULL) {
++		void (*callback)(void*) = thread->post_interrupt_callback;
++		void* data = thread->post_interrupt_data;
++
++		thread->post_interrupt_callback = NULL;
++		thread->post_interrupt_data = NULL;
++
++		restore_interrupts(state);
++
++		callback(data);
++	}
++}
++
++
++extern "C" void
++STrap(iframe* frame)
++{
++	// dprintf("STrap("); WriteCause(Scause()); dprintf(")\n");
++	if (SstatusReg(Sstatus()).spp == modeU) {
++		thread_get_current_thread()->arch_info.userFrame = frame;
++		thread_at_kernel_entry(system_time());
++	}
++	struct ScopeExit {
++		~ScopeExit()
++		{
++			if (SstatusReg(Sstatus()).spp == modeU) {
++				if ((thread_get_current_thread()->flags
++					& (THREAD_FLAGS_SIGNALS_PENDING
++					| THREAD_FLAGS_DEBUG_THREAD
++					| THREAD_FLAGS_TRAP_FOR_CORE_DUMP)) != 0) {
++					enable_interrupts();
++					thread_at_kernel_exit();
++				} else {
++					thread_at_kernel_exit_no_signals();
++				}
++				thread_get_current_thread()->arch_info.userFrame = NULL;
++			}
++		}
++	} scopeExit;
++
++	uint64 cause = Scause();
++	switch (cause) {
++		case causeIllegalInst:
++			return SendSignal(B_INVALID_OPCODE_EXCEPTION, SIGILL, ILL_ILLOPC,
++				frame->epc);
++		case causeExecMisalign:
++		case causeLoadMisalign:
++		case causeStoreMisalign:
++			return SendSignal(B_ALIGNMENT_EXCEPTION, SIGBUS, BUS_ADRALN,
++				Stval());
++		// case causeBreakpoint:
++		// case causeExecAccessFault:
++		// case causeLoadAccessFault:
++		// case causeStoreAccessFault:
++		case causeExecPageFault:
++		case causeLoadPageFault:
++		case causeStorePageFault: {
++			uint64 stval = Stval();
++			SstatusReg status(Sstatus());
++			addr_t newIP = 0;
++			enable_interrupts();
++			vm_page_fault(stval, frame->epc, cause == causeStorePageFault,
++				cause == causeExecPageFault, status.spp == modeU, &newIP);
++			if (newIP != 0)
++				frame->epc = newIP;
++			SetSstatus(status.val);
++			return;
++		}
++		case causeInterrupt + sTimerInt: {
++			SstatusReg status(Sstatus());
++			timer_interrupt();
++			AfterInterrupt();
++			SetSstatus(status.val);
++			return;
++		}
++		case causeInterrupt + sExternInt: {
++			SstatusReg status(Sstatus());
++			uint64 irq = gPlicRegs->contexts[0].claimAndComplete;
++			int_io_interrupt_handler(irq, true);
++			gPlicRegs->contexts[0].claimAndComplete = irq;
++			AfterInterrupt();
++			SetSstatus(status.val);
++			return;
++		}
++		case causeUEcall: {
++			frame->epc += 4; // skip ecall
++			uint64 syscall = frame->t0;
++			uint64 args[20];
++			if (syscall < (uint64)kSyscallCount) {
++				uint32 argCnt = kExtendedSyscallInfos[syscall].parameter_count;
++				memcpy(&args[0], &frame->a0,
++					sizeof(uint64)*std::min<uint32>(argCnt, 8));
++				if (argCnt > 8) {
++					if (status_t res = user_memcpy(&args[8], (void*)frame->sp,
++						sizeof(uint64)*(argCnt - 8)) < B_OK) {
++						dprintf("can't read syscall arguments on user "
++							"stack\n");
++						frame->a0 = res;
++						return;
++					}
++				}
++			}
++/*
++			switch (syscall) {
++				case SYSCALL_READ_PORT_ETC:
++				case SYSCALL_WRITE_PORT_ETC:
++					WriteTrapInfo();
++					DoStackTrace(Fp(), 0);
++					break;
++			}
++*/
++			// dprintf("syscall: %s\n", kExtendedSyscallInfos[syscall].name);
++			SstatusReg status(Sstatus());
++			enable_interrupts();
++			uint64 returnValue = 0;
++			syscall_dispatcher(syscall, (void*)args, &returnValue);
++			frame->a0 = returnValue;
++			SetSstatus(status.val);
++			return;
++		}
++	}
++	WriteTrapInfo();
++	panic("unhandled STrap");
++}
++
++
++//#pragma mark -
+ 
+ status_t
+-arch_int_init(kernel_args *args)
++arch_int_init(kernel_args* args)
+ {
++	SetMtvec((uint64)MVec);
++	SetStvec((uint64)SVec);
++	MstatusReg mstatus(Mstatus());
++	mstatus.ie = 1 << modeM;
++	mstatus.fs = extStatusInitial; // enable FPU
++	mstatus.xs = extStatusOff;
++	SetMstatus(mstatus.val);
++	MSyscall(switchToSmodeMmodeSyscall);
++	SetSie(Sie() | (1 << sTimerInt) | (1 << sExternInt));
++
++	// TODO: read from FDT
++	reserve_io_interrupt_vectors(32, 0, INTERRUPT_TYPE_IRQ);
++
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-arch_int_init_post_vm(kernel_args *args)
++arch_int_init_post_vm(kernel_args* args)
+ {
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-arch_int_init_post_device_manager(struct kernel_args *args)
++arch_int_init_post_device_manager(struct kernel_args* args)
+ {
+ 	return B_OK;
+ }
+@@ -41,16 +447,21 @@ arch_int_init_io(kernel_args* args)
+ void
+ arch_int_enable_io_interrupt(int irq)
+ {
++	// not implemented by TinyEMU
++	gPlicRegs->enable[0][irq / 32] |= 1 << (irq % 32);
+ }
+ 
+ 
+ void
+ arch_int_disable_io_interrupt(int irq)
+ {
++	// not implemented by TinyEMU
++	gPlicRegs->enable[0][irq / 32] &= ~(1 << (irq % 32));
+ }
+ 
+ 
+ void
+ arch_int_assign_to_cpu(int32 irq, int32 cpu)
+ {
++	// SMP not yet supported
+ }
+diff --git a/src/system/kernel/arch/riscv64/arch_traps.S b/src/system/kernel/arch/riscv64/arch_traps.S
+new file mode 100644
+index 0000000000..a8e7fe9b6b
+--- /dev/null
++++ b/src/system/kernel/arch/riscv64/arch_traps.S
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "arch_traps.h"
++
++
++.globl MVec
++.type  MVec, @function
++.align 4
++MVec:
++	PushTrapFrame
++	sd fp, 2*8(sp)
++	csrr t0, mepc
++	sd   t0, 31*8(sp)
++
++	mv a0, sp
++	call MTrap
++
++	ld t0, 31*8(sp)
++	csrw mepc, t0
++	PopTrapFrame
++	mret
++.size	MVec, .-MVec
++
++
++.globl MVecS
++.type  MVecS, @function
++.align 4
++MVecS:
++	csrrw sp, mscratch, sp
++
++	PushTrapFrame
++
++	csrr t0, mscratch
++	sd t0, 2*8(sp) # save supervisor SP
++	csrw mscratch, fp
++
++	csrr t0, mepc
++	sd   t0, 31*8(sp)
++
++	la   t0,    MVec
++	csrw mtvec, t0
++
++	mv a0, sp
++	call MTrap
++
++	la   t0,    MVecS
++	csrw mtvec, t0
++
++	ld t0, 31*8(sp)
++	csrw mepc, t0
++	PopTrapFrame
++	mret
++.size	MVecS, .-MVecS
++
++
++.globl SVec
++.type  SVec, @function
++.align 4
++SVec:
++	PushTrapFrame
++	sd fp, 2*8(sp)
++	csrr t0, sepc
++	sd   t0, 31*8(sp)
++
++	mv a0, sp
++	call STrap
++
++	ld t0, 31*8(sp)
++	csrw sepc, t0
++	PopTrapFrame
++	sret
++.size	SVec, .-SVec
++
++
++.globl SVecU
++.type  SVecU, @function
++.align 4
++SVecU:
++	csrrw t0, sscratch, t0   # t0: &arch_thread
++	ld    tp,        0*8(t0) # tp = arch_thread.thread
++	ld    t0, (1 + 13)*8(t0) # t0 = arch_thread.context.sp
++	sd    sp,  2*8 - 256(t0) # save user SP
++	mv    sp, t0             # switch to kernel stack
++	csrr  t0, sscratch
++
++	PushTrapFrame
++
++	csrr t0, sepc
++	sd   t0, 31*8(sp)
++
++	la   t0,    SVec
++	csrw stvec, t0
++
++	mv a0, sp
++	call STrap
++
++.globl SVecURet
++.type  SVecURet, @function
++SVecURet:
++	call RestoreUserRegs
++
++	csrr  t0, sscratch
++	sd    fp, (1 + 13)*8(t0) # arch_thread.context.sp = fp
++
++	la   t0,    SVecU
++	csrw stvec, t0
++
++	ld t0, 31*8(sp)
++	csrw sepc, t0
++	PopTrapFrame
++	sret
++.size	SVecU, .-SVecU
+-- 
+2.30.2
+

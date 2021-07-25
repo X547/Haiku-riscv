@@ -1,0 +1,48 @@
+From b58cbac35b31665a6ec1d8aaeeb2299bd769dbfb Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 23:02:03 +0900
+Subject: kernel/arch/timer: implement for riscv64
+
+Change-Id: Ia854b0048a86b1427e975f482325ed4d4df1a12a
+---
+ src/system/kernel/arch/riscv64/arch_timer.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/riscv64/arch_timer.cpp b/src/system/kernel/arch/riscv64/arch_timer.cpp
+index fc5193b4a4..33f8014fad 100644
+--- a/src/system/kernel/arch/riscv64/arch_timer.cpp
++++ b/src/system/kernel/arch/riscv64/arch_timer.cpp
+@@ -11,17 +11,22 @@
+ #include <debug.h>
+ #include <timer.h>
+ #include <arch/timer.h>
++#include <arch_int.h>
++#include <arch_cpu_defs.h>
++#include <Clint.h>
+ 
+ 
+ void
+ arch_timer_set_hardware_timer(bigtime_t timeout)
+ {
++	MSyscall(setTimerMmodeSyscall, true, gClintRegs->mTime + timeout/10);
+ }
+ 
+ 
+ void
+ arch_timer_clear_hardware_timer()
+ {
++	MSyscall(setTimerMmodeSyscall, false);
+ }
+ 
+ 
+@@ -35,6 +40,5 @@ arch_init_timer(kernel_args *args)
+ bigtime_t
+ system_time(void)
+ {
+-	// TODO
+-	return 0;
++	return CpuTime();
+ }
+-- 
+2.30.2
+

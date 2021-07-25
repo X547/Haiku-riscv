@@ -1,0 +1,82 @@
+From 5c4fdb630eb50e5922071ab0c4388d74dfe5ed4c Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 22:37:10 +0900
+Subject: kernel: add RISC-V HTIF code
+
+Change-Id: I83251bb4586b4f752c97741f62a96d2f6f842377
+---
+ src/system/kernel/arch/riscv64/Htif.cpp | 49 +++++++++++++++++++++++++
+ src/system/kernel/arch/riscv64/Jamfile  |  1 +
+ 2 files changed, 50 insertions(+)
+ create mode 100644 src/system/kernel/arch/riscv64/Htif.cpp
+
+diff --git a/src/system/kernel/arch/riscv64/Htif.cpp b/src/system/kernel/arch/riscv64/Htif.cpp
+new file mode 100644
+index 0000000000..c4063b1150
+--- /dev/null
++++ b/src/system/kernel/arch/riscv64/Htif.cpp
+@@ -0,0 +1,49 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include <Htif.h>
++
++
++uint64
++HtifCmd(uint32 device, uint8 cmd, uint32 arg)
++{
++	uint64 htifTohost = ((uint64)device << 56)
++		+ ((uint64)cmd << 48) + arg;
++	gHtifRegs->toHostLo = htifTohost % ((uint64)1 << 32);
++	gHtifRegs->toHostHi = htifTohost / ((uint64)1 << 32);
++	return (uint64)gHtifRegs->fromHostLo
++		+ ((uint64)gHtifRegs->fromHostHi << 32);
++}
++
++
++void
++HtifShutdown()
++{
++	HtifCmd(0, 0, 1);
++}
++
++
++void
++HtifOutChar(char ch)
++{
++	HtifCmd(1, 1, ch);
++}
++
++
++void
++HtifOutString(const char *str)
++{
++	for (; *str != '\0'; str++)
++		HtifOutChar(*str);
++}
++
++
++void
++HtifOutString(const char *str, size_t len)
++{
++	for (; len > 0; str++, len--)
++		HtifOutChar(*str);
++}
+diff --git a/src/system/kernel/arch/riscv64/Jamfile b/src/system/kernel/arch/riscv64/Jamfile
+index 0371ebb210..de684e5081 100644
+--- a/src/system/kernel/arch/riscv64/Jamfile
++++ b/src/system/kernel/arch/riscv64/Jamfile
+@@ -22,6 +22,7 @@ KernelMergeObject kernel_arch_riscv64.o :
+         arch_vm.cpp
+         arch_vm_translation_map.cpp
+         RISCV64VMTranslationMap.cpp
++        Htif.cpp
+         :
+         $(TARGET_KERNEL_PIC_CCFLAGS) -Wno-unused
+         :
+-- 
+2.30.2
+

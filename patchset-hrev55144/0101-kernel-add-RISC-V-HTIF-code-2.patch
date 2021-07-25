@@ -1,0 +1,27 @@
+From 239c90124a9899440acb6545560cb08ab7d15252 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:09:57 +0900
+Subject: kernel: add RISC-V HTIF code (2)
+
+Change-Id: Iabd1cdc59fde905a6f17bbc7640638c0ed06918b
+---
+ src/system/kernel/arch/riscv64/Htif.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/system/kernel/arch/riscv64/Htif.cpp b/src/system/kernel/arch/riscv64/Htif.cpp
+index c4063b1150..7101958d22 100644
+--- a/src/system/kernel/arch/riscv64/Htif.cpp
++++ b/src/system/kernel/arch/riscv64/Htif.cpp
+@@ -10,6 +10,9 @@
+ uint64
+ HtifCmd(uint32 device, uint8 cmd, uint32 arg)
+ {
++	if (gHtifRegs == 0)
++		return 0;
++
+ 	uint64 htifTohost = ((uint64)device << 56)
+ 		+ ((uint64)cmd << 48) + arg;
+ 	gHtifRegs->toHostLo = htifTohost % ((uint64)1 << 32);
+-- 
+2.30.2
+

@@ -1,0 +1,54 @@
+From 90c3e96c4e1571671b87d380fe84f7e5e21275b7 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Fri, 15 Jan 2021 11:22:29 +0900
+Subject: runtime_loader: export loaded module list
+
+Change-Id: I51cd3193960cf927ce9538c4d5ad0e80338c8979
+---
+ headers/private/runtime_loader/runtime_loader.h | 2 ++
+ src/system/runtime_loader/export.cpp            | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/headers/private/runtime_loader/runtime_loader.h b/headers/private/runtime_loader/runtime_loader.h
+index 2cf0a271e8..590936ff12 100644
+--- a/headers/private/runtime_loader/runtime_loader.h
++++ b/headers/private/runtime_loader/runtime_loader.h
+@@ -23,6 +23,7 @@
+ 
+ struct user_space_program_args;
+ struct SymbolLookupInfo;
++struct image_queue_t;
+ 
+ struct rld_export {
+ 	// runtime loader API export
+@@ -59,6 +60,7 @@ struct rld_export {
+ 	const void* commpage_address;
+ 	int abi_version;
+ 	int api_version;
++	struct image_queue_t *loaded_images;
+ };
+ 
+ extern struct rld_export *__gRuntimeLoader;
+diff --git a/src/system/runtime_loader/export.cpp b/src/system/runtime_loader/export.cpp
+index 70c742d006..1dfdf2f9f0 100644
+--- a/src/system/runtime_loader/export.cpp
++++ b/src/system/runtime_loader/export.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "runtime_loader_private.h"
+ #include "elf_tls.h"
++#include "images.h"
+ 
+ 
+ // exported via the rld_export structure in user space program arguments
+@@ -90,6 +91,7 @@ rldexport_init(void)
+ {
+ 	gRuntimeLoader.program_args = gProgramArgs;
+ 	gRuntimeLoader.commpage_address = __gCommPageAddress;
++	gRuntimeLoader.loaded_images = &get_loaded_images();
+ }
+ 
+ 
+-- 
+2.30.2
+

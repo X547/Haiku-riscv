@@ -1,0 +1,1630 @@
+From 4301ef1790058aeb984307a9ffce6cb8e0b01b3b Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 10 Dec 2020 05:06:33 +0900
+Subject: integrate AutoDeleter's into pointers
+
+Change-Id: I6c3925a7aec4d0647c76c2a03aad7b08985d7166
+---
+ src/add-ons/disk_systems/bfs/BFSAddOn.cpp     | 12 ++---
+ .../disk/virtual/ram_disk/ram_disk.cpp        | 33 +++++++------
+ .../kernel/file_systems/bindfs/Volume.cpp     |  9 ++--
+ .../packagefs/volume/PackageSettings.cpp      |  8 ++--
+ .../file_systems/packagefs/volume/Volume.cpp  | 47 +++++++++----------
+ src/apps/aboutsystem/AboutSystem.cpp          |  8 ++--
+ src/apps/drivesetup/MainWindow.cpp            |  7 ++-
+ src/bin/fstrim.cpp                            |  8 ++--
+ src/bin/i2c/i2c.cpp                           |  9 ++--
+ src/bin/multiuser/multiuser_utils.cpp         | 11 ++---
+ src/bin/package/PackageWritingUtils.cpp       |  7 ++-
+ src/bin/ramdisk.cpp                           | 29 +++++-------
+ src/kits/network/libnetapi/NetworkDevice.cpp  | 34 ++++++--------
+ .../network/libnetapi/NetworkInterface.cpp    | 44 +++++++----------
+ src/kits/network/libnetapi/NetworkRoster.cpp  | 34 +++++---------
+ src/kits/network/libnetapi/NetworkRoute.cpp   | 10 ++--
+ src/kits/package/RepositoryInfo.cpp           | 34 ++++++++------
+ src/kits/package/hpkg/PackageWriterImpl.cpp   | 28 +++++------
+ .../package/manager/RepositoryBuilder.cpp     |  7 ++-
+ src/preferences/virtualmemory/Settings.cpp    | 32 +++++++------
+ src/servers/net/NetServer.cpp                 |  9 ++--
+ .../package/CommitTransactionHandler.cpp      | 11 ++---
+ src/servers/package/PackageFile.cpp           |  7 ++-
+ src/servers/package/Volume.cpp                | 22 ++++-----
+ .../registrar/AuthenticationManager.cpp       | 42 +++++++----------
+ .../packagefs/PackageSettingsItem.cpp         | 13 +++--
+ src/system/boot/loader/package_support.cpp    | 11 ++---
+ src/system/libnetwork/getifaddrs.cpp          | 37 +++++++--------
+ src/system/libroot/os/image.cpp               |  9 ++--
+ src/tools/generate_boot_screen.cpp            | 27 ++---------
+ 30 files changed, 260 insertions(+), 339 deletions(-)
+
+diff --git a/src/add-ons/disk_systems/bfs/BFSAddOn.cpp b/src/add-ons/disk_systems/bfs/BFSAddOn.cpp
+index 7b5a5e5fbf..274f148395 100644
+--- a/src/add-ons/disk_systems/bfs/BFSAddOn.cpp
++++ b/src/add-ons/disk_systems/bfs/BFSAddOn.cpp
+@@ -226,12 +226,10 @@ BFSPartitionHandle::Repair(bool checkOnly)
+ 	BPath path;
+ 	path.SetTo(&directory, ".");
+ 
+-	int fd = open(path.Path(), O_RDONLY);
+-	if (fd < 0)
++	FileDescriptorCloser fd(open(path.Path(), O_RDONLY));
++	if (!fd.IsSet())
+ 	    return errno;
+ 
+-	FileDescriptorCloser closer(fd);
+-
+ 	struct check_control result;
+ 	memset(&result, 0, sizeof(result));
+ 	result.magic = BFS_IOCTL_CHECK_MAGIC;
+@@ -243,7 +241,7 @@ BFSPartitionHandle::Repair(bool checkOnly)
+ 	}
+ 
+ 	// start checking
+-	if (ioctl(fd, BFS_IOCTL_START_CHECKING, &result, sizeof(result)) < 0)
++	if (ioctl(fd.Get(), BFS_IOCTL_START_CHECKING, &result, sizeof(result)) < 0)
+ 	    return errno;
+ 
+ 	uint64 attributeDirectories = 0, attributes = 0;
+@@ -252,7 +250,7 @@ BFSPartitionHandle::Repair(bool checkOnly)
+ 	uint32 previousPass = result.pass;
+ 
+ 	// check all files and report errors
+-	while (ioctl(fd, BFS_IOCTL_CHECK_NEXT_NODE, &result,
++	while (ioctl(fd.Get(), BFS_IOCTL_CHECK_NEXT_NODE, &result,
+ 			sizeof(result)) == 0) {
+ 		if (++counter % 50 == 0)
+ 			printf("%9" B_PRIu64 " nodes processed\x1b[1A\n", counter);
+@@ -297,7 +295,7 @@ BFSPartitionHandle::Repair(bool checkOnly)
+ 	}
+ 
+ 	// stop checking
+-	if (ioctl(fd, BFS_IOCTL_STOP_CHECKING, &result, sizeof(result)) != 0)
++	if (ioctl(fd.Get(), BFS_IOCTL_STOP_CHECKING, &result, sizeof(result)) != 0)
+ 		return errno;
+ 
+ 	printf("        %" B_PRIu64 " nodes checked,\n\t%" B_PRIu64 " blocks not "
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/ram_disk/ram_disk.cpp b/src/add-ons/kernel/drivers/disk/virtual/ram_disk/ram_disk.cpp
+index 280e370abb..a219a84dcd 100644
+--- a/src/add-ons/kernel/drivers/disk/virtual/ram_disk/ram_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/virtual/ram_disk/ram_disk.cpp
+@@ -395,10 +395,9 @@ struct RawDevice : Device, DoublyLinkedListLinkImpl<RawDevice> {
+ 		static const size_t kPageCountPerIteration = 1024;
+ 		static const size_t kMaxGapSize = 15;
+ 
+-		int fd = open(fFilePath, O_WRONLY);
+-		if (fd < 0)
++		FileDescriptorCloser fd(open(fFilePath, O_WRONLY));
++		if (!fd.IsSet())
+ 			return errno;
+-		FileDescriptorCloser fdCloser(fd);
+ 
+ 		vm_page** pages = new(std::nothrow) vm_page*[kPageCountPerIteration];
+ 		ArrayDeleter<vm_page*> pagesDeleter(pages);
+@@ -491,7 +490,7 @@ struct RawDevice : Device, DoublyLinkedListLinkImpl<RawDevice> {
+ 
+ 			// write the buffer
+ 			if (error == B_OK) {
+-				ssize_t bytesWritten = pwrite(fd, buffer,
++				ssize_t bytesWritten = pwrite(fd.Get(), buffer,
+ 					pagesToWrite * B_PAGE_SIZE, offset);
+ 				if (bytesWritten < 0) {
+ 					dprintf("ramdisk: error writing pages to file: %s\n",
+@@ -793,21 +792,20 @@ private:
+ 	{
+ 		static const size_t kPageCountPerIteration = 1024;
+ 
+-		int fd = open(fFilePath, O_RDONLY);
+-		if (fd < 0)
++		FileDescriptorCloser fd(open(fFilePath, O_RDONLY));
++		if (!fd.IsSet())
+ 			return errno;
+-		FileDescriptorCloser fdCloser(fd);
+ 
+-		vm_page** pages = new(std::nothrow) vm_page*[kPageCountPerIteration];
+-		ArrayDeleter<vm_page*> pagesDeleter(pages);
++		ArrayDeleter<vm_page*> pages(
++			new(std::nothrow) vm_page*[kPageCountPerIteration]);
+ 
+-		uint8* buffer = (uint8*)malloc(kPageCountPerIteration * B_PAGE_SIZE);
+-		MemoryDeleter bufferDeleter(buffer);
++		ArrayDeleter<uint8> buffer(
++			new(std::nothrow) uint8[kPageCountPerIteration * B_PAGE_SIZE]);
+ 			// TODO: Ideally we wouldn't use a buffer to read the file content,
+ 			// but read into the pages we allocated directly. Unfortunately
+ 			// there's no API to do that yet.
+ 
+-		if (pages == NULL || buffer == NULL)
++		if (!pages.IsSet() || !buffer.IsSet())
+ 			return B_NO_MEMORY;
+ 
+ 		status_t error = B_OK;
+@@ -836,7 +834,8 @@ private:
+ 
+ 			// read from the file
+ 			size_t bytesToRead = pagesToRead * B_PAGE_SIZE;
+-			ssize_t bytesRead = pread(fd, buffer, bytesToRead, offset);
++			ssize_t bytesRead = pread(fd.Get(), buffer.Get(), bytesToRead,
++				offset);
+ 			if (bytesRead < 0) {
+ 				error = bytesRead;
+ 				break;
+@@ -849,7 +848,7 @@ private:
+ 
+ 			// clear the last read page, if partial
+ 			if ((size_t)bytesRead < pagesRead * B_PAGE_SIZE) {
+-				memset(buffer + bytesRead, 0,
++				memset(buffer.Get() + bytesRead, 0,
+ 					pagesRead * B_PAGE_SIZE - bytesRead);
+ 			}
+ 
+@@ -858,7 +857,7 @@ private:
+ 				vm_page* page = pages[i];
+ 				error = vm_memcpy_to_physical(
+ 					page->physical_page_number * B_PAGE_SIZE,
+-					buffer + i * B_PAGE_SIZE, B_PAGE_SIZE, false);
++					buffer.Get() + i * B_PAGE_SIZE, B_PAGE_SIZE, false);
+ 				if (error != B_OK)
+ 					break;
+ 			}
+@@ -873,7 +872,7 @@ private:
+ 
+ 			size_t clearPages = 0;
+ 			for (size_t i = 0; i < pagesRead; i++) {
+-				uint64* pageData = (uint64*)(buffer + i * B_PAGE_SIZE);
++				uint64* pageData = (uint64*)(buffer.Get() + i * B_PAGE_SIZE);
+ 				bool isClear = true;
+ 				for (size_t k = 0; isClear && k < B_PAGE_SIZE / 8; k++)
+ 					isClear = pageData[k] == 0;
+@@ -892,7 +891,7 @@ private:
+ 			// and compute the new allocated pages count.
+ 			if (pagesRead < allocatedPages) {
+ 				size_t count = allocatedPages - pagesRead;
+-				memcpy(pages + clearPages, pages + pagesRead,
++				memcpy(pages.Get() + clearPages, pages.Get() + pagesRead,
+ 					count * sizeof(vm_page*));
+ 				clearPages += count;
+ 			}
+diff --git a/src/add-ons/kernel/file_systems/bindfs/Volume.cpp b/src/add-ons/kernel/file_systems/bindfs/Volume.cpp
+index 5f53bd074a..7f468a0fe1 100644
+--- a/src/add-ons/kernel/file_systems/bindfs/Volume.cpp
++++ b/src/add-ons/kernel/file_systems/bindfs/Volume.cpp
+@@ -50,10 +50,11 @@ status_t
+ Volume::Mount(const char* parameterString)
+ {
+ 	const char* source = NULL;
+-	void* parameterHandle = parse_driver_settings_string(parameterString);
+-	DriverSettingsUnloader parameterDeleter(parameterHandle);
+-	if (parameterHandle != NULL)
+-		source = get_driver_parameter(parameterHandle, "source", NULL, NULL);
++	DriverSettingsUnloader parametersHandle(
++		parse_driver_settings_string(parameterString));
++	if (parametersHandle.IsSet())
++		source = get_driver_parameter(
++			parametersHandle.Get(), "source", NULL, NULL);
+ 	if (source == NULL || source[0] == '\0') {
+ 		ERROR("need source folder ('source' parameter)!\n");
+ 		RETURN_ERROR(B_BAD_VALUE);
+diff --git a/src/add-ons/kernel/file_systems/packagefs/volume/PackageSettings.cpp b/src/add-ons/kernel/file_systems/packagefs/volume/PackageSettings.cpp
+index 10d8f77ebf..4284693a2a 100644
+--- a/src/add-ons/kernel/file_systems/packagefs/volume/PackageSettings.cpp
++++ b/src/add-ons/kernel/file_systems/packagefs/volume/PackageSettings.cpp
+@@ -216,12 +216,12 @@ PackageSettings::Load(dev_t mountPointDeviceID, ino_t mountPointNodeID,
+ 		return error;
+ 
+ 	// load the driver settings
+-	void* settingsHandle = load_driver_settings(path.Path());
+-	if (settingsHandle == NULL)
++	DriverSettingsUnloader settingsHandle(load_driver_settings(path.Path()));
++	if (!settingsHandle.IsSet())
+ 		return B_ENTRY_NOT_FOUND;
+-	DriverSettingsUnloader settingsDeleter(settingsHandle);
+ 
+-	const driver_settings* settings = get_driver_settings(settingsHandle);
++	const driver_settings* settings
++		= get_driver_settings(settingsHandle.Get());
+ 	for (int i = 0; i < settings->parameter_count; i++) {
+ 		const driver_parameter& parameter = settings->parameters[i];
+ 		if (strcmp(parameter.name, "Package") != 0
+diff --git a/src/add-ons/kernel/file_systems/packagefs/volume/Volume.cpp b/src/add-ons/kernel/file_systems/packagefs/volume/Volume.cpp
+index eecfa5390a..595eb04713 100644
+--- a/src/add-ons/kernel/file_systems/packagefs/volume/Volume.cpp
++++ b/src/add-ons/kernel/file_systems/packagefs/volume/Volume.cpp
+@@ -318,21 +318,21 @@ Volume::Mount(const char* parameterString)
+ 	const char* shineThrough = NULL;
+ 	const char* packagesState = NULL;
+ 
+-	void* parameterHandle = parse_driver_settings_string(parameterString);
+-	if (parameterHandle != NULL) {
+-		packages = get_driver_parameter(parameterHandle, "packages", NULL,
+-			NULL);
+-		volumeName = get_driver_parameter(parameterHandle, "volume-name", NULL,
+-			NULL);
+-		mountType = get_driver_parameter(parameterHandle, "type", NULL, NULL);
+-		shineThrough = get_driver_parameter(parameterHandle, "shine-through",
++	DriverSettingsUnloader parameterHandle(
++		parse_driver_settings_string(parameterString));
++	if (parameterHandle.IsSet()) {
++		packages = get_driver_parameter(parameterHandle.Get(), "packages",
++			NULL, NULL);
++		volumeName = get_driver_parameter(parameterHandle.Get(), "volume-name",
+ 			NULL, NULL);
+-		packagesState = get_driver_parameter(parameterHandle, "state", NULL,
++		mountType = get_driver_parameter(parameterHandle.Get(), "type", NULL,
+ 			NULL);
++		shineThrough = get_driver_parameter(parameterHandle.Get(),
++			"shine-through", NULL, NULL);
++		packagesState = get_driver_parameter(parameterHandle.Get(), "state",
++			NULL, NULL);
+ 	}
+ 
+-	DriverSettingsUnloader parameterHandleDeleter(parameterHandle);
+-
+ 	if (packages != NULL && packages[0] == '\0') {
+ 		FATAL("invalid package folder ('packages' parameter)!\n");
+ 		RETURN_ERROR(B_BAD_VALUE);
+@@ -707,14 +707,13 @@ Volume::_LoadOldPackagesStates(const char* packagesState)
+ 	}
+ 
+ 	// iterate through the "administrative" dir
+-	DIR* dir = fdopendir(fd);
+-	if (dir == NULL) {
++	DirCloser dir(fdopendir(fd));
++	if (!dir.IsSet()) {
+ 		ERROR("Failed to open administrative directory: %s\n", strerror(errno));
+ 		RETURN_ERROR(errno);
+ 	}
+-	DirCloser dirCloser(dir);
+ 
+-	while (dirent* entry = readdir(dir)) {
++	while (dirent* entry = readdir(dir.Get())) {
+ 		if (strncmp(entry->d_name, "state_", 6) != 0
+ 			|| strcmp(entry->d_name, packagesState) < 0) {
+ 			continue;
+@@ -813,20 +812,19 @@ Volume::_AddInitialPackagesFromActivationFile(
+ 	PackagesDirectory* packagesDirectory)
+ {
+ 	// try reading the activation file
+-	int fd = openat(packagesDirectory->DirectoryFD(),
++	FileDescriptorCloser fd(openat(packagesDirectory->DirectoryFD(),
+ 		packagesDirectory == fPackagesDirectory
+ 			? kActivationFilePath : kActivationFileName,
+-		O_RDONLY);
+-	if (fd < 0) {
++		O_RDONLY));
++	if (!fd.IsSet()) {
+ 		INFORM("Failed to open packages activation file: %s\n",
+ 			strerror(errno));
+ 		RETURN_ERROR(errno);
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	// read the whole file into memory to simplify things
+ 	struct stat st;
+-	if (fstat(fd, &st) != 0) {
++	if (fstat(fd.Get(), &st) != 0) {
+ 		ERROR("Failed to stat packages activation file: %s\n",
+ 			strerror(errno));
+ 		RETURN_ERROR(errno);
+@@ -842,7 +840,7 @@ Volume::_AddInitialPackagesFromActivationFile(
+ 		RETURN_ERROR(B_NO_MEMORY);
+ 	MemoryDeleter fileContentDeleter(fileContent);
+ 
+-	ssize_t bytesRead = read(fd, fileContent, st.st_size);
++	ssize_t bytesRead = read(fd.Get(), fileContent, st.st_size);
+ 	if (bytesRead < 0) {
+ 		ERROR("Failed to read packages activation file: %s\n", strerror(errno));
+ 		RETURN_ERROR(errno);
+@@ -898,15 +896,14 @@ Volume::_AddInitialPackagesFromDirectory()
+ 		RETURN_ERROR(errno);
+ 	}
+ 
+-	DIR* dir = fdopendir(fd);
+-	if (dir == NULL) {
++	DirCloser dir(fdopendir(fd));
++	if (!dir.IsSet()) {
+ 		ERROR("Failed to open packages directory \"%s\": %s\n",
+ 			fPackagesDirectory->Path(), strerror(errno));
+ 		RETURN_ERROR(errno);
+ 	}
+-	DirCloser dirCloser(dir);
+ 
+-	while (dirent* entry = readdir(dir)) {
++	while (dirent* entry = readdir(dir.Get())) {
+ 		// skip "." and ".."
+ 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+ 			continue;
+diff --git a/src/apps/aboutsystem/AboutSystem.cpp b/src/apps/aboutsystem/AboutSystem.cpp
+index 804766d268..b39f236736 100644
+--- a/src/apps/aboutsystem/AboutSystem.cpp
++++ b/src/apps/aboutsystem/AboutSystem.cpp
+@@ -1466,19 +1466,19 @@ AboutView::_AddCopyrightsFromAttribute()
+ 		return;
+ 
+ 	// attach it to a FILE
+-	FILE* attrFile = fdopen(attrFD, "r");
+-	if (attrFile == NULL) {
++	FileCloser attrFile(fdopen(attrFD, "r"));
++	if (!attrFile.IsSet()) {
+ 		close(attrFD);
+ 		return;
+ 	}
+-	FileCloser _(attrFile);
+ 
+ 	// read and parse the copyrights
+ 	BMessage package;
+ 	BString fieldName;
+ 	BString fieldValue;
+ 	char lineBuffer[LINE_MAX];
+-	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), attrFile)) {
++	while (char* line
++		= fgets(lineBuffer, sizeof(lineBuffer), attrFile.Get())) {
+ 		// chop off line break
+ 		size_t lineLen = strlen(line);
+ 		if (lineLen > 0 && line[lineLen - 1] == '\n')
+diff --git a/src/apps/drivesetup/MainWindow.cpp b/src/apps/drivesetup/MainWindow.cpp
+index a35748ade5..bc2630afb0 100644
+--- a/src/apps/drivesetup/MainWindow.cpp
++++ b/src/apps/drivesetup/MainWindow.cpp
+@@ -1529,16 +1529,15 @@ MainWindow::_CreateRamDisk()
+ 	request.path[0] = '\0';
+ 	request.id = -1;
+ 
+-	int fd = open(ctrlDevPath, O_RDONLY);
+-	if (fd < 0) {
++	FileDescriptorCloser fd(open(ctrlDevPath, O_RDONLY));
++	if (!fd.IsSet()) {
+ 		fprintf(stderr, "Error: Failed to open RAM disk control device \"%s\": "
+ 			"%s\n", ctrlDevPath, strerror(errno));
+ 		return;
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	// issue the request
+-	if (ioctl(fd, RAM_DISK_IOCTL_REGISTER, &request) < 0)
++	if (ioctl(fd.Get(), RAM_DISK_IOCTL_REGISTER, &request) < 0)
+ 		fprintf(stderr, "Error: Failed to create RAM disk device: %s\n",
+ 			strerror(errno));
+ }
+diff --git a/src/bin/fstrim.cpp b/src/bin/fstrim.cpp
+index b09cd41184..a956d16b8c 100644
+--- a/src/bin/fstrim.cpp
++++ b/src/bin/fstrim.cpp
+@@ -56,22 +56,20 @@ main(int argc, char** argv)
+ 		usage(1);
+ 	const char* path = argv[optind++];
+ 
+-	int fd = open(path, O_RDONLY);
+-	if (fd < 0) {
++	FileDescriptorCloser fd(open(path, O_RDONLY));
++	if (!fd.IsSet()) {
+ 		fprintf(stderr, "%s: Could not access path: %s\n", kProgramName,
+ 			strerror(errno));
+ 		return EXIT_FAILURE;
+ 	}
+ 
+-	FileDescriptorCloser closer(fd);
+-
+ 	fs_trim_data trimData;
+ 	trimData.range_count = 1;
+ 	trimData.ranges[0].offset = 0;
+ 	trimData.ranges[0].size = UINT64_MAX;
+ 	trimData.trimmed_size = 0;
+ 
+-	if (ioctl(fd, B_TRIM_DEVICE, &trimData, sizeof(fs_trim_data)) != 0) {
++	if (ioctl(fd.Get(), B_TRIM_DEVICE, &trimData, sizeof(fs_trim_data)) != 0) {
+ 		fprintf(stderr, "%s: Trimming failed: %s\n", kProgramName,
+ 			strerror(errno));
+ 		return EXIT_FAILURE;
+diff --git a/src/bin/i2c/i2c.cpp b/src/bin/i2c/i2c.cpp
+index 6b4c7c00c0..95d11a2326 100644
+--- a/src/bin/i2c/i2c.cpp
++++ b/src/bin/i2c/i2c.cpp
+@@ -41,8 +41,8 @@ static int
+ scan_bus(const char *path)
+ {
+ 	int err = EXIT_SUCCESS;
+-	int fd = open(path, O_RDONLY);
+-	if (fd < 0) {
++	FileDescriptorCloser fd(open(path, O_RDONLY));
++	if (!fd.IsSet()) {
+ 		fprintf(stderr, "%s: Could not access path: %s\n", kProgramName,
+ 			strerror(errno));
+ 		return EXIT_FAILURE;
+@@ -50,7 +50,6 @@ scan_bus(const char *path)
+ 
+ 	setbuf(stdout, NULL);
+ 	printf("Scanning I2C bus: %s\n", path);
+-	FileDescriptorCloser closer(fd);
+ 
+ 	printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n");
+ 	for (int i = 0; i < 128; i+=16) {
+@@ -66,7 +65,7 @@ scan_bus(const char *path)
+ 			exec.cmdLength = sizeof(cmd);
+ 			exec.buffer = &data;
+ 			exec.bufferLength = sizeof(data);
+-			if (ioctl(fd, I2CEXEC, &exec, sizeof(exec)) == 0)
++			if (ioctl(fd.Get(), I2CEXEC, &exec, sizeof(exec)) == 0)
+ 				printf("%02x ", addr);
+ 			else
+ 				printf("-- ");
+@@ -74,8 +73,6 @@ scan_bus(const char *path)
+ 		printf("\n");
+ 	}
+ 
+-	close(fd);
+-
+ 	return err;
+ }
+ 
+diff --git a/src/bin/multiuser/multiuser_utils.cpp b/src/bin/multiuser/multiuser_utils.cpp
+index 54838ebcaa..1b0b5cade0 100644
+--- a/src/bin/multiuser/multiuser_utils.cpp
++++ b/src/bin/multiuser/multiuser_utils.cpp
+@@ -25,20 +25,19 @@ read_password(const char* prompt, char* password, size_t bufferSize,
+ 	FILE* out = stdout;
+ 
+ 	// open tty
+-	FILE* tty = NULL;
++	FileCloser tty;
+ 	if (!useStdio) {
+ // TODO: Open tty with O_NOCTTY!
+-		tty = fopen("/dev/tty", "w+");
+-		if (tty == NULL) {
++		tty.SetTo(fopen("/dev/tty", "w+"));
++		if (!tty.IsSet()) {
+ 			fprintf(stderr, "Error: Failed to open tty: %s\n",
+ 				strerror(errno));
+ 			return errno;
+ 		}
+ 
+-		in = tty;
+-		out = tty;
++		in = tty.Get();
++		out = tty.Get();
+ 	}
+-	FileCloser ttyCloser(tty);
+ 
+ 	// disable echo
+ 	int inFD = fileno(in);
+diff --git a/src/bin/package/PackageWritingUtils.cpp b/src/bin/package/PackageWritingUtils.cpp
+index 88aa9850a1..5ce871d6e1 100644
+--- a/src/bin/package/PackageWritingUtils.cpp
++++ b/src/bin/package/PackageWritingUtils.cpp
+@@ -22,15 +22,14 @@ add_current_directory_entries(BPackageWriter& packageWriter,
+ 	BPackageWriterListener& listener, bool skipPackageInfo)
+ {
+ 	// open the current directory
+-	DIR* dir = opendir(".");
+-	if (dir == NULL) {
++	DirCloser dir(opendir("."));
++	if (!dir.IsSet()) {
+ 		listener.PrintError("Error: Failed to opendir '.': %s\n",
+ 			strerror(errno));
+ 		return errno;
+ 	}
+-	DirCloser dirCloser(dir);
+ 
+-	while (dirent* entry = readdir(dir)) {
++	while (dirent* entry = readdir(dir.Get())) {
+ 		// skip "." and ".."
+ 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+ 			continue;
+diff --git a/src/bin/ramdisk.cpp b/src/bin/ramdisk.cpp
+index b851025a39..ad90383483 100644
+--- a/src/bin/ramdisk.cpp
++++ b/src/bin/ramdisk.cpp
+@@ -99,16 +99,15 @@ static status_t
+ execute_control_device_ioctl(int operation, void* request)
+ {
+ 	// open the ram disk control device
+-	int fd = open(kRamDiskControlDevicePath, O_RDONLY);
+-	if (fd < 0) {
++	FileDescriptorCloser fd(open(kRamDiskControlDevicePath, O_RDONLY));
++	if (!fd.IsSet()) {
+ 		fprintf(stderr, "Error: Failed to open RAM disk control device \"%s\": "
+ 			"%s\n", kRamDiskControlDevicePath, strerror(errno));
+ 		return errno;
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	// issue the request
+-	if (ioctl(fd, operation, request) < 0)
++	if (ioctl(fd.Get(), operation, request) < 0)
+ 		return errno;
+ 
+ 	return B_OK;
+@@ -331,16 +330,15 @@ command_flush(int argc, const char* const* argv)
+ 	// open the raw device
+ 	BString path;
+ 	path.SetToFormat("%s/%s/raw", kRamDiskRawDeviceBasePath, idString);
+-	int fd = open(path, O_RDONLY);
+-	if (fd < 0) {
++	FileDescriptorCloser fd(open(path, O_RDONLY));
++	if (!fd.IsSet()) {
+ 		fprintf(stderr, "Error: Failed to open RAM disk device \"%s\"\n",
+ 			path.String());
+ 		return 1;
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	// issue the request
+-	if (ioctl(fd, RAM_DISK_IOCTL_FLUSH, NULL) < 0) {
++	if (ioctl(fd.Get(), RAM_DISK_IOCTL_FLUSH, NULL) < 0) {
+ 		fprintf(stderr, "Error: Failed to flush RAM disk device: %s\n",
+ 			strerror(errno));
+ 		return 1;
+@@ -382,20 +380,19 @@ command_list(int argc, const char* const* argv)
+ 		print_usage_and_exit(true);
+ 
+ 	// iterate through the RAM disk device directory and search for raw devices
+-	DIR* dir = opendir(kRamDiskRawDeviceBasePath);
+-	if (dir == NULL) {
++	DirCloser dir(opendir(kRamDiskRawDeviceBasePath));
++	if (!dir.IsSet()) {
+ 		fprintf(stderr, "Error: Failed to open RAM disk device directory: %s\n",
+ 			strerror(errno));
+ 		return 1;
+ 	}
+-	DirCloser dirCloser(dir);
+ 
+ 	TextTable table;
+ 	table.AddColumn("ID", B_ALIGN_RIGHT);
+ 	table.AddColumn("Size", B_ALIGN_RIGHT);
+ 	table.AddColumn("Associated file");
+ 
+-	while (dirent* entry = readdir(dir)) {
++	while (dirent* entry = readdir(dir.Get())) {
+ 		// check, if the entry name could be an ID
+ 		const char* idString = entry->d_name;
+ 		char* end;
+@@ -406,14 +403,14 @@ command_list(int argc, const char* const* argv)
+ 		// open the raw device
+ 		BString path;
+ 		path.SetToFormat("%s/%s/raw", kRamDiskRawDeviceBasePath, idString);
+-		int fd = open(path, O_RDONLY);
+-		if (fd < 0)
++		FileDescriptorCloser fd(open(path, O_RDONLY));
++		if (!fd.IsSet())
+ 			continue;
+-		FileDescriptorCloser fdCloser(fd);
+ 
+ 		// issue the request
+ 		ram_disk_ioctl_info request;
+-		if (ioctl(fd, RAM_DISK_IOCTL_INFO, &request, sizeof(request)) < 0)
++		if (ioctl(fd.Get(), RAM_DISK_IOCTL_INFO, &request, sizeof(request))
++			< 0)
+ 			continue;
+ 
+ 		int32 rowIndex = table.CountRows();
+diff --git a/src/kits/network/libnetapi/NetworkDevice.cpp b/src/kits/network/libnetapi/NetworkDevice.cpp
+index 7cd7b46fbd..a4a5eddc62 100644
+--- a/src/kits/network/libnetapi/NetworkDevice.cpp
++++ b/src/kits/network/libnetapi/NetworkDevice.cpp
+@@ -50,12 +50,10 @@ struct ie_data {
+ static status_t
+ get_80211(const char* name, int32 type, void* data, int32& length)
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	struct ieee80211req ireq;
+ 	strlcpy(ireq.i_name, name, IF_NAMESIZE);
+ 	ireq.i_type = type;
+@@ -63,7 +61,8 @@ get_80211(const char* name, int32 type, void* data, int32& length)
+ 	ireq.i_len = length;
+ 	ireq.i_data = data;
+ 
+-	if (ioctl(socket, SIOCG80211, &ireq, sizeof(struct ieee80211req)) < 0)
++	if (ioctl(socket.Get(), SIOCG80211, &ireq, sizeof(struct ieee80211req))
++		< 0)
+ 		return errno;
+ 
+ 	length = ireq.i_len;
+@@ -75,12 +74,10 @@ static status_t
+ set_80211(const char* name, int32 type, void* data,
+ 	int32 length = 0, int32 value = 0)
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	struct ieee80211req ireq;
+ 	strlcpy(ireq.i_name, name, IF_NAMESIZE);
+ 	ireq.i_type = type;
+@@ -88,7 +85,8 @@ set_80211(const char* name, int32 type, void* data,
+ 	ireq.i_len = length;
+ 	ireq.i_data = data;
+ 
+-	if (ioctl(socket, SIOCS80211, &ireq, sizeof(struct ieee80211req)) < 0)
++	if (ioctl(socket.Get(), SIOCS80211, &ireq, sizeof(struct ieee80211req))
++		< 0)
+ 		return errno;
+ 
+ 	return B_OK;
+@@ -98,15 +96,13 @@ set_80211(const char* name, int32 type, void* data,
+ template<typename T> status_t
+ do_request(T& request, const char* name, int option)
+ {
+-	int socket = ::socket(AF_LINK, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_LINK, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	strlcpy(((struct ifreq&)request).ifr_name, name, IF_NAMESIZE);
+ 
+-	if (ioctl(socket, option, &request, sizeof(T)) < 0)
++	if (ioctl(socket.Get(), option, &request, sizeof(T)) < 0)
+ 		return errno;
+ 
+ 	return B_OK;
+@@ -116,15 +112,13 @@ do_request(T& request, const char* name, int option)
+ template<> status_t
+ do_request<ieee80211req>(ieee80211req& request, const char* name, int option)
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	strlcpy(((struct ieee80211req&)request).i_name, name, IFNAMSIZ);
+ 
+-	if (ioctl(socket, option, &request, sizeof(request)) < 0)
++	if (ioctl(socket.Get(), option, &request, sizeof(request)) < 0)
+ 		return errno;
+ 
+ 	return B_OK;
+diff --git a/src/kits/network/libnetapi/NetworkInterface.cpp b/src/kits/network/libnetapi/NetworkInterface.cpp
+index 9d9ab8e505..d557adfaf0 100644
+--- a/src/kits/network/libnetapi/NetworkInterface.cpp
++++ b/src/kits/network/libnetapi/NetworkInterface.cpp
+@@ -37,12 +37,10 @@ do_ifaliasreq(const char* name, int32 option, BNetworkInterfaceAddress& address,
+ 	if (!readBack)
+ 		family = family_from_interface_address(address);
+ 
+-	int socket = ::socket(family, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(family, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifaliasreq request;
+ 	strlcpy(request.ifra_name, name, IF_NAMESIZE);
+ 	request.ifra_index = address.Index();
+@@ -55,7 +53,7 @@ do_ifaliasreq(const char* name, int32 option, BNetworkInterfaceAddress& address,
+ 	memcpy(&request.ifra_broadaddr, &address.Broadcast().SockAddr(),
+ 		address.Broadcast().Length());
+ 
+-	if (ioctl(socket, option, &request, sizeof(struct ifaliasreq)) < 0)
++	if (ioctl(socket.Get(), option, &request, sizeof(struct ifaliasreq)) < 0)
+ 		return errno;
+ 
+ 	if (readBack) {
+@@ -81,15 +79,13 @@ do_ifaliasreq(const char* name, int32 option,
+ template<typename T> status_t
+ do_request(int family, T& request, const char* name, int option)
+ {
+-	int socket = ::socket(family, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(family, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	strlcpy(((struct ifreq&)request).ifr_name, name, IF_NAMESIZE);
+ 
+-	if (ioctl(socket, option, &request, sizeof(T)) < 0)
++	if (ioctl(socket.Get(), option, &request, sizeof(T)) < 0)
+ 		return errno;
+ 
+ 	return B_OK;
+@@ -371,12 +367,10 @@ BNetworkInterface::GetAddressAt(int32 index, BNetworkInterfaceAddress& address)
+ int32
+ BNetworkInterface::FindAddress(const BNetworkAddress& address)
+ {
+-	int socket = ::socket(address.Family(), SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(address.Family(), SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return -1;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifaliasreq request;
+ 	memset(&request, 0, sizeof(ifaliasreq));
+ 
+@@ -384,8 +378,8 @@ BNetworkInterface::FindAddress(const BNetworkAddress& address)
+ 	request.ifra_index = -1;
+ 	memcpy(&request.ifra_addr, &address.SockAddr(), address.Length());
+ 
+-	if (ioctl(socket, B_SOCKET_GET_ALIAS, &request, sizeof(struct ifaliasreq))
+-			< 0) {
++	if (ioctl(socket.Get(), B_SOCKET_GET_ALIAS, &request,
++		sizeof(struct ifaliasreq)) < 0) {
+ 		return -1;
+ 	}
+ 
+@@ -396,12 +390,10 @@ BNetworkInterface::FindAddress(const BNetworkAddress& address)
+ int32
+ BNetworkInterface::FindFirstAddress(int family)
+ {
+-	int socket = ::socket(family, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(family, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return -1;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifaliasreq request;
+ 	memset(&request, 0, sizeof(ifaliasreq));
+ 
+@@ -409,8 +401,8 @@ BNetworkInterface::FindFirstAddress(int family)
+ 	request.ifra_index = -1;
+ 	request.ifra_addr.ss_family = AF_UNSPEC;
+ 
+-	if (ioctl(socket, B_SOCKET_GET_ALIAS, &request, sizeof(struct ifaliasreq))
+-			< 0) {
++	if (ioctl(socket.Get(), B_SOCKET_GET_ALIAS, &request,
++		sizeof(struct ifaliasreq)) < 0) {
+ 		return -1;
+ 	}
+ 
+@@ -479,16 +471,14 @@ BNetworkInterface::RemoveAddressAt(int32 index)
+ status_t
+ BNetworkInterface::GetHardwareAddress(BNetworkAddress& address)
+ {
+-	int socket = ::socket(AF_LINK, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_LINK, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifreq request;
+ 	strlcpy(request.ifr_name, Name(), IF_NAMESIZE);
+ 
+-	if (ioctl(socket, SIOCGIFADDR, &request, sizeof(struct ifreq)) < 0)
++	if (ioctl(socket.Get(), SIOCGIFADDR, &request, sizeof(struct ifreq)) < 0)
+ 		return errno;
+ 
+ 	address.SetTo(request.ifr_addr);
+diff --git a/src/kits/network/libnetapi/NetworkRoster.cpp b/src/kits/network/libnetapi/NetworkRoster.cpp
+index 8f840b5d28..b090be85b9 100644
+--- a/src/kits/network/libnetapi/NetworkRoster.cpp
++++ b/src/kits/network/libnetapi/NetworkRoster.cpp
+@@ -37,15 +37,13 @@ BNetworkRoster::Default()
+ size_t
+ BNetworkRoster::CountInterfaces() const
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return 0;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifconf config;
+ 	config.ifc_len = sizeof(config.ifc_value);
+-	if (ioctl(socket, SIOCGIFCOUNT, &config, sizeof(struct ifconf)) != 0)
++	if (ioctl(socket.Get(), SIOCGIFCOUNT, &config, sizeof(struct ifconf)) != 0)
+ 		return 0;
+ 
+ 	return (size_t)config.ifc_value;
+@@ -63,15 +61,13 @@ BNetworkRoster::GetNextInterface(uint32* cookie,
+ 
+ 	// get a list of all interfaces
+ 
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket (::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifconf config;
+ 	config.ifc_len = sizeof(config.ifc_value);
+-	if (ioctl(socket, SIOCGIFCOUNT, &config, sizeof(struct ifconf)) < 0)
++	if (ioctl(socket.Get(), SIOCGIFCOUNT, &config, sizeof(struct ifconf)) < 0)
+ 		return errno;
+ 
+ 	size_t count = (size_t)config.ifc_value;
+@@ -86,7 +82,7 @@ BNetworkRoster::GetNextInterface(uint32* cookie,
+ 
+ 	config.ifc_len = count * sizeof(struct ifreq);
+ 	config.ifc_buf = buffer;
+-	if (ioctl(socket, SIOCGIFCONF, &config, sizeof(struct ifconf)) < 0)
++	if (ioctl(socket.Get(), SIOCGIFCONF, &config, sizeof(struct ifconf)) < 0)
+ 		return errno;
+ 
+ 	ifreq* interfaces = (ifreq*)buffer;
+@@ -110,17 +106,15 @@ BNetworkRoster::GetNextInterface(uint32* cookie,
+ status_t
+ BNetworkRoster::AddInterface(const char* name)
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket (::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifaliasreq request;
+ 	memset(&request, 0, sizeof(ifaliasreq));
+ 	strlcpy(request.ifra_name, name, IF_NAMESIZE);
+ 
+-	if (ioctl(socket, SIOCAIFADDR, &request, sizeof(request)) != 0)
++	if (ioctl(socket.Get(), SIOCAIFADDR, &request, sizeof(request)) != 0)
+ 		return errno;
+ 
+ 	return B_OK;
+@@ -137,18 +131,16 @@ BNetworkRoster::AddInterface(const BNetworkInterface& interface)
+ status_t
+ BNetworkRoster::RemoveInterface(const char* name)
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	ifreq request;
+ 	strlcpy(request.ifr_name, name, IF_NAMESIZE);
+ 
+ 	request.ifr_addr.sa_family = AF_UNSPEC;
+ 
+-	if (ioctl(socket, SIOCDIFADDR, &request, sizeof(request)) != 0)
++	if (ioctl(socket.Get(), SIOCDIFADDR, &request, sizeof(request)) != 0)
+ 		return errno;
+ 
+ 	return B_OK;
+diff --git a/src/kits/network/libnetapi/NetworkRoute.cpp b/src/kits/network/libnetapi/NetworkRoute.cpp
+index 7d32f26ec3..6ebe6a55fe 100644
+--- a/src/kits/network/libnetapi/NetworkRoute.cpp
++++ b/src/kits/network/libnetapi/NetworkRoute.cpp
+@@ -256,15 +256,13 @@ status_t
+ BNetworkRoute::GetRoutes(int family, const char* interfaceName,
+ 	uint32 filterFlags, BObjectList<BNetworkRoute>& routes)
+ {
+-	int socket = ::socket(family, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(family, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser fdCloser(socket);
+-
+ 	ifconf config;
+ 	config.ifc_len = sizeof(config.ifc_value);
+-	if (ioctl(socket, SIOCGRTSIZE, &config, sizeof(struct ifconf)) < 0)
++	if (ioctl(socket.Get(), SIOCGRTSIZE, &config, sizeof(struct ifconf)) < 0)
+ 		return errno;
+ 
+ 	uint32 size = (uint32)config.ifc_value;
+@@ -279,7 +277,7 @@ BNetworkRoute::GetRoutes(int family, const char* interfaceName,
+ 	config.ifc_len = size;
+ 	config.ifc_buf = buffer;
+ 
+-	if (ioctl(socket, SIOCGRTTABLE, &config, sizeof(struct ifconf)) < 0)
++	if (ioctl(socket.Get(), SIOCGRTTABLE, &config, sizeof(struct ifconf)) < 0)
+ 		return errno;
+ 
+ 	ifreq* interface = (ifreq*)buffer;
+diff --git a/src/kits/package/RepositoryInfo.cpp b/src/kits/package/RepositoryInfo.cpp
+index f2120f7282..dc41b81309 100644
+--- a/src/kits/package/RepositoryInfo.cpp
++++ b/src/kits/package/RepositoryInfo.cpp
+@@ -358,25 +358,29 @@ BRepositoryInfo::_SetTo(const BEntry& entry)
+ 	buffer[size] = '\0';
+ 	configString.UnlockBuffer(size);
+ 
+-	void* settingsHandle = parse_driver_settings_string(configString.String());
+-	if (settingsHandle == NULL)
++	DriverSettingsUnloader settingsHandle(
++		parse_driver_settings_string(configString.String()));
++	if (!settingsHandle.IsSet())
+ 		return B_BAD_DATA;
+-	DriverSettingsUnloader settingsHandleDeleter(settingsHandle);
+ 
+-	const char* name = get_driver_parameter(settingsHandle, "name", NULL, NULL);
+-	const char* identifier = get_driver_parameter(settingsHandle, "identifier", NULL, NULL);
++	const char* name = get_driver_parameter(settingsHandle.Get(), "name", NULL,
++		NULL);
++	const char* identifier = get_driver_parameter(settingsHandle.Get(),
++		"identifier", NULL, NULL);
+ 	// Also handle the old name if the new one isn't found
+ 	if (identifier == NULL || *identifier == '\0')
+-		identifier = get_driver_parameter(settingsHandle, "url", NULL, NULL);
+-	const char* baseUrl = get_driver_parameter(settingsHandle, "baseurl", NULL, NULL);
+-	const char* vendor
+-		= get_driver_parameter(settingsHandle, "vendor", NULL, NULL);
+-	const char* summary
+-		= get_driver_parameter(settingsHandle, "summary", NULL, NULL);
+-	const char* priorityString
+-		= get_driver_parameter(settingsHandle, "priority", NULL, NULL);
+-	const char* architectureString
+-		= get_driver_parameter(settingsHandle, "architecture", NULL, NULL);
++		identifier = get_driver_parameter(settingsHandle.Get(),
++			"url", NULL, NULL);
++	const char* baseUrl = get_driver_parameter(settingsHandle.Get(),
++		"baseurl", NULL, NULL);
++	const char* vendor = get_driver_parameter(settingsHandle.Get(),
++		"vendor", NULL, NULL);
++	const char* summary = get_driver_parameter(settingsHandle.Get(),
++		"summary", NULL, NULL);
++	const char* priorityString = get_driver_parameter(settingsHandle.Get(),
++		"priority", NULL, NULL);
++	const char* architectureString = get_driver_parameter(settingsHandle.Get(),
++		"architecture", NULL, NULL);
+ 
+ 	if (name == NULL || *name == '\0'
+ 		|| identifier == NULL || *identifier == '\0'
+diff --git a/src/kits/package/hpkg/PackageWriterImpl.cpp b/src/kits/package/hpkg/PackageWriterImpl.cpp
+index 301e2d4bfd..d21ba18d37 100644
+--- a/src/kits/package/hpkg/PackageWriterImpl.cpp
++++ b/src/kits/package/hpkg/PackageWriterImpl.cpp
+@@ -1138,10 +1138,9 @@ PackageWriterImpl::_UpdateCheckEntryCollisions(Attribute* parentAttribute,
+ 		// explicitly specified directory -- we need to read the directory
+ 
+ 		// first we check for colliding node attributes, though
+-		if (DIR* attrDir = fs_fopen_attr_dir(fd)) {
+-			AttrDirCloser attrDirCloser(attrDir);
+-
+-			while (dirent* entry = fs_read_attr_dir(attrDir)) {
++		AttrDirCloser attrDir(fs_fopen_attr_dir(fd));
++		if (attrDir.IsSet()) {
++			while (dirent* entry = fs_read_attr_dir(attrDir.Get())) {
+ 				attr_info attrInfo;
+ 				if (fs_stat_attr(fd, entry->d_name, &attrInfo) < 0) {
+ 					fListener->PrintError(
+@@ -1177,17 +1176,16 @@ PackageWriterImpl::_UpdateCheckEntryCollisions(Attribute* parentAttribute,
+ 			throw status_t(errno);
+ 		}
+ 
+-		DIR* dir = fdopendir(clonedFD);
+-		if (dir == NULL) {
++		DirCloser dir(fdopendir(clonedFD));
++		if (!dir.IsSet()) {
+ 			fListener->PrintError(
+ 				"Failed to open directory \"%s\": %s\n", pathBuffer,
+ 				strerror(errno));
+ 			close(clonedFD);
+ 			throw status_t(errno);
+ 		}
+-		DirCloser dirCloser(dir);
+ 
+-		while (dirent* entry = readdir(dir)) {
++		while (dirent* entry = readdir(dir.Get())) {
+ 			// skip "." and ".."
+ 			if (strcmp(entry->d_name, ".") == 0
+ 				|| strcmp(entry->d_name, "..") == 0) {
+@@ -1525,10 +1523,9 @@ PackageWriterImpl::_AddEntry(int dirFD, Entry* entry, const char* fileName,
+ 	}
+ 
+ 	// add attributes
+-	if (DIR* attrDir = fs_fopen_attr_dir(fd)) {
+-		AttrDirCloser attrDirCloser(attrDir);
+-
+-		while (dirent* entry = fs_read_attr_dir(attrDir)) {
++	AttrDirCloser attrDir(fs_fopen_attr_dir(fd));
++	if (attrDir.IsSet()) {
++		while (dirent* entry = fs_read_attr_dir(attrDir.Get())) {
+ 			attr_info attrInfo;
+ 			if (fs_stat_attr(fd, entry->d_name, &attrInfo) < 0) {
+ 				fListener->PrintError(
+@@ -1579,17 +1576,16 @@ PackageWriterImpl::_AddDirectoryChildren(Entry* entry, int fd, char* pathBuffer)
+ 			throw status_t(errno);
+ 		}
+ 
+-		DIR* dir = fdopendir(clonedFD);
+-		if (dir == NULL) {
++		DirCloser dir(fdopendir(clonedFD));
++		if (!dir.IsSet()) {
+ 			fListener->PrintError(
+ 				"Failed to open directory \"%s\": %s\n", pathBuffer,
+ 				strerror(errno));
+ 			close(clonedFD);
+ 			throw status_t(errno);
+ 		}
+-		DirCloser dirCloser(dir);
+ 
+-		while (dirent* entry = readdir(dir)) {
++		while (dirent* entry = readdir(dir.Get())) {
+ 			// skip "." and ".."
+ 			if (strcmp(entry->d_name, ".") == 0
+ 				|| strcmp(entry->d_name, "..") == 0) {
+diff --git a/src/kits/package/manager/RepositoryBuilder.cpp b/src/kits/package/manager/RepositoryBuilder.cpp
+index fe9bbe395d..236c0b25c4 100644
+--- a/src/kits/package/manager/RepositoryBuilder.cpp
++++ b/src/kits/package/manager/RepositoryBuilder.cpp
+@@ -208,13 +208,12 @@ BRepositoryBuilder&
+ BRepositoryBuilder::AddPackagesDirectory(const char* path)
+ {
+ 	// open directory
+-	DIR* dir = opendir(path);
+-	if (dir == NULL)
++	DirCloser dir(opendir(path));
++	if (!dir.IsSet())
+ 		DIE(errno, "failed to open package directory \"%s\"", path);
+-	DirCloser dirCloser(dir);
+ 
+ 	// iterate through directory entries
+-	while (dirent* entry = readdir(dir)) {
++	while (dirent* entry = readdir(dir.Get())) {
+ 		// skip "." and ".."
+ 		const char* name = entry->d_name;
+ 		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+diff --git a/src/preferences/virtualmemory/Settings.cpp b/src/preferences/virtualmemory/Settings.cpp
+index 270defd88e..6752f65024 100644
+--- a/src/preferences/virtualmemory/Settings.cpp
++++ b/src/preferences/virtualmemory/Settings.cpp
+@@ -137,22 +137,24 @@ Settings::WriteWindowSettings()
+ status_t
+ Settings::ReadSwapSettings()
+ {
+-	void* settings = load_driver_settings(kVirtualMemorySettings);
+-	if (settings == NULL)
++	DriverSettingsUnloader settings(
++		load_driver_settings(kVirtualMemorySettings));
++	if (!settings.IsSet())
+ 		return kErrorSettingsNotFound;
+-	DriverSettingsUnloader settingDeleter(settings);
+-
+-	const char* enabled = get_driver_parameter(settings, "vm", NULL, NULL);
+-	const char* automatic = get_driver_parameter(settings, "swap_auto",
+-		NULL, NULL);
+-	const char* size = get_driver_parameter(settings, "swap_size", NULL, NULL);
+-	const char* volume = get_driver_parameter(settings, "swap_volume_name",
+-		NULL, NULL);
+-	const char* device = get_driver_parameter(settings,
++
++	const char* enabled = get_driver_parameter(settings.Get(),
++		"vm", NULL, NULL);
++	const char* automatic = get_driver_parameter(settings.Get(),
++		"swap_auto", NULL, NULL);
++	const char* size = get_driver_parameter(settings.Get(),
++		"swap_size", NULL, NULL);
++	const char* volume = get_driver_parameter(settings.Get(),
++		"swap_volume_name", NULL, NULL);
++	const char* device = get_driver_parameter(settings.Get(),
+ 		"swap_volume_device", NULL, NULL);
+-	const char* filesystem = get_driver_parameter(settings,
++	const char* filesystem = get_driver_parameter(settings.Get(),
+ 		"swap_volume_filesystem", NULL, NULL);
+-	const char* capacity = get_driver_parameter(settings,
++	const char* capacity = get_driver_parameter(settings.Get(),
+ 		"swap_volume_capacity", NULL, NULL);
+ 
+ 	if (enabled == NULL	|| automatic == NULL || size == NULL || device == NULL
+@@ -161,9 +163,9 @@ Settings::ReadSwapSettings()
+ 
+ 	off_t volCapacity = atoll(capacity);
+ 
+-	SetSwapEnabled(get_driver_boolean_parameter(settings,
++	SetSwapEnabled(get_driver_boolean_parameter(settings.Get(),
+ 		"vm", true, false));
+-	SetSwapAutomatic(get_driver_boolean_parameter(settings,
++	SetSwapAutomatic(get_driver_boolean_parameter(settings.Get(),
+ 		"swap_auto", true, false));
+ 	SetSwapSize(atoll(size));
+ 
+diff --git a/src/servers/net/NetServer.cpp b/src/servers/net/NetServer.cpp
+index 167379d3c5..289f5bf6ce 100644
+--- a/src/servers/net/NetServer.cpp
++++ b/src/servers/net/NetServer.cpp
+@@ -118,12 +118,10 @@ static status_t
+ set_80211(const char* name, int32 type, void* data,
+ 	int32 length = 0, int32 value = 0)
+ {
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return errno;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	struct ieee80211req ireq;
+ 	strlcpy(ireq.i_name, name, IF_NAMESIZE);
+ 	ireq.i_type = type;
+@@ -131,7 +129,8 @@ set_80211(const char* name, int32 type, void* data,
+ 	ireq.i_len = length;
+ 	ireq.i_data = data;
+ 
+-	if (ioctl(socket, SIOCS80211, &ireq, sizeof(struct ieee80211req)) < 0)
++	if (ioctl(socket.Get(), SIOCS80211, &ireq, sizeof(struct ieee80211req))
++		< 0)
+ 		return errno;
+ 
+ 	return B_OK;
+diff --git a/src/servers/package/CommitTransactionHandler.cpp b/src/servers/package/CommitTransactionHandler.cpp
+index aa3dbfb66b..1cbfbe117f 100644
+--- a/src/servers/package/CommitTransactionHandler.cpp
++++ b/src/servers/package/CommitTransactionHandler.cpp
+@@ -1863,18 +1863,17 @@ CommitTransactionHandler::_ChangePackageActivationIOCtl(
+ 	}
+ 
+ 	// issue the request
+-	int fd = fVolume->OpenRootDirectory();
+-	if (fd < 0) {
++	FileDescriptorCloser fd(fVolume->OpenRootDirectory());
++	if (!fd.IsSet()) {
+ 		throw Exception(B_TRANSACTION_FAILED_TO_OPEN_DIRECTORY)
+ 			.SetPath1(_GetPath(
+ 				FSUtils::Entry(fVolume->RootDirectoryRef()),
+ 				"<packagefs root>"))
+-			.SetSystemError(fd);
++			.SetSystemError(fd.Get());
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+-	if (ioctl(fd, PACKAGE_FS_OPERATION_CHANGE_ACTIVATION, request, requestSize)
+-			!= 0) {
++	if (ioctl(fd.Get(), PACKAGE_FS_OPERATION_CHANGE_ACTIVATION, request,
++		requestSize) != 0) {
+ // TODO: We need more error information and error handling!
+ 		throw Exception(B_TRANSACTION_FAILED_TO_CHANGE_PACKAGE_ACTIVATION)
+ 			.SetSystemError(errno);
+diff --git a/src/servers/package/PackageFile.cpp b/src/servers/package/PackageFile.cpp
+index 26f5f6ff3c..df8e8def5a 100644
+--- a/src/servers/package/PackageFile.cpp
++++ b/src/servers/package/PackageFile.cpp
+@@ -61,12 +61,11 @@ PackageFile::Init(const entry_ref& entryRef, PackageFileManager* owner)
+ 		RETURN_ERROR(error);
+ 
+ 	// get the package info
+-	int fd = file.Dup();
+-	if (fd < 0)
++	FileDescriptorCloser fd(file.Dup());
++	if (!fd.IsSet())
+ 		RETURN_ERROR(error);
+-	FileDescriptorCloser fdCloser(fd);
+ 
+-	error = fInfo.ReadFromPackageFile(fd);
++	error = fInfo.ReadFromPackageFile(fd.Get());
+ 	if (error != B_OK)
+ 		RETURN_ERROR(error);
+ 
+diff --git a/src/servers/package/Volume.cpp b/src/servers/package/Volume.cpp
+index d2cb6704b8..3065314039 100644
+--- a/src/servers/package/Volume.cpp
++++ b/src/servers/package/Volume.cpp
+@@ -230,13 +230,12 @@ Volume::Init(const node_ref& rootDirectoryRef, node_ref& _packageRootRef)
+ 		RETURN_ERROR(B_NO_MEMORY);
+ 
+ 	// get a volume info from the FS
+-	int fd = directory.Dup();
+-	if (fd < 0) {
++	FileDescriptorCloser fd(directory.Dup());
++	if (!fd.IsSet()) {
+ 		ERROR("Volume::Init(): failed to get root directory FD: %s\n",
+-			strerror(fd));
+-		RETURN_ERROR(fd);
++			strerror(fd.Get()));
++		RETURN_ERROR(fd.Get());
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	// get the volume info from packagefs
+ 	uint32 maxPackagesDirCount = 16;
+@@ -251,7 +250,7 @@ Volume::Init(const node_ref& rootDirectoryRef, node_ref& _packageRootRef)
+ 			RETURN_ERROR(B_NO_MEMORY);
+ 		infoDeleter.SetTo(info);
+ 
+-		if (ioctl(fd, PACKAGE_FS_OPERATION_GET_VOLUME_INFO, info,
++		if (ioctl(fd.Get(), PACKAGE_FS_OPERATION_GET_VOLUME_INFO, info,
+ 				bufferSize) != 0) {
+ 			ERROR("Volume::Init(): failed to get volume info: %s\n",
+ 				strerror(errno));
+@@ -310,13 +309,12 @@ Volume::InitPackages(Listener* listener)
+ 	}
+ 
+ 	// read the packages directory and get the active packages
+-	int fd = OpenRootDirectory();
+-	if (fd < 0) {
++	FileDescriptorCloser fd(OpenRootDirectory());
++	if (!fd.IsSet()) {
+ 		ERROR("Volume::InitPackages(): failed to open root directory: %s\n",
+-			strerror(fd));
+-		RETURN_ERROR(fd);
++			strerror(fd.Get()));
++		RETURN_ERROR(fd.Get());
+ 	}
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	error = _ReadPackagesDirectory();
+ 	if (error != B_OK)
+@@ -326,7 +324,7 @@ Volume::InitPackages(Listener* listener)
+ 	if (error != B_OK)
+ 		RETURN_ERROR(error);
+ 
+-	error = _GetActivePackages(fd);
++	error = _GetActivePackages(fd.Get());
+ 	if (error != B_OK)
+ 		RETURN_ERROR(error);
+ 
+diff --git a/src/servers/registrar/AuthenticationManager.cpp b/src/servers/registrar/AuthenticationManager.cpp
+index ddc6ef9fb6..355b36d920 100644
+--- a/src/servers/registrar/AuthenticationManager.cpp
++++ b/src/servers/registrar/AuthenticationManager.cpp
+@@ -564,26 +564,24 @@ public:
+ 			// Don't check errors. We can't do anything anyway.
+ 
+ 		// open files
+-		FILE* passwdFile = fopen(kPasswdFile, "w");
+-		if (passwdFile == NULL) {
++		FileCloser passwdFile(fopen(kPasswdFile, "w"));
++		if (!passwdFile.IsSet()) {
+ 			debug_printf("REG: Failed to open passwd file \"%s\" for "
+ 				"writing: %s\n", kPasswdFile, strerror(errno));
+ 		}
+-		FileCloser _1(passwdFile);
+ 
+-		FILE* shadowFile = fopen(kShadowPwdFile, "w");
+-		if (shadowFile == NULL) {
++		FileCloser shadowFile(fopen(kShadowPwdFile, "w"));
++		if (!shadowFile.IsSet()) {
+ 			debug_printf("REG: Failed to open shadow passwd file \"%s\" for "
+ 				"writing: %s\n", kShadowPwdFile, strerror(errno));
+ 		}
+-		FileCloser _2(shadowFile);
+ 
+ 		// write users
+ 		for (map<uid_t, User*>::const_iterator it = fUsersByID.begin();
+ 			 it != fUsersByID.end(); ++it) {
+ 			User* user = it->second;
+-			user->WritePasswdLine(passwdFile);
+-			user->WriteShadowPwdLine(shadowFile);
++			user->WritePasswdLine(passwdFile.Get());
++			user->WriteShadowPwdLine(shadowFile.Get());
+ 		}
+ 	}
+ 
+@@ -690,18 +688,17 @@ public:
+ 			// Don't check errors. We can't do anything anyway.
+ 
+ 		// open file
+-		FILE* groupFile = fopen(kGroupFile, "w");
+-		if (groupFile == NULL) {
++		FileCloser groupFile(fopen(kGroupFile, "w"));
++		if (!groupFile.IsSet()) {
+ 			debug_printf("REG: Failed to open group file \"%s\" for "
+ 				"writing: %s\n", kGroupFile, strerror(errno));
+ 		}
+-		FileCloser _1(groupFile);
+ 
+ 		// write groups
+ 		for (map<gid_t, Group*>::const_iterator it = fGroupsByID.begin();
+ 			it != fGroupsByID.end(); ++it) {
+ 			Group* group = it->second;
+-			group->WriteGroupLine(groupFile);
++			group->WriteGroupLine(groupFile.Get());
+ 		}
+ 	}
+ 
+@@ -1240,16 +1237,15 @@ AuthenticationManager::_RequestThread()
+ status_t
+ AuthenticationManager::_InitPasswdDB()
+ {
+-	FILE* file = fopen(kPasswdFile, "r");
+-	if (file == NULL) {
++	FileCloser file(fopen(kPasswdFile, "r"));
++	if (!file.IsSet()) {
+ 		debug_printf("REG: Failed to open passwd DB file \"%s\": %s\n",
+ 			kPasswdFile, strerror(errno));
+ 		return errno;
+ 	}
+-	FileCloser _(file);
+ 
+ 	char lineBuffer[LINE_MAX];
+-	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), file)) {
++	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), file.Get())) {
+ 		if (strlen(line) == 0)
+ 			continue;
+ 
+@@ -1289,16 +1285,15 @@ AuthenticationManager::_InitPasswdDB()
+ status_t
+ AuthenticationManager::_InitGroupDB()
+ {
+-	FILE* file = fopen(kGroupFile, "r");
+-	if (file == NULL) {
++	FileCloser file(fopen(kGroupFile, "r"));
++	if (!file.IsSet()) {
+ 		debug_printf("REG: Failed to open group DB file \"%s\": %s\n",
+ 			kGroupFile, strerror(errno));
+ 		return errno;
+ 	}
+-	FileCloser _(file);
+ 
+ 	char lineBuffer[LINE_MAX];
+-	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), file)) {
++	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), file.Get())) {
+ 		if (strlen(line) == 0)
+ 			continue;
+ 
+@@ -1337,16 +1332,15 @@ AuthenticationManager::_InitGroupDB()
+ status_t
+ AuthenticationManager::_InitShadowPwdDB()
+ {
+-	FILE* file = fopen(kShadowPwdFile, "r");
+-	if (file == NULL) {
++	FileCloser file(fopen(kShadowPwdFile, "r"));
++	if (!file.IsSet()) {
+ 		debug_printf("REG: Failed to open shadow passwd DB file \"%s\": %s\n",
+ 			kShadowPwdFile, strerror(errno));
+ 		return errno;
+ 	}
+-	FileCloser _(file);
+ 
+ 	char lineBuffer[LINE_MAX];
+-	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), file)) {
++	while (char* line = fgets(lineBuffer, sizeof(lineBuffer), file.Get())) {
+ 		if (strlen(line) == 0)
+ 			continue;
+ 
+diff --git a/src/system/boot/loader/file_systems/packagefs/PackageSettingsItem.cpp b/src/system/boot/loader/file_systems/packagefs/PackageSettingsItem.cpp
+index 85e9f4be38..f62115fcf4 100644
+--- a/src/system/boot/loader/file_systems/packagefs/PackageSettingsItem.cpp
++++ b/src/system/boot/loader/file_systems/packagefs/PackageSettingsItem.cpp
+@@ -45,18 +45,17 @@ PackageSettingsItem::Load(::Directory* systemDirectory, const char* name)
+ 	const char* settingsFilePath
+ 		= &(kSystemSettingsDirectory "/packages")[strlen(kSystemDirectory) + 1];
+ 
+-	int fd = open_from(systemDirectory, settingsFilePath, B_READ_ONLY, 0);
+-	if (fd < 0)
++	FileDescriptorCloser fd(open_from(systemDirectory, settingsFilePath,
++		B_READ_ONLY, 0));
++	if (!fd.IsSet())
+ 		return NULL;
+-	FileDescriptorCloser fdCloser(fd);
+ 
+ 	// load the driver settings
+-	void* settingsHandle = load_driver_settings_file(fd);
+-	if (settingsHandle == NULL)
++	DriverSettingsUnloader settingsHandle(load_driver_settings_file(fd.Get()));
++	if (!settingsHandle.IsSet())
+ 		return NULL;
+-	DriverSettingsUnloader settingsDeleter(settingsHandle);
+ 
+-	const driver_settings* settings = get_driver_settings(settingsHandle);
++	const driver_settings* settings = get_driver_settings(settingsHandle.Get());
+ 	for (int i = 0; i < settings->parameter_count; i++) {
+ 		const driver_parameter& parameter = settings->parameters[i];
+ 		if (strcmp(parameter.name, "Package") != 0
+diff --git a/src/system/boot/loader/package_support.cpp b/src/system/boot/loader/package_support.cpp
+index 12ab7c77b6..7a60f212fb 100644
+--- a/src/system/boot/loader/package_support.cpp
++++ b/src/system/boot/loader/package_support.cpp
+@@ -326,13 +326,12 @@ PackageVolumeInfo::_ParseActivatedPackagesFile(Directory* packagesDirectory,
+ 	snprintf(path, sizeof(path), "%s/%s/%s",
+ 		kAdministrativeDirectory, state->Name() != NULL ? state->Name() : "",
+ 		kActivatedPackagesFile);
+-	int fd = open_from(packagesDirectory, path, O_RDONLY);
+-	if (fd < 0)
+-		return fd;
+-	FileDescriptorCloser fdCloser(fd);
++	FileDescriptorCloser fd(open_from(packagesDirectory, path, O_RDONLY));
++	if (!fd.IsSet())
++		return fd.Get();
+ 
+ 	struct stat st;
+-	if (fstat(fd, &st) != 0)
++	if (fstat(fd.Get(), &st) != 0)
+ 		return errno;
+ 	if (!S_ISREG(st.st_mode))
+ 		return B_ENTRY_NOT_FOUND;
+@@ -340,7 +339,7 @@ PackageVolumeInfo::_ParseActivatedPackagesFile(Directory* packagesDirectory,
+ 	// read the file until we find the system package line
+ 	size_t remainingBytes = 0;
+ 	for (;;) {
+-		ssize_t bytesRead = read(fd, path + remainingBytes,
++		ssize_t bytesRead = read(fd.Get(), path + remainingBytes,
+ 			sizeof(path) - remainingBytes - 1);
+ 		if (bytesRead <= 0)
+ 			return B_ENTRY_NOT_FOUND;
+diff --git a/src/system/libnetwork/getifaddrs.cpp b/src/system/libnetwork/getifaddrs.cpp
+index 005bc082f9..34493056f3 100644
+--- a/src/system/libnetwork/getifaddrs.cpp
++++ b/src/system/libnetwork/getifaddrs.cpp
+@@ -53,16 +53,15 @@ copy_address(const sockaddr& address)
+ static int
+ _getifaddrs(int domain, char* buffer, size_t len, struct ifaddrs** previous)
+ {
+-	int socket = ::socket(domain, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket (::socket(domain, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return -1;
+-	FileDescriptorCloser closer(socket);
+ 
+ 	// Get interfaces configuration
+ 	ifconf config;
+ 	config.ifc_buf = buffer;
+ 	config.ifc_len = len;
+-	if (ioctl(socket, SIOCGIFCONF, &config, sizeof(struct ifconf)) < 0)
++	if (ioctl(socket.Get(), SIOCGIFCONF, &config, sizeof(struct ifconf)) < 0)
+ 		return -1;
+ 
+ 	ifreq* interfaces = (ifreq*)buffer;
+@@ -88,13 +87,14 @@ _getifaddrs(int domain, char* buffer, size_t len, struct ifaddrs** previous)
+ 		ifreq request;
+ 		strlcpy(request.ifr_name, interfaces[0].ifr_name, IF_NAMESIZE);
+ 
+-		if (ioctl(socket, SIOCGIFFLAGS, &request, sizeof(struct ifreq)) == 0)
++		if (ioctl(socket.Get(), SIOCGIFFLAGS, &request, sizeof(struct ifreq))
++				== 0)
+ 			current->ifa_flags = request.ifr_flags;
+-		if (ioctl(socket, SIOCGIFNETMASK, &request, sizeof(struct ifreq))
++		if (ioctl(socket.Get(), SIOCGIFNETMASK, &request, sizeof(struct ifreq))
+ 				== 0) {
+ 			current->ifa_netmask = copy_address(request.ifr_mask);
+ 		}
+-		if (ioctl(socket, SIOCGIFDSTADDR, &request, sizeof(struct ifreq))
++		if (ioctl(socket.Get(), SIOCGIFDSTADDR, &request, sizeof(struct ifreq))
+ 				== 0) {
+ 			current->ifa_dstaddr = copy_address(request.ifr_dstaddr);
+ 		}
+@@ -117,20 +117,17 @@ getifaddrs(struct ifaddrs** _ifaddrs)
+ 		return -1;
+ 	}
+ 
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+-	if (socket < 0)
++	FileDescriptorCloser socket(::socket(AF_INET, SOCK_DGRAM, 0));
++	if (!socket.IsSet())
+ 		return -1;
+ 
+-	FileDescriptorCloser closer(socket);
+-
+ 	// Get interface count
+ 	ifconf config;
+ 	config.ifc_len = sizeof(config.ifc_value);
+-	if (ioctl(socket, SIOCGIFCOUNT, &config, sizeof(struct ifconf)) < 0)
++	if (ioctl(socket.Get(), SIOCGIFCOUNT, &config, sizeof(struct ifconf)) < 0)
+ 		return -1;
+ 
+-	socket = -1;
+-	closer.Unset();
++	socket.Unset();
+ 
+ 	size_t count = (size_t)config.ifc_value;
+ 	if (count == 0) {
+@@ -141,27 +138,25 @@ getifaddrs(struct ifaddrs** _ifaddrs)
+ 
+ 	// Allocate a buffer for ifreqs for all interfaces
+ 	size_t buflen = count * sizeof(struct ifreq);
+-	char* buffer = (char*)malloc(buflen);
+-	if (buffer == NULL) {
++	ArrayDeleter<char> buffer(new(std::nothrow) char[buflen]);
++	if (!buffer.IsSet()) {
+ 		errno = B_NO_MEMORY;
+ 		return -1;
+ 	}
+ 
+-	MemoryDeleter deleter(buffer);
+-
+ 	struct ifaddrs* previous = NULL;
+ 	int serrno = errno;
+-	if (_getifaddrs(AF_INET, buffer, buflen, &previous) < 0 &&
++	if (_getifaddrs(AF_INET, buffer.Get(), buflen, &previous) < 0 &&
+ 		errno != B_UNSUPPORTED) {
+ 		freeifaddrs(previous);
+ 		return -1;
+ 	}
+-	if (_getifaddrs(AF_INET6, buffer, buflen, &previous) < 0 &&
++	if (_getifaddrs(AF_INET6, buffer.Get(), buflen, &previous) < 0 &&
+ 		errno != B_UNSUPPORTED) {
+ 		freeifaddrs(previous);
+ 		return -1;
+ 	}
+-	if (_getifaddrs(AF_LINK, buffer, buflen, &previous) < 0 &&
++	if (_getifaddrs(AF_LINK, buffer.Get(), buflen, &previous) < 0 &&
+ 		errno != B_UNSUPPORTED) {
+ 		freeifaddrs(previous);
+ 		return -1;
+diff --git a/src/system/libroot/os/image.cpp b/src/system/libroot/os/image.cpp
+index caf4adb873..428636b4a1 100644
+--- a/src/system/libroot/os/image.cpp
++++ b/src/system/libroot/os/image.cpp
+@@ -43,17 +43,16 @@ struct EnvironmentFilter {
+ 
+ 	void Init(const char* path, const char* const* env, size_t envCount)
+ 	{
+-		int fd = open(path, O_RDONLY);
+-		if (fd < 0)
++		FileDescriptorCloser fd(open(path, O_RDONLY));
++		if (!fd.IsSet())
+ 			return;
+-		FileDescriptorCloser fdCloser(fd);
+ 
+ 		static const char* const kEnvAttribute = "SYS:ENV";
+ 		attr_info info;
+-		if (fs_stat_attr(fd, kEnvAttribute, &info) < 0)
++		if (fs_stat_attr(fd.Get(), kEnvAttribute, &info) < 0)
+ 			return;
+ 
+-		_Init(fd, kEnvAttribute, info.size, env, envCount);
++		_Init(fd.Get(), kEnvAttribute, info.size, env, envCount);
+ 	}
+ 
+ 	size_t AdditionalSlotsNeeded() const
+diff --git a/src/tools/generate_boot_screen.cpp b/src/tools/generate_boot_screen.cpp
+index 5869ad26d3..264a94062e 100644
+--- a/src/tools/generate_boot_screen.cpp
++++ b/src/tools/generate_boot_screen.cpp
+@@ -56,23 +56,6 @@ new_line_if_required()
+ // #pragma mark -
+ 
+ 
+-class AutoFileCloser {
+-public:
+-	AutoFileCloser(FILE* file)
+-		: fFile(file)
+-	{}
+-	~AutoFileCloser()
+-	{
+-		fclose(fFile);
+-	}
+-private:
+-	FILE* fFile;
+-};
+-
+-
+-// #pragma mark -
+-
+-
+ class ZlibCompressor {
+ public:
+ 	ZlibCompressor(FILE* output);
+@@ -162,13 +145,11 @@ read_png(const char* filename, int& width, int& height, png_bytep*& rowPtrs,
+ 	png_structp& pngPtr, png_infop& infoPtr)
+ {
+ 	char header[8];
+-	FILE* input = fopen(filename, "rb");
+-	if (!input)
++	FileCloser input(fopen(filename, "rb"));
++	if (!input.IsSet())
+ 		error("[read_png] File %s could not be opened for reading", filename);
+ 
+-	AutoFileCloser _(input);
+-
+-	fread(header, 1, 8, input);
++	fread(header, 1, 8, input.Get());
+ 	if (png_sig_cmp((png_byte *)header, 0, 8 ))
+ 		error("[read_png] File %s is not recognized as a PNG file", filename);
+ 
+@@ -187,7 +168,7 @@ read_png(const char* filename, int& width, int& height, png_bytep*& rowPtrs,
+ 		error("[read_png] Error during init_io");
+ #endif
+ 
+-	png_init_io(pngPtr, input);
++	png_init_io(pngPtr, input.Get());
+ 	png_set_sig_bytes(pngPtr, 8);
+ 
+ 	// make sure we automatically get RGB data with 8 bits per channel
+-- 
+2.30.2
+

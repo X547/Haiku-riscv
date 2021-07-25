@@ -1,0 +1,266 @@
+From f022e2de36abda84470e0367ae806caa598038e9 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:02:16 +0900
+Subject: kernel/arch/debug: implement for riscv64 (2)
+
+Change-Id: I5ef3ecd30c13a6379ed428b8c91dd1427e2e85c1
+---
+ src/system/kernel/arch/riscv64/arch_debug.cpp | 82 +++++++++++++++++--
+ .../arch/riscv64/arch_debug_console.cpp       | 55 ++++++++++++-
+ 2 files changed, 126 insertions(+), 11 deletions(-)
+
+diff --git a/src/system/kernel/arch/riscv64/arch_debug.cpp b/src/system/kernel/arch/riscv64/arch_debug.cpp
+index 880fd93851..5bc6eb4b8d 100644
+--- a/src/system/kernel/arch/riscv64/arch_debug.cpp
++++ b/src/system/kernel/arch/riscv64/arch_debug.cpp
+@@ -24,6 +24,7 @@ static void
+ WriteImage(preloaded_image* _image)
+ {
+ 	preloaded_elf64_image* image = (preloaded_elf64_image*)_image;
++	dprintf("image %p\n", image);
+ 	dprintf("image \"%s\"\n", (char*)image->name);
+ 	dprintf(
+ 		"  text: 0x%" B_PRIxADDR " - 0x%" B_PRIxADDR ", %" B_PRIdSSIZE "\n",
+@@ -104,9 +105,15 @@ FindImage(addr_t adr)
+ static VMArea*
+ FindArea(addr_t adr)
+ {
+-	VMAddressSpacePutter addrSpace;
+-	addrSpace.SetTo(VMAddressSpace::GetCurrent());
+-	return addrSpace->LookupArea(adr);
++	if (IS_KERNEL_ADDRESS(adr)) {
++		VMAddressSpacePutter addrSpace(VMAddressSpace::GetKernel());
++		return addrSpace->LookupArea(adr);
++	}
++	if (IS_USER_ADDRESS(adr)) {
++		VMAddressSpacePutter addrSpace(VMAddressSpace::GetCurrent());
++		return addrSpace->LookupArea(adr);
++	}
++	return NULL;
+ }
+ 
+ 
+@@ -120,7 +127,7 @@ lookup_symbol(Thread* thread, addr_t address, addr_t* _baseAddress,
+ 		// a kernel symbol
+ 		status = elf_debug_lookup_symbol_address(address, _baseAddress,
+ 			_symbolName, _imageName, _exactMatch);
+-	} else if (thread != NULL && thread->team != NULL) {
++	} else if (true && thread != NULL && thread->team != NULL) {
+ 		// try a lookup using the userland runtime loader structures
+ 		status = elf_debug_lookup_user_symbol_address(thread->team, address,
+ 			_baseAddress, _symbolName, _imageName, _exactMatch);
+@@ -165,7 +172,7 @@ WritePCBoot(addr_t pc)
+ void
+ WritePC(addr_t pc)
+ {
+-	// dprintf("0x%" B_PRIxADDR " ", pc);
++	dprintf("0x%" B_PRIxADDR " ", pc);
+ 	if (!sInitCalled) {
+ 		WritePCBoot(pc); return;
+ 	}
+@@ -195,6 +202,27 @@ WritePC(addr_t pc)
+ }
+ 
+ 
++static void
++DumpMemory(uint64* adr, size_t len)
++{
++	while (len > 0) {
++		if ((addr_t)adr % 0x10 == 0)
++			dprintf("%08" B_PRIxADDR " ", (addr_t)adr);
++		uint64 val;
++		if (user_memcpy(&val, adr++, sizeof(val)) < B_OK) {
++			dprintf(" ????????????????");
++		} else {
++			dprintf(" %016" B_PRIx64, val);
++		}
++		if ((addr_t)adr % 0x10 == 0)
++			dprintf("\n");
++		len -= 8;
++	}
++	if ((addr_t)adr % 0x10 != 0)
++		dprintf("\n");
++}
++
++
+ void
+ DoStackTrace(addr_t fp, addr_t pc)
+ {
+@@ -204,12 +232,26 @@ DoStackTrace(addr_t fp, addr_t pc)
+ 		dprintf(", PC: "); WritePC(pc);
+ 	}
+ 	dprintf("\n");
++	addr_t oldFp = fp;
+ 	while (fp != 0) {
+-		if (user_memcpy(&pc, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
+-		if (user_memcpy(&fp, (uint64*)fp - 2, sizeof(pc)) < B_OK) break;
++		if (
++			(pc >= (addr_t)&strcpy && pc < (addr_t)&strcpy + 32) ||
++			(pc >= (addr_t)&memset && pc < (addr_t)&memset + 34)
++		) {
++			if (user_memcpy(&fp, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
++			pc = 0;
++		} else {
++			if (user_memcpy(&pc, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
++			if (user_memcpy(&fp, (uint64*)fp - 2, sizeof(pc)) < B_OK) break;
++		}
+ 		dprintf("FP: 0x%" B_PRIxADDR, fp);
+-		dprintf(", PC: "); WritePC(pc - 1);
++		dprintf(", PC: "); WritePC((pc == 0) ? 0 : pc - 1);
+ 		dprintf("\n");
++/*
++		if (IS_KERNEL_ADDRESS(oldFp) && IS_KERNEL_ADDRESS(fp))
++			DumpMemory((uint64*)oldFp, (addr_t)fp - (addr_t)oldFp);
++*/
++		oldFp = fp;
+ 	}
+ }
+ 
+@@ -217,6 +259,19 @@ DoStackTrace(addr_t fp, addr_t pc)
+ static int
+ stack_trace(int argc, char **argv)
+ {
++	if (argc >= 2) {
++		thread_id id = strtoul(argv[1], NULL, 0);
++		Thread* thread = Thread::GetDebug(id);
++		if (thread == NULL) {
++			kprintf("could not find thread %" B_PRId32 "\n", id);
++			return 0;
++		}
++		uint64 oldSatp = Satp();
++		SetSatp(thread->arch_info.context.satp);
++		DoStackTrace(thread->arch_info.context.s[0], thread->arch_info.context.ra);
++		SetSatp(oldSatp);
++		return 0;
++	}
+ 	DoStackTrace(Fp(), 0);
+ 	return 0;
+ }
+@@ -250,10 +305,21 @@ arch_debug_save_registers(struct arch_debug_registers* registers)
+ }
+ 
+ 
++static void __attribute__((naked))
++HandleFault()
++{
++	asm volatile("ld a0, 0(sp)");
++	asm volatile("li a1, 1");
++	asm volatile("call longjmp");
++}
++
++
+ void
+ arch_debug_call_with_fault_handler(cpu_ent* cpu, jmp_buf jumpBuffer,
+ 	void (*function)(void*), void* parameter)
+ {
++	cpu->fault_handler = (addr_t)&HandleFault;
++	cpu->fault_handler_stack_pointer = (addr_t)&jumpBuffer;
+ 	function(parameter);
+ }
+ 
+diff --git a/src/system/kernel/arch/riscv64/arch_debug_console.cpp b/src/system/kernel/arch/riscv64/arch_debug_console.cpp
+index 6f82d72773..b662cf6eae 100644
+--- a/src/system/kernel/arch/riscv64/arch_debug_console.cpp
++++ b/src/system/kernel/arch/riscv64/arch_debug_console.cpp
+@@ -11,11 +11,35 @@
+ #include <boot/kernel_args.h>
+ #include <kernel.h>
+ #include <vm/vm.h>
++#include <arch/generic/debug_uart.h>
++#include <arch/generic/debug_uart_8250.h>
++#include <arch/riscv64/arch_uart_sifive.h>
+ #include <Htif.h>
+ 
+ #include <string.h>
+ 
+ 
++static DebugUART* sArchDebugUART = NULL;
++
++
++DebugUART8250*
++arch_get_uart_8250(addr_t base, int64 clock)
++{
++	static char buffer[sizeof(DebugUART8250)];
++	DebugUART8250* uart = new(buffer) DebugUART8250(base, clock);
++	return uart;
++}
++
++
++ArchUARTSifive*
++arch_get_uart_sifive(addr_t base, int64 clock)
++{
++	static char buffer[sizeof(ArchUARTSifive)];
++	ArchUARTSifive* uart = new(buffer) ArchUARTSifive(base, clock);
++	return uart;
++}
++
++
+ void
+ arch_debug_remove_interrupt_handler(uint32 line)
+ {
+@@ -53,6 +77,9 @@ arch_debug_serial_try_getchar(void)
+ char
+ arch_debug_serial_getchar(void)
+ {
++	if (sArchDebugUART != NULL)
++		return sArchDebugUART->GetChar(false);
++
+ 	return 0;
+ }
+ 
+@@ -60,6 +87,11 @@ arch_debug_serial_getchar(void)
+ void
+ arch_debug_serial_putchar(const char c)
+ {
++	if (sArchDebugUART != NULL) {
++		sArchDebugUART->PutChar(c);
++		return;
++	}
++
+ 	HtifOutChar(c);
+ }
+ 
+@@ -68,7 +100,12 @@ void
+ arch_debug_serial_puts(const char *s)
+ {
+ 	while (*s != '\0') {
+-		arch_debug_serial_putchar(*s);
++		char ch = *s;
++		if (ch == '\n') {
++			arch_debug_serial_putchar('\r');
++			arch_debug_serial_putchar('\n');
++		} else if (ch != '\r')
++			arch_debug_serial_putchar(ch);
+ 		s++;
+ 	}
+ }
+@@ -84,6 +121,20 @@ arch_debug_serial_early_boot_message(const char *string)
+ status_t
+ arch_debug_console_init(kernel_args *args)
+ {
++	switch (args->arch_args.uart.kind) {
++		case kUartKind8250:
++			sArchDebugUART = arch_get_uart_8250(args->arch_args.uart.regs.start, args->arch_args.uart.clock);
++			break;
++		case kUartKindSifive:
++			sArchDebugUART = arch_get_uart_sifive(args->arch_args.uart.regs.start, args->arch_args.uart.clock);
++			break;
++		default:
++			;
++	}
++
++	if (sArchDebugUART != NULL)
++		sArchDebugUART->InitEarly();
++
+ 	return B_OK;
+ }
+ 
+@@ -93,5 +144,3 @@ arch_debug_console_init_settings(kernel_args *args)
+ {
+ 	return B_OK;
+ }
+-
+-
+-- 
+2.30.2
+

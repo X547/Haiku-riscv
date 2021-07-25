@@ -1,0 +1,56 @@
+From 48bb059417b5d991c4e5e78375809f398b1c7dfa Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 21:10:47 +0900
+Subject: kernel/arch_real_time_clock: implement for riscv64
+
+Change-Id: I3a50b3343e00ef45ef9391d463939abba9e666a0
+---
+ .../kernel/arch/riscv64/arch_real_time_clock.cpp       | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/riscv64/arch_real_time_clock.cpp b/src/system/kernel/arch/riscv64/arch_real_time_clock.cpp
+index 937b58d595..c4bc17be48 100644
+--- a/src/system/kernel/arch/riscv64/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/riscv64/arch_real_time_clock.cpp
+@@ -3,10 +3,15 @@
+ #include <real_time_clock.h>
+ #include <real_time_data.h>
+ 
++#include <Htif.h>
++
+ 
+ status_t
+ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ {
++	bigtime_t systemTime = system_time();
++	uint64 rtcTime = HtifCmd(2, 0, 0);
++	data->arch_data.system_time_conversion_factor = rtcTime - systemTime;
+ 	return B_OK;
+ }
+ 
+@@ -14,7 +19,7 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ uint32
+ arch_rtc_get_hw_time(void)
+ {
+-	return 0;
++	return (uint32)(HtifCmd(2, 0, 0) / 1000000);
+ }
+ 
+ 
+@@ -27,11 +32,12 @@ arch_rtc_set_hw_time(uint32 seconds)
+ void
+ arch_rtc_set_system_time_offset(struct real_time_data *data, bigtime_t offset)
+ {
++	atomic_set64(&data->arch_data.system_time_offset, offset);
+ }
+ 
+ 
+ bigtime_t
+ arch_rtc_get_system_time_offset(struct real_time_data *data)
+ {
+-	return 0;
++	return atomic_get64(&data->arch_data.system_time_offset);
+ }
+-- 
+2.30.2
+

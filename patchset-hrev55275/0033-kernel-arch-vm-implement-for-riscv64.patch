@@ -1,0 +1,1552 @@
+From 5f78253d46e9b4cb0524700715501fdee121fb94 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 21:56:36 +0900
+Subject: kernel/arch/vm: implement for riscv64
+
+Change-Id: I0b463f3d2bca9f31b0aabacbf70a9774493d3467
+---
+ .../arch/riscv64/arch_vm_translation_map.h    |  25 +-
+ headers/private/kernel/vm/vm_types.h          |   2 +
+ src/system/kernel/arch/riscv64/Jamfile        |   1 +
+ .../arch/riscv64/RISCV64VMTranslationMap.cpp  | 878 ++++++++++++++++++
+ .../arch/riscv64/RISCV64VMTranslationMap.h    | 143 +++
+ src/system/kernel/arch/riscv64/arch_vm.cpp    | 205 +++-
+ .../arch/riscv64/arch_vm_translation_map.cpp  | 108 ++-
+ 7 files changed, 1332 insertions(+), 30 deletions(-)
+ create mode 100644 src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+ create mode 100644 src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+
+diff --git a/headers/private/kernel/arch/riscv64/arch_vm_translation_map.h b/headers/private/kernel/arch/riscv64/arch_vm_translation_map.h
+index 853d7202c0..5f09fc5c01 100644
+--- a/headers/private/kernel/arch/riscv64/arch_vm_translation_map.h
++++ b/headers/private/kernel/arch/riscv64/arch_vm_translation_map.h
+@@ -7,20 +7,23 @@
+ 
+ #include <arch/vm_translation_map.h>
+ 
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+ 
+-void riscv64_translation_map_change_asid(VMTranslationMap *map);
++//gVirtFromPhysOffset = virtAdr - physAdr;
++extern ssize_t gVirtFromPhysOffset;
+ 
+-status_t riscv64_map_address_range(addr_t virtualAddress,
+-	phys_addr_t physicalAddress, size_t size);
+-void riscv64_unmap_address_range(addr_t virtualAddress, size_t size);
+-status_t riscv64_remap_address_range(addr_t *virtualAddress, size_t size,
+-	bool unmap);
+ 
+-#ifdef __cplusplus
++static inline void*
++VirtFromPhys(phys_addr_t physAdr)
++{
++	return (void*)(physAdr + gVirtFromPhysOffset);
+ }
+-#endif
++
++
++static inline phys_addr_t
++PhysFromVirt(void* virtAdr)
++{
++	return (phys_addr_t)virtAdr - gVirtFromPhysOffset;
++}
++
+ 
+ #endif /* _KERNEL_ARCH_RISCV64_VM_TRANSLATION_MAP_H */
+diff --git a/headers/private/kernel/vm/vm_types.h b/headers/private/kernel/vm/vm_types.h
+index 85aa030687..a165bb4229 100644
+--- a/headers/private/kernel/vm/vm_types.h
++++ b/headers/private/kernel/vm/vm_types.h
+@@ -25,6 +25,8 @@
+ 
+ #include "kernel_debug_config.h"
+ 
++#undef DEBUG_PAGE_ACCESS
++
+ 
+ #define VM_PAGE_ALLOCATION_TRACKING_AVAILABLE \
+ 	(VM_PAGE_ALLOCATION_TRACKING && PAGE_ALLOCATION_TRACING != 0 \
+diff --git a/src/system/kernel/arch/riscv64/Jamfile b/src/system/kernel/arch/riscv64/Jamfile
+index f76a4dfe22..e6d005b3ef 100644
+--- a/src/system/kernel/arch/riscv64/Jamfile
++++ b/src/system/kernel/arch/riscv64/Jamfile
+@@ -20,6 +20,7 @@ KernelMergeObject kernel_arch_riscv64.o :
+         arch_user_debugger.cpp
+         arch_vm.cpp
+         arch_vm_translation_map.cpp
++        RISCV64VMTranslationMap.cpp
+         :
+         $(TARGET_KERNEL_PIC_CCFLAGS) -Wno-unused
+         :
+diff --git a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+new file mode 100644
+index 0000000000..3ea75bdb00
+--- /dev/null
++++ b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+@@ -0,0 +1,878 @@
++#include "RISCV64VMTranslationMap.h"
++
++#include <kernel.h>
++#include <vm/vm_priv.h>
++#include <vm/vm_page.h>
++#include <vm/VMAddressSpace.h>
++#include <vm/VMCache.h>
++#include <slab/Slab.h>
++
++#include <util/AutoLock.h>
++
++
++//#define DISABLE_MODIFIED_FLAGS 1
++
++//#define DO_TRACE
++#ifdef DO_TRACE
++#	define TRACE(x...) dprintf(x)
++#else
++#	define TRACE(x...) ;
++#endif
++
++#define NOT_IMPLEMENTED_PANIC() \
++	panic("not implemented: %s\n", __PRETTY_FUNCTION__)
++
++
++static void
++FreePageTable(page_num_t ppn, bool isKernel, uint32 level = 2)
++{
++	if (level > 0) {
++		Pte* pte = (Pte*)VirtFromPhys(ppn * B_PAGE_SIZE);
++		uint64 beg = 0;
++		uint64 end = pteCount - 1;
++		if (level == 2 && !isKernel) {
++			beg = VirtAdrPte(USER_BASE, 2);
++			end = VirtAdrPte(USER_TOP, 2);
++		}
++		for (uint64 i = beg; i <= end; i++) {
++			if ((1 << pteValid) & pte[i].flags)
++				FreePageTable(pte[i].ppn, isKernel, level - 1);
++		}
++	}
++	vm_page* page = vm_lookup_page(ppn);
++	vm_page_set_state(page, PAGE_STATE_FREE);
++}
++
++
++static uint64
++GetPageTableSize(page_num_t ppn, bool isKernel, uint32 level = 2)
++{
++	if (ppn == 0)
++		return 0;
++
++	if (level == 0)
++		return 1;
++
++	uint64 size = 1;
++	Pte* pte = (Pte*)VirtFromPhys(ppn * B_PAGE_SIZE);
++	uint64 beg = 0;
++	uint64 end = pteCount - 1;
++	if (level == 2 && !isKernel) {
++		beg = VirtAdrPte(USER_BASE, 2);
++		end = VirtAdrPte(USER_TOP, 2);
++	}
++	for (uint64 i = beg; i <= end; i++) {
++		if ((1 << pteValid) & pte[i].flags)
++			size += GetPageTableSize(pte[i].ppn, isKernel, level - 1);
++	}
++	return size;
++}
++
++
++//#pragma mark RISCV64VMTranslationMap
++
++Pte*
++RISCV64VMTranslationMap::LookupPte(addr_t virtAdr, bool alloc,
++	vm_page_reservation* reservation)
++{
++	if (fPageTable == 0) {
++		if (!alloc)
++			return NULL;
++		vm_page* page = vm_page_allocate_page(reservation,
++			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
++		fPageTable = page->physical_page_number * B_PAGE_SIZE;
++		if (fPageTable == 0)
++			return NULL;
++		fPageTableSize++;
++		if (!fIsKernel) {
++			// Map kernel address space into user address space. Preallocated
++			// kernel level-2 PTEs are reused.
++			RISCV64VMTranslationMap* kernelMap = (RISCV64VMTranslationMap*)
++				VMAddressSpace::Kernel()->TranslationMap();
++			Pte *kernelPageTable = (Pte*)VirtFromPhys(kernelMap->PageTable());
++			Pte *userPageTable = (Pte*)VirtFromPhys(fPageTable);
++			for (uint64 i = VirtAdrPte(KERNEL_BASE, 2);
++				i <= VirtAdrPte(KERNEL_TOP, 2); i++) {
++				Pte *pte = &userPageTable[i];
++				pte->ppn = kernelPageTable[i].ppn;
++				pte->flags |= (1 << pteValid);
++			}
++		}
++	}
++	Pte *pte = (Pte*)VirtFromPhys(fPageTable);
++	for (int level = 2; level > 0; level--) {
++		pte += VirtAdrPte(virtAdr, level);
++		if (!((1 << pteValid) & pte->flags)) {
++			if (!alloc)
++				return NULL;
++			vm_page* page = vm_page_allocate_page(reservation,
++				PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
++			pte->ppn = page->physical_page_number;
++			if (pte->ppn == 0)
++				return NULL;
++			fPageTableSize++;
++			pte->flags |= (1 << pteValid);
++		}
++		pte = (Pte*)VirtFromPhys(B_PAGE_SIZE * pte->ppn);
++	}
++	pte += VirtAdrPte(virtAdr, 0);
++	return pte;
++}
++
++
++phys_addr_t
++RISCV64VMTranslationMap::LookupAddr(addr_t virtAdr)
++{
++	Pte* pte = LookupPte(virtAdr, false, NULL);
++	if (pte == NULL || !((1 << pteValid) & pte->flags))
++		return 0;
++	if (fIsKernel != (((1 << pteUser) & pte->flags) == 0))
++		return 0;
++	return pte->ppn * B_PAGE_SIZE;
++}
++
++
++RISCV64VMTranslationMap::RISCV64VMTranslationMap(bool kernel,
++	phys_addr_t pageTable):
++	fIsKernel(kernel),
++	fPageTable(pageTable),
++	fPageTableSize(GetPageTableSize(pageTable / B_PAGE_SIZE, kernel))
++{
++	TRACE("+RISCV64VMTranslationMap(%p, %d, 0x%" B_PRIxADDR ")\n", this,
++		kernel, pageTable);
++	TRACE("  pageTableSize: %" B_PRIu64 "\n", fPageTableSize);
++}
++
++
++RISCV64VMTranslationMap::~RISCV64VMTranslationMap()
++{
++	TRACE("-RISCV64VMTranslationMap(%p)\n", this);
++	TRACE("  pageTableSize: %" B_PRIu64 "\n", fPageTableSize);
++	TRACE("  GetPageTableSize(): %" B_PRIu64 "\n",
++		GetPageTableSize(fPageTable / B_PAGE_SIZE, fIsKernel));
++
++	ASSERT_ALWAYS(!fIsKernel);
++	// Can't delete currently used page table
++	ASSERT_ALWAYS(::Satp() != Satp());
++
++	FreePageTable(fPageTable / B_PAGE_SIZE, fIsKernel);
++}
++
++
++bool
++RISCV64VMTranslationMap::Lock()
++{
++	TRACE("RISCV64VMTranslationMap::Lock()\n");
++	recursive_lock_lock(&fLock);
++	return true;
++}
++
++
++void
++RISCV64VMTranslationMap::Unlock()
++{
++	TRACE("RISCV64VMTranslationMap::Unlock()\n");
++	if (recursive_lock_get_recursion(&fLock) == 1) {
++		// we're about to release it for the last time
++		Flush();
++	}
++	recursive_lock_unlock(&fLock);
++}
++
++
++addr_t
++RISCV64VMTranslationMap::MappedSize() const
++{
++	NOT_IMPLEMENTED_PANIC();
++	return 0;
++}
++
++
++size_t
++RISCV64VMTranslationMap::MaxPagesNeededToMap(addr_t start, addr_t end) const
++{
++	enum {
++		level0Range = (uint64_t)B_PAGE_SIZE * pteCount,
++		level1Range = (uint64_t)level0Range * pteCount,
++		level2Range = (uint64_t)level1Range * pteCount,
++	};
++
++	if (start == 0) {
++		start = (level2Range) - B_PAGE_SIZE;
++		end += start;
++	}
++
++	size_t requiredLevel2 = end / level2Range + 1 - start / level2Range;
++	size_t requiredLevel1 = end / level1Range + 1 - start / level1Range;
++	size_t requiredLevel0 = end / level0Range + 1 - start / level0Range;
++
++	return requiredLevel2 + requiredLevel1 + requiredLevel0;
++}
++
++
++status_t
++RISCV64VMTranslationMap::Map(addr_t virtualAddress,
++								phys_addr_t physicalAddress,
++								uint32 attributes, uint32 memoryType,
++								vm_page_reservation* reservation)
++{
++	TRACE("RISCV64VMTranslationMap::Map(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
++		")\n", virtualAddress, physicalAddress);
++
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	Pte* pte = LookupPte(virtualAddress, true, reservation);
++	if (pte == NULL) panic("can't allocate page table");
++
++	pte->ppn = physicalAddress / B_PAGE_SIZE;
++	pte->flags = 0;
++	if ((attributes & B_USER_PROTECTION) != 0) {
++		pte->flags |= (1 << pteUser);
++		if ((attributes & B_READ_AREA)    != 0) pte->flags |= (1 << pteRead);
++		if ((attributes & B_WRITE_AREA)   != 0) pte->flags |= (1 << pteWrite);
++		if ((attributes & B_EXECUTE_AREA) != 0) pte->flags |= (1 << pteExec);
++	} else {
++		if ((attributes & B_KERNEL_READ_AREA)    != 0)
++			pte->flags |= (1 << pteRead);
++		if ((attributes & B_KERNEL_WRITE_AREA)   != 0)
++			pte->flags |= (1 << pteWrite);
++		if ((attributes & B_KERNEL_EXECUTE_AREA) != 0)
++			pte->flags |= (1 << pteExec);
++	}
++	pte->flags |= (1 << pteValid)
++#ifdef DISABLE_MODIFIED_FLAGS
++		| (1 << pteAccessed) | (1 << pteDirty)
++#endif
++	;
++
++	FlushTlbPage(virtualAddress);
++
++	fMapCount++;
++
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::Unmap(addr_t start, addr_t end)
++{
++	TRACE("RISCV64VMTranslationMap::Unmap(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
++		")\n", start, end);
++
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	for (addr_t page = start; page < end; page += B_PAGE_SIZE) {
++		Pte* pte = LookupPte(page, false, NULL);
++		if (pte != NULL) {
++			fMapCount--;
++			pte->flags = 0;
++			pte->ppn = 0;
++			FlushTlbPage(page);
++		}
++	}
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::DebugMarkRangePresent(addr_t start, addr_t end,
++	bool markPresent)
++{
++	NOT_IMPLEMENTED_PANIC();
++	return B_NOT_SUPPORTED;
++}
++
++
++/*
++Things need to be done when unmapping VMArea pages
++	update vm_page::accessed, modified
++	MMIO pages:
++		just unmap
++	wired pages:
++		decrement wired count
++	non-wired pages:
++		remove from VMArea and vm_page `mappings` list
++	wired and non-wird pages
++		vm_page_set_state
++*/
++
++status_t
++RISCV64VMTranslationMap::UnmapPage(VMArea* area, addr_t address,
++	bool updatePageQueue)
++{
++	TRACE("RISCV64VMTranslationMap::UnmapPage(0x%" B_PRIxADDR "(%s), 0x%"
++		B_PRIxADDR ", %d)\n", (addr_t)area, area->name, address,
++		updatePageQueue);
++
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	Pte* pte = LookupPte(address, false, NULL);
++	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0)
++		return B_ENTRY_NOT_FOUND;
++
++	RecursiveLocker locker(fLock);
++
++	Pte oldPte = *pte;
++	pte->flags = 0;
++	pte->ppn = 0;
++	fMapCount--;
++	FlushTlbPage(address);
++	pinner.Unlock();
++
++	locker.Detach(); // PageUnmapped takes ownership
++	PageUnmapped(area, oldPte.ppn, ((1 << pteAccessed) & oldPte.flags) != 0,
++		((1 << pteDirty) & oldPte.flags) != 0, updatePageQueue);
++	return B_OK;
++}
++
++
++void
++RISCV64VMTranslationMap::UnmapPages(VMArea* area, addr_t base, size_t size,
++	bool updatePageQueue)
++{
++	TRACE("RISCV64VMTranslationMap::UnmapPages(0x%" B_PRIxADDR "(%s), 0x%"
++		B_PRIxADDR ", 0x%" B_PRIxSIZE ", %d)\n", (addr_t)area, area->name, base,
++		size, updatePageQueue);
++	for (addr_t end = base + size; base < end; base += B_PAGE_SIZE)
++		UnmapPage(area, base, updatePageQueue);
++}
++
++
++void
++RISCV64VMTranslationMap::UnmapArea(VMArea* area, bool deletingAddressSpace,
++	bool ignoreTopCachePageFlags)
++{
++	TRACE("RISCV64VMTranslationMap::UnmapArea(0x%" B_PRIxADDR "(%s), 0x%"
++		B_PRIxADDR ", 0x%" B_PRIxSIZE ", %d, %d)\n", (addr_t)area, area->name,
++		area->Base(), area->Size(), deletingAddressSpace,
++		ignoreTopCachePageFlags);
++
++	if (area->cache_type == CACHE_TYPE_DEVICE || area->wiring != B_NO_LOCK) {
++		UnmapPages(area, area->Base(), area->Size(), true);
++		return;
++	}
++
++	bool unmapPages = !deletingAddressSpace || !ignoreTopCachePageFlags;
++
++	RecursiveLocker locker(fLock);
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	VMAreaMappings mappings;
++	mappings.MoveFrom(&area->mappings);
++
++	for (VMAreaMappings::Iterator it = mappings.GetIterator();
++			vm_page_mapping* mapping = it.Next();) {
++		vm_page* page = mapping->page;
++		page->mappings.Remove(mapping);
++
++		VMCache* cache = page->Cache();
++
++		bool pageFullyUnmapped = false;
++		if (!page->IsMapped()) {
++			atomic_add(&gMappedPagesCount, -1);
++			pageFullyUnmapped = true;
++		}
++
++		if (unmapPages || cache != area->cache) {
++			addr_t address = area->Base()
++				+ ((page->cache_offset * B_PAGE_SIZE) - area->cache_offset);
++
++			Pte* pte = LookupPte(address, false, NULL);
++			if (pte == NULL || ((1 << pteValid) & pte->flags) == 0)
++
++			Pte* pte = LookupPte(address, false, NULL);
++			if (pte == NULL || ((1 << pteValid) & pte->flags) == 0) {
++				panic("page %p has mapping for area %p (%#" B_PRIxADDR
++					"), but has no page table", page, area, address);
++				continue;
++			}
++
++			Pte oldPte = *pte;
++			pte->flags = 0;
++			pte->ppn = 0;
++
++			// transfer the accessed/dirty flags to the page and invalidate
++			// the mapping, if necessary
++			if (((1 << pteAccessed) & oldPte.flags) != 0) {
++				page->accessed = true;
++
++				if (!deletingAddressSpace)
++					FlushTlbPage(address);
++			}
++
++			if (((1 << pteDirty) & oldPte.flags) != 0)
++				page->modified = true;
++
++			if (pageFullyUnmapped) {
++				if (cache->temporary)
++					vm_page_set_state(page, PAGE_STATE_INACTIVE);
++				else if (page->modified)
++					vm_page_set_state(page, PAGE_STATE_MODIFIED);
++				else
++					vm_page_set_state(page, PAGE_STATE_CACHED);
++			}
++		}
++
++		fMapCount--;
++	}
++
++	Flush();
++		// flush explicitely, since we directly use the lock
++
++	locker.Unlock();
++
++	bool isKernelSpace = area->address_space == VMAddressSpace::Kernel();
++	uint32 freeFlags = CACHE_DONT_WAIT_FOR_MEMORY
++		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
++	while (vm_page_mapping* mapping = mappings.RemoveHead())
++		object_cache_free(gPageMappingsObjectCache, mapping, freeFlags);
++}
++
++
++status_t
++RISCV64VMTranslationMap::Query(addr_t virtualAddress,
++	phys_addr_t* _physicalAddress, uint32* _flags)
++{
++	*_flags = 0;
++	*_physicalAddress = 0;
++
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	if (fPageTable == 0)
++		return B_OK;
++
++	Pte* pte = LookupPte(virtualAddress, false, NULL);
++	if (pte == 0)
++		return B_OK;
++
++	*_physicalAddress = pte->ppn * B_PAGE_SIZE;
++
++	if (((1 << pteValid)    & pte->flags) != 0) *_flags |= PAGE_PRESENT;
++#ifndef DISABLE_MODIFIED_FLAGS
++	if (((1 << pteDirty)    & pte->flags) != 0) *_flags |= PAGE_MODIFIED;
++	if (((1 << pteAccessed) & pte->flags) != 0) *_flags |= PAGE_ACCESSED;
++#endif
++	if (((1 << pteUser) & pte->flags) != 0) {
++		if (((1 << pteRead)  & pte->flags) != 0) *_flags |= B_READ_AREA;
++		if (((1 << pteWrite) & pte->flags) != 0) *_flags |= B_WRITE_AREA;
++		if (((1 << pteExec)  & pte->flags) != 0) *_flags |= B_EXECUTE_AREA;
++	} else {
++		if (((1 << pteRead)  & pte->flags) != 0)
++			*_flags |= B_KERNEL_READ_AREA;
++		if (((1 << pteWrite) & pte->flags) != 0)
++			*_flags |= B_KERNEL_WRITE_AREA;
++		if (((1 << pteExec)  & pte->flags) != 0)
++			*_flags |= B_KERNEL_EXECUTE_AREA;
++	}
++
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::QueryInterrupt(addr_t virtualAddress,
++								phys_addr_t* _physicalAddress,
++								uint32* _flags)
++{
++	return Query(virtualAddress, _physicalAddress, _flags);
++}
++
++
++status_t RISCV64VMTranslationMap::Protect(addr_t base, addr_t top,
++	uint32 attributes, uint32 memoryType)
++{
++	TRACE("RISCV64VMTranslationMap::Protect(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
++		")\n", base, top);
++
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	for (addr_t page = base; page < top; page += B_PAGE_SIZE) {
++		Pte* pte = LookupPte(page, false, NULL);
++		if (pte == NULL || ((1 << pteValid) & pte->flags) == 0) {
++			TRACE("attempt to protect not mapped page: 0x%" B_PRIxADDR "\n",
++				page);
++			continue;
++		}
++
++		Pte newPte = *pte;
++		newPte.flags &= (1 << pteValid) | (1 << pteAccessed) | (1 << pteDirty);
++		if ((attributes & B_USER_PROTECTION) != 0) {
++			newPte.flags |= (1 << pteUser);
++			if ((attributes & B_READ_AREA)    != 0)
++				newPte.flags |= (1 << pteRead);
++			if ((attributes & B_WRITE_AREA)   != 0)
++				newPte.flags |= (1 << pteWrite);
++			if ((attributes & B_EXECUTE_AREA) != 0)
++				newPte.flags |= (1 << pteExec);
++		} else {
++			if ((attributes & B_KERNEL_READ_AREA)    != 0)
++				newPte.flags |= (1 << pteRead);
++			if ((attributes & B_KERNEL_WRITE_AREA)   != 0)
++				newPte.flags |= (1 << pteWrite);
++			if ((attributes & B_KERNEL_EXECUTE_AREA) != 0)
++				newPte.flags |= (1 << pteExec);
++		}
++		*pte = newPte;
++
++		FlushTlbPage(page);
++	}
++
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::ProtectPage(VMArea* area, addr_t address,
++	uint32 attributes)
++{
++	NOT_IMPLEMENTED_PANIC();
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::ProtectArea(VMArea* area, uint32 attributes)
++{
++	NOT_IMPLEMENTED_PANIC();
++	return B_NOT_SUPPORTED;
++}
++
++
++static inline uint32
++ConvertAccessedFlags(uint32 flags)
++{
++	return
++		((flags & PAGE_MODIFIED) ? (1 << pteDirty   ) : 0) |
++		((flags & PAGE_ACCESSED) ? (1 << pteAccessed) : 0);
++}
++
++
++status_t
++RISCV64VMTranslationMap::SetFlags(addr_t address, uint32 flags)
++{
++	ThreadCPUPinner pinner(thread_get_current_thread());
++	Pte* pte = LookupPte(address, false, NULL);
++	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0)
++		return B_OK;
++#ifndef DISABLE_MODIFIED_FLAGS
++	pte->flags |= ConvertAccessedFlags(flags);
++#endif
++	FlushTlbPage(address);
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::ClearFlags(addr_t address, uint32 flags)
++{
++	ThreadCPUPinner pinner(thread_get_current_thread());
++	Pte* pte = LookupPte(address, false, NULL);
++	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0)
++		return B_OK;
++#ifndef DISABLE_MODIFIED_FLAGS
++	pte->flags &= ~ConvertAccessedFlags(flags);
++#endif
++	FlushTlbPage(address);
++	return B_OK;
++}
++
++
++bool
++RISCV64VMTranslationMap::ClearAccessedAndModified(VMArea* area, addr_t address,
++	bool unmapIfUnaccessed, bool& _modified)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::ClearAccessedAndModified(0x%" B_PRIxADDR
++		"(%s), 0x%" B_PRIxADDR ", %d)\n", (addr_t)area, area->name, address,
++		unmapIfUnaccessed);
++
++	RecursiveLocker locker(fLock);
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	Pte* pte = LookupPte(address, false, NULL);
++	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0) {
++		return false;
++	}
++	Pte oldPte = *pte;
++#ifndef DISABLE_MODIFIED_FLAGS
++	if (unmapIfUnaccessed) {
++		if (((1 << pteAccessed) & pte->flags) != 0) {
++			pte->flags &= ~((1 << pteAccessed) | (1 << pteDirty));
++		} else {
++			pte->flags = 0;
++			pte->ppn = 0;
++		}
++	} else {
++		pte->flags &= ~((1 << pteAccessed) | (1 << pteDirty));
++	}
++#endif
++	pinner.Unlock();
++	_modified = ((1 << pteDirty) & oldPte.flags) != 0;
++	if (((1 << pteAccessed) & oldPte.flags) != 0) {
++		FlushTlbPage(address);
++		Flush();
++		return true;
++	}
++
++	if (!unmapIfUnaccessed)
++		return false;
++
++	fMapCount--;
++
++	locker.Detach(); // UnaccessedPageUnmapped takes ownership
++	UnaccessedPageUnmapped(area, oldPte.ppn);
++	return false;
++}
++
++
++void
++RISCV64VMTranslationMap::Flush()
++{
++	//NOT_IMPLEMENTED_PANIC();
++}
++
++
++void
++RISCV64VMTranslationMap::DebugPrintMappingInfo(addr_t virtualAddress)
++{
++	NOT_IMPLEMENTED_PANIC();
++}
++
++
++bool
++RISCV64VMTranslationMap::DebugGetReverseMappingInfo(phys_addr_t physicalAddress,
++	ReverseMappingInfoCallback& callback)
++{
++	NOT_IMPLEMENTED_PANIC();
++	return false;
++}
++
++
++status_t
++RISCV64VMTranslationMap::MemcpyToMap(addr_t to, const char *from, size_t size)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemcpyToMap(0x%" B_PRIxADDR ", 0x%"
++		B_PRIxADDR ", %" B_PRIuSIZE ")\n", to, (addr_t)from, size);
++
++	while (size > 0) {
++		uint64 va0 = ROUNDDOWN(to, B_PAGE_SIZE);
++		uint64 pa0 = LookupAddr(va0);
++		TRACE("LookupAddr(0x%" B_PRIxADDR "): 0x%" B_PRIxADDR "\n", va0, pa0);
++		if(pa0 == 0) {
++			TRACE("[!] not mapped: 0x%" B_PRIxADDR "\n", va0);
++			return B_BAD_ADDRESS;
++		}
++		uint64 n = B_PAGE_SIZE - (to - va0);
++		if(n > size)
++			n = size;
++
++		memcpy(VirtFromPhys(pa0 + (to - va0)), from, n);
++
++		size -= n;
++		from += n;
++		to = va0 + B_PAGE_SIZE;
++	}
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::MemcpyFromMap(char *to, addr_t from, size_t size)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemcpyFromMap(0x%" B_PRIxADDR ", 0x%"
++		B_PRIxADDR ", %" B_PRIuSIZE ")\n", (addr_t)to, from, size);
++
++	while (size > 0) {
++		uint64 va0 = ROUNDDOWN(from, B_PAGE_SIZE);
++		uint64 pa0 = LookupAddr(va0);
++		if (pa0 == 0) {
++			TRACE("[!] not mapped: 0x%" B_PRIxADDR
++				", calling page fault handler\n", va0);
++			addr_t newIP;
++			vm_page_fault(va0, Ra(), true, false, true, true, &newIP);
++			pa0 = LookupAddr(va0);
++			TRACE("LookupAddr(0x%" B_PRIxADDR "): 0x%" B_PRIxADDR "\n",
++				va0, pa0);
++			if (pa0 == 0)
++				return B_BAD_ADDRESS;
++		}
++		uint64 n = B_PAGE_SIZE - (from - va0);
++		if(n > size)
++			n = size;
++		memcpy(to, VirtFromPhys(pa0 + (from - va0)), n);
++
++		size -= n;
++		to += n;
++		from = va0 + B_PAGE_SIZE;
++	}
++
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMTranslationMap::MemsetToMap(addr_t to, char c, size_t count)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemsetToMap(0x%" B_PRIxADDR ", %d, %"
++		B_PRIuSIZE ")\n", to, c, count);
++
++	while (count > 0) {
++		uint64 va0 = ROUNDDOWN(to, B_PAGE_SIZE);
++		uint64 pa0 = LookupAddr(va0);
++		TRACE("LookupAddr(0x%" B_PRIxADDR "): 0x%" B_PRIxADDR "\n", va0, pa0);
++		if(pa0 == 0) {
++			TRACE("[!] not mapped: 0x%" B_PRIxADDR
++				", calling page fault handler\n", va0);
++			addr_t newIP;
++			vm_page_fault(va0, Ra(), true, false, true, true, &newIP);
++			pa0 = LookupAddr(va0);
++			TRACE("LookupAddr(0x%" B_PRIxADDR "): 0x%" B_PRIxADDR "\n",
++				va0, pa0);
++			if (pa0 == 0)
++				return B_BAD_ADDRESS;
++		}
++		uint64 n = B_PAGE_SIZE - (to - va0);
++		if(n > count)
++			n = count;
++
++		memset(VirtFromPhys(pa0 + (to - va0)), c, n);
++
++		count -= n;
++		to = va0 + B_PAGE_SIZE;
++	}
++	return B_OK;
++}
++
++
++ssize_t
++RISCV64VMTranslationMap::StrlcpyFromMap(char *to, addr_t from, size_t size)
++{
++	// NOT_IMPLEMENTED_PANIC();
++	return strlcpy(to, (const char*)from, size);
++	// return 0;
++}
++
++
++ssize_t
++RISCV64VMTranslationMap::StrlcpyToMap(addr_t to, const char *from, size_t size)
++{
++	ssize_t len = strlen(from) + 1;
++	if ((size_t)len > size) len = size;
++	if (MemcpyToMap(to, from, len) < B_OK)
++		return 0;
++	return len;
++}
++
++
++//#pragma mark RISCV64VMPhysicalPageMapper
++
++RISCV64VMPhysicalPageMapper::RISCV64VMPhysicalPageMapper()
++{
++	TRACE("+RISCV64VMPhysicalPageMapper\n");
++}
++
++
++RISCV64VMPhysicalPageMapper::~RISCV64VMPhysicalPageMapper()
++{
++	TRACE("-RISCV64VMPhysicalPageMapper\n");
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::GetPage(phys_addr_t physicalAddress,
++	addr_t* _virtualAddress, void** _handle)
++{
++	*_virtualAddress = (addr_t)VirtFromPhys(physicalAddress);
++	*_handle = (void*)1;
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::PutPage(addr_t virtualAddress, void* handle)
++{
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::GetPageCurrentCPU( phys_addr_t physicalAddress,
++	addr_t* _virtualAddress, void** _handle)
++{
++	return GetPage(physicalAddress, _virtualAddress, _handle);
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::PutPageCurrentCPU(addr_t virtualAddress,
++	void* _handle)
++{
++	return PutPage(virtualAddress, _handle);
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::GetPageDebug(phys_addr_t physicalAddress,
++	addr_t* _virtualAddress, void** _handle)
++{
++	NOT_IMPLEMENTED_PANIC();
++	return B_NOT_SUPPORTED;
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::PutPageDebug(addr_t virtualAddress, void* handle)
++{
++	NOT_IMPLEMENTED_PANIC();
++	return B_NOT_SUPPORTED;
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::MemsetPhysical(phys_addr_t address, int value,
++	phys_size_t length)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemsetPhysical(0x%" B_PRIxADDR
++		", 0x%x, 0x%" B_PRIxADDR ")\n", address, value, length);
++	set_ac();
++	memset(VirtFromPhys(address), value, length);
++	clear_ac();
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::MemcpyFromPhysical(void* to, phys_addr_t from,
++	size_t length, bool user)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemcpyFromPhysical(0x%" B_PRIxADDR
++		", 0x%" B_PRIxADDR ", %" B_PRIuSIZE ")\n", (addr_t)to, from, length);
++	set_ac();
++	memcpy(to, VirtFromPhys(from), length);
++	clear_ac();
++	return B_OK;
++}
++
++
++status_t
++RISCV64VMPhysicalPageMapper::MemcpyToPhysical(phys_addr_t to, const void* from,
++	size_t length, bool user)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemcpyToPhysical(0x%" B_PRIxADDR
++		", 0x%" B_PRIxADDR ", %" B_PRIuSIZE ")\n", to, (addr_t)from, length);
++	set_ac();
++	memcpy(VirtFromPhys(to), from, length);
++	clear_ac();
++	return B_OK;
++}
++
++
++void
++RISCV64VMPhysicalPageMapper::MemcpyPhysicalPage(phys_addr_t to,
++	phys_addr_t from)
++{
++	TRACE("RISCV64VMPhysicalPageMapper::MemcpyPhysicalPage(0x%" B_PRIxADDR
++		", 0x%" B_PRIxADDR ")\n", to, from);
++	set_ac();
++	memcpy(VirtFromPhys(to), VirtFromPhys(from), B_PAGE_SIZE);
++	clear_ac();
++}
+diff --git a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+new file mode 100644
+index 0000000000..2d9e8a148c
+--- /dev/null
++++ b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+@@ -0,0 +1,143 @@
++#ifndef _RISCV64VMTRANSLATIONMAP_H_
++#define _RISCV64VMTRANSLATIONMAP_H_
++
++#include <vm/VMTranslationMap.h>
++#include <arch_cpu_defs.h>
++
++
++struct RISCV64VMTranslationMap: public VMTranslationMap {
++								RISCV64VMTranslationMap(bool kernel,
++									phys_addr_t pageTable = 0);
++	virtual						~RISCV64VMTranslationMap();
++
++	virtual	bool				Lock();
++	virtual	void				Unlock();
++
++	virtual	addr_t				MappedSize() const;
++	virtual	size_t				MaxPagesNeededToMap(addr_t start,
++									addr_t end) const;
++
++	virtual	status_t			Map(addr_t virtualAddress,
++									phys_addr_t physicalAddress,
++									uint32 attributes, uint32 memoryType,
++									vm_page_reservation* reservation);
++	virtual	status_t			Unmap(addr_t start, addr_t end);
++
++	virtual	status_t			DebugMarkRangePresent(addr_t start, addr_t end,
++									bool markPresent);
++
++	virtual	status_t			UnmapPage(VMArea* area, addr_t address,
++									bool updatePageQueue);
++	virtual	void				UnmapPages(VMArea* area, addr_t base,
++									size_t size, bool updatePageQueue);
++	virtual	void				UnmapArea(VMArea* area,
++									bool deletingAddressSpace,
++									bool ignoreTopCachePageFlags);
++
++	virtual	status_t			Query(addr_t virtualAddress,
++									phys_addr_t* _physicalAddress,
++									uint32* _flags);
++	virtual	status_t			QueryInterrupt(addr_t virtualAddress,
++									phys_addr_t* _physicalAddress,
++									uint32* _flags);
++
++	virtual	status_t			Protect(addr_t base, addr_t top,
++									uint32 attributes, uint32 memoryType);
++			status_t			ProtectPage(VMArea* area, addr_t address,
++									uint32 attributes);
++			status_t			ProtectArea(VMArea* area,
++									uint32 attributes);
++
++			status_t			SetFlags(addr_t virtualAddress,
++									uint32 flags);
++
++	virtual	status_t			ClearFlags(addr_t virtualAddress,
++									uint32 flags);
++
++	virtual	bool				ClearAccessedAndModified(
++									VMArea* area, addr_t address,
++									bool unmapIfUnaccessed,
++									bool& _modified);
++
++	virtual	void				Flush();
++
++	virtual	void				DebugPrintMappingInfo(addr_t virtualAddress);
++	virtual	bool				DebugGetReverseMappingInfo(
++									phys_addr_t physicalAddress,
++									ReverseMappingInfoCallback& callback);
++
++	inline	phys_addr_t			PageTable();
++	inline	uint64				Satp();
++
++			status_t			MemcpyToMap(addr_t to, const char *from,
++									size_t size);
++			status_t			MemcpyFromMap(char *to, addr_t from,
++									size_t size);
++			status_t			MemsetToMap(addr_t to, char c, size_t count);
++			ssize_t				StrlcpyFromMap(char *to, addr_t from,
++									size_t size);
++			ssize_t				StrlcpyToMap(addr_t to, const char *from,
++									size_t size);
++
++private:
++			Pte*				LookupPte(addr_t virtAdr, bool alloc,
++									vm_page_reservation* reservation);
++			phys_addr_t			LookupAddr(addr_t virtAdr);
++
++			bool				fIsKernel;
++			phys_addr_t			fPageTable;
++			uint64_t			fPageTableSize; // in page units
++};
++
++
++inline phys_addr_t RISCV64VMTranslationMap::PageTable()
++{
++	return fPageTable;
++}
++
++inline uint64 RISCV64VMTranslationMap::Satp()
++{
++	SatpReg satp;
++	satp.ppn = fPageTable / B_PAGE_SIZE;
++	satp.asid = 0;
++	satp.mode = satpModeSv39;
++	return satp.val;
++}
++
++
++struct RISCV64VMPhysicalPageMapper: public VMPhysicalPageMapper {
++								RISCV64VMPhysicalPageMapper();
++	virtual						~RISCV64VMPhysicalPageMapper();
++
++	virtual	status_t			GetPage(phys_addr_t physicalAddress,
++									addr_t* _virtualAddress,
++									void** _handle);
++	virtual	status_t			PutPage(addr_t virtualAddress,
++									void* handle);
++
++	virtual	status_t			GetPageCurrentCPU(
++									phys_addr_t physicalAddress,
++									addr_t* _virtualAddress,
++									void** _handle);
++	virtual	status_t			PutPageCurrentCPU(addr_t virtualAddress,
++									void* _handle);
++
++	virtual	status_t			GetPageDebug(phys_addr_t physicalAddress,
++									addr_t* _virtualAddress,
++									void** _handle);
++	virtual	status_t			PutPageDebug(addr_t virtualAddress,
++									void* handle);
++
++	virtual	status_t			MemsetPhysical(phys_addr_t address, int value,
++									phys_size_t length);
++	virtual	status_t			MemcpyFromPhysical(void* to, phys_addr_t from,
++									size_t length, bool user);
++	virtual	status_t			MemcpyToPhysical(phys_addr_t to,
++									const void* from, size_t length,
++									bool user);
++	virtual	void				MemcpyPhysicalPage(phys_addr_t to,
++									phys_addr_t from);
++};
++
++
++#endif	// _RISCV64VMTRANSLATIONMAP_H_
+diff --git a/src/system/kernel/arch/riscv64/arch_vm.cpp b/src/system/kernel/arch/riscv64/arch_vm.cpp
+index 8a72900813..d70fb21f00 100644
+--- a/src/system/kernel/arch/riscv64/arch_vm.cpp
++++ b/src/system/kernel/arch/riscv64/arch_vm.cpp
+@@ -8,9 +8,12 @@
+ #include <vm/vm.h>
+ #include <vm/VMAddressSpace.h>
+ #include <arch/vm.h>
++#include <boot/kernel_args.h>
+ 
++#include "RISCV64VMTranslationMap.h"
+ 
+-//#define TRACE_ARCH_VM
++
++#define TRACE_ARCH_VM
+ #ifdef TRACE_ARCH_VM
+ #	define TRACE(x) dprintf x
+ #else
+@@ -18,6 +21,182 @@
+ #endif
+ 
+ 
++static uint64_t
++SignExtendVirtAdr(uint64_t virtAdr)
++{
++	if (((uint64_t)1 << 38) & virtAdr)
++		return virtAdr | 0xFFFFFF8000000000;
++	return virtAdr;
++}
++
++
++static Pte*
++LookupPte(phys_addr_t pageTable, addr_t virtAdr)
++{
++	Pte *pte = (Pte*)VirtFromPhys(pageTable);
++	for (int level = 2; level > 0; level --) {
++		pte += VirtAdrPte(virtAdr, level);
++		if (!((1 << pteValid) & pte->flags)) {
++			return NULL;
++		}
++		pte = (Pte*)VirtFromPhys(B_PAGE_SIZE * pte->ppn);
++	}
++	pte += VirtAdrPte(virtAdr, 0);
++	return pte;
++}
++
++
++
++static void
++WritePteFlags(uint32 flags)
++{
++	bool first = true;
++	dprintf("{");
++	for (uint32 i = 0; i < 32; i++) {
++		if ((1 << i) & flags) {
++			if (first) first = false; else dprintf(", ");
++			switch (i) {
++			case pteValid:    dprintf("valid"); break;
++			case pteRead:     dprintf("read"); break;
++			case pteWrite:    dprintf("write"); break;
++			case pteExec:     dprintf("exec"); break;
++			case pteUser:     dprintf("user"); break;
++			case pteGlobal:   dprintf("global"); break;
++			case pteAccessed: dprintf("accessed"); break;
++			case pteDirty:    dprintf("dirty"); break;
++			default:          dprintf("%" B_PRIu32, i);
++			}
++		}
++	}
++	dprintf("}");
++}
++
++
++static void
++DumpPageWrite(uint64_t virtAdr, uint64_t physAdr, size_t size, uint64 flags, uint64& firstVirt, uint64& firstPhys, uint64& firstFlags, uint64& len)
++{
++	if (virtAdr == firstVirt + len && physAdr == firstPhys + len && flags == firstFlags) {
++		len += size;
++	} else {
++		if (len != 0) {
++			dprintf("  0x%08" B_PRIxADDR " - 0x%08" B_PRIxADDR,
++				firstVirt, firstVirt + (len - 1));
++			dprintf(": 0x%08" B_PRIxADDR " - 0x%08" B_PRIxADDR ", %#" B_PRIxADDR ", ", firstPhys, firstPhys + (len - 1), len);
++			WritePteFlags(firstFlags); dprintf("\n");
++		}
++		firstVirt = virtAdr;
++		firstPhys = physAdr;
++		firstFlags = flags;
++		len = size;
++	}
++}
++
++
++static void
++DumpPageTableInt(Pte* pte, uint64_t virtAdr, uint32_t level, uint64& firstVirt, uint64& firstPhys, uint64& firstFlags, uint64& len)
++{
++	for (uint32 i = 0; i < pteCount; i++) {
++		if (((1 << pteValid) & pte[i].flags) != 0) {
++			if ((((1 << pteRead) | (1 << pteWrite) | (1 << pteExec)) & pte[i].flags) == 0) {
++				if (level == 0)
++					kprintf("  internal page table on level 0\n");
++
++				DumpPageTableInt((Pte*)VirtFromPhys(pageSize*pte[i].ppn),
++					virtAdr + ((uint64_t)i << (pageBits + pteIdxBits*level)),
++					level - 1, firstVirt, firstPhys, firstFlags, len);
++			} else {
++				DumpPageWrite(
++					SignExtendVirtAdr(virtAdr + ((uint64_t)i << (pageBits + pteIdxBits*level))),
++					pte[i].ppn * B_PAGE_SIZE,
++					1 << (pageBits + pteIdxBits*level),
++					pte[i].flags,
++					firstVirt, firstPhys, firstFlags, len);
++			}
++		}
++	}
++}
++
++
++static int
++DumpPageTable(int argc, char** argv)
++{
++	SatpReg satp;
++	if (argc >= 2) {
++		team_id id = strtoul(argv[1], NULL, 0);
++		VMAddressSpace* addrSpace = VMAddressSpace::DebugGet(id);
++		if (addrSpace == NULL) {
++			kprintf("could not find team %" B_PRId32 "\n", id);
++			return 0;
++		}
++		satp.val = ((RISCV64VMTranslationMap*)
++			addrSpace->TranslationMap())->Satp();
++		dprintf("page table for team %" B_PRId32 "\n", id);
++	} else {
++		satp.val = Satp();
++		dprintf("current page table:\n");
++	}
++	Pte* root = (Pte*)VirtFromPhys(satp.ppn * B_PAGE_SIZE);
++
++	uint64 firstVirt = 0;
++	uint64 firstPhys = 0;
++	uint64 firstFlags = 0;
++	uint64 len = 0;
++	DumpPageTableInt(root, 0, 2, firstVirt, firstPhys, firstFlags, len);
++	DumpPageWrite(0, 0, 0, 0, firstVirt, firstPhys, firstFlags, len);
++
++	return 0;
++}
++
++
++static int
++DumpVirtPage(int argc, char** argv)
++{
++	int curArg = 1;
++	SatpReg satp;
++
++	satp.val = Satp();
++	while (argv[curArg][0] == '-') {
++		if (strcmp(argv[curArg], "-team") == 0) {
++			curArg++;
++			team_id id = strtoul(argv[curArg++], NULL, 0);
++			VMAddressSpace* addrSpace = VMAddressSpace::DebugGet(id);
++			if (addrSpace == NULL) {
++				kprintf("could not find team %" B_PRId32 "\n", id);
++				return 0;
++			}
++			satp.val = ((RISCV64VMTranslationMap*)
++				addrSpace->TranslationMap())->Satp();
++		} else {
++			kprintf("unknown flag \"%s\"\n", argv[curArg]);
++			return 0;
++		}
++	}
++
++	kprintf("satp: %#" B_PRIx64 "\n", satp.val);
++
++	uint64 firstVirt = 0;
++	uint64 firstPhys = 0;
++	uint64 firstFlags = 0;
++	uint64 len = B_PAGE_SIZE;
++	if (!evaluate_debug_expression(argv[curArg++], &firstVirt, false))
++		return 0;
++
++	firstVirt = ROUNDDOWN(firstVirt, B_PAGE_SIZE);
++
++	Pte* pte = LookupPte(satp.ppn * B_PAGE_SIZE, firstVirt);
++	if (pte == NULL) {
++		dprintf("not mapped\n");
++		return 0;
++	}
++	firstPhys = pte->ppn * B_PAGE_SIZE;
++	firstFlags = pte->flags;
++
++	DumpPageWrite(0, 0, 0, 0, firstVirt, firstPhys, firstFlags, len);
++
++	return 0;
++}
++
++
+ status_t
+ arch_vm_init(kernel_args *args)
+ {
+@@ -28,6 +207,16 @@ arch_vm_init(kernel_args *args)
+ status_t
+ arch_vm_init_post_area(kernel_args *args)
+ {
++	void* address = (void*)args->arch_args.physMap.start;
++	area_id area = vm_create_null_area(VMAddressSpace::KernelID(),
++		"physical map area", &address, B_EXACT_ADDRESS,
++		args->arch_args.physMap.size, 0);
++	if (area < B_OK)
++		return area;
++
++	add_debugger_command("dump_page_table", &DumpPageTable, "Dump page table");
++	add_debugger_command("dump_virt_page", &DumpVirtPage, "Dump virtual page mapping");
++
+ 	return B_OK;
+ }
+ 
+@@ -42,15 +231,15 @@ arch_vm_init_post_modules(kernel_args *args)
+ status_t
+ arch_vm_init_end(kernel_args *args)
+ {
+-	TRACE(("arch_vm_init_end(): %lu virtual ranges to keep:\n",
++	TRACE(("arch_vm_init_end(): %" B_PRIu32 " virtual ranges to keep:\n",
+ 		args->arch_args.num_virtual_ranges_to_keep));
+ 
+ 	for (int i = 0; i < (int)args->arch_args.num_virtual_ranges_to_keep; i++) {
+ 		addr_range &range = args->arch_args.virtual_ranges_to_keep[i];
+ 
+-		TRACE(("  start: %p, size: 0x%lx\n", (void*)range.start, range.size));
++		TRACE(("  start: %p, size: %#" B_PRIxSIZE "\n", (void*)range.start, range.size));
+ 
+-#if 0
++#if 1
+ 		// skip ranges outside the kernel address space
+ 		if (!IS_KERNEL_ADDRESS(range.start)) {
+ 			TRACE(("    no kernel address, skipping...\n"));
+@@ -96,6 +285,9 @@ arch_vm_aspace_swap(struct VMAddressSpace *from, struct VMAddressSpace *to)
+ 	// page directories include all kernel mappings as well. Furthermore our
+ 	// arch specific translation map data objects are ref-counted, so they won't
+ 	// go away as long as they are still used on any CPU.
++
++	SetSatp(((RISCV64VMTranslationMap*)to->TranslationMap())->Satp());
++	FlushTlbAll();
+ }
+ 
+ 
+@@ -115,8 +307,5 @@ arch_vm_unset_memory_type(VMArea *area)
+ status_t
+ arch_vm_set_memory_type(VMArea *area, phys_addr_t physicalBase, uint32 type)
+ {
+-	if (type == 0)
+-		return B_OK;
+-
+-	return B_ERROR;
++	return B_OK;
+ }
+diff --git a/src/system/kernel/arch/riscv64/arch_vm_translation_map.cpp b/src/system/kernel/arch/riscv64/arch_vm_translation_map.cpp
+index afb42677a2..1f131ab669 100644
+--- a/src/system/kernel/arch/riscv64/arch_vm_translation_map.cpp
++++ b/src/system/kernel/arch/riscv64/arch_vm_translation_map.cpp
+@@ -1,7 +1,8 @@
+ /*
+  * Copyright 2007-2010, François Revol, revol@free.fr.
+  * Copyright 2008-2010, Ingo Weinhold, ingo_weinhold@gmx.de.
+- * Copyright 2002-2007, Axel Dörfler, axeld@pinc-software.de. All rights reserved.
++ * Copyright 2002-2007, Axel Dörfler, axeld@pinc-software.de. All rights
++ *   reserved.
+  * Copyright 2019, Adrien Destugues, pulkomandy@pulkomandy.tk.
+  * Distributed under the terms of the MIT License.
+  *
+@@ -12,9 +13,15 @@
+ 
+ #include <KernelExport.h>
+ #include <kernel.h>
++#include <boot/kernel_args.h>
+ #include <vm/vm.h>
+ #include <vm/vm_priv.h>
+ #include <vm/VMAddressSpace.h>
++#include <arch_cpu_defs.h>
++#include "RISCV64VMTranslationMap.h"
++#include <Htif.h>
++#include <Plic.h>
++#include <Clint.h>
+ 
+ 
+ #define TRACE_VM_TMAP
+@@ -25,6 +32,52 @@
+ #endif
+ 
+ 
++ssize_t gVirtFromPhysOffset = 0;
++
++phys_addr_t sPageTable = 0;
++char sPhysicalPageMapperData[sizeof(RISCV64VMPhysicalPageMapper)];
++
++
++static Pte*
++LookupPte(addr_t virtAdr, bool alloc, kernel_args* args,
++	phys_addr_t (*get_free_page)(kernel_args *))
++{
++	Pte *pte = (Pte*)VirtFromPhys(sPageTable);
++	for (int level = 2; level > 0; level --) {
++		pte += VirtAdrPte(virtAdr, level);
++		if (!((1 << pteValid) & pte->flags)) {
++			if (!alloc)
++				return NULL;
++			pte->ppn = get_free_page(args);
++			if (pte->ppn == 0)
++				return NULL;
++			memset((Pte*)VirtFromPhys(B_PAGE_SIZE * pte->ppn), 0, B_PAGE_SIZE);
++			pte->flags |= (1 << pteValid);
++		}
++		pte = (Pte*)VirtFromPhys(B_PAGE_SIZE * pte->ppn);
++	}
++	pte += VirtAdrPte(virtAdr, 0);
++	return pte;
++}
++
++
++static void
++Map(addr_t virtAdr, phys_addr_t physAdr, uint64 flags, kernel_args* args,
++	phys_addr_t (*get_free_page)(kernel_args *))
++{
++	// dprintf("Map(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR ")\n", virtAdr, physAdr);
++	Pte* pte = LookupPte(virtAdr, true, args, get_free_page);
++	if (pte == NULL) panic("can't allocate page table");
++
++	pte->ppn = physAdr / B_PAGE_SIZE;
++	pte->flags = (1 << pteValid) | (1 << pteAccessed) | (1 << pteDirty) | flags;
++
++	FlushTlbPage(virtAdr);
++}
++
++
++//#pragma mark -
++
+ status_t
+ arch_vm_translation_map_init(kernel_args *args,
+ 	VMPhysicalPageMapper** _physicalPageMapper)
+@@ -36,25 +89,44 @@ arch_vm_translation_map_init(kernel_args *args,
+ 	for (uint32 i = 0; i < args->num_physical_memory_ranges; i++) {
+ 		phys_addr_t start = args->physical_memory_range[i].start;
+ 		phys_addr_t end = start + args->physical_memory_range[i].size;
+-		TRACE("  %#10" B_PRIxPHYSADDR " - %#10" B_PRIxPHYSADDR "\n", start,
+-			end);
++		TRACE("  %" B_PRIxPHYSADDR " - %" B_PRIxPHYSADDR "\n", start, end);
+ 	}
+ 
+ 	TRACE("allocated physical ranges:\n");
+ 	for (uint32 i = 0; i < args->num_physical_allocated_ranges; i++) {
+ 		phys_addr_t start = args->physical_allocated_range[i].start;
+ 		phys_addr_t end = start + args->physical_allocated_range[i].size;
+-		TRACE("  %#10" B_PRIxPHYSADDR " - %#10" B_PRIxPHYSADDR "\n", start,
+-			end);
++		TRACE("  %" B_PRIxPHYSADDR " - %" B_PRIxPHYSADDR "\n", start, end);
+ 	}
+ 
+ 	TRACE("allocated virtual ranges:\n");
+ 	for (uint32 i = 0; i < args->num_virtual_allocated_ranges; i++) {
+ 		addr_t start = args->virtual_allocated_range[i].start;
+ 		addr_t end = start + args->virtual_allocated_range[i].size;
+-		TRACE("  %#10" B_PRIxADDR " - %#10" B_PRIxADDR "\n", start, end);
++		TRACE("  %" B_PRIxADDR " - %" B_PRIxADDR "\n", start, end);
++	}
++
++	TRACE("kernel args ranges:\n");
++	for (uint32 i = 0; i < args->num_kernel_args_ranges; i++) {
++		phys_addr_t start = args->kernel_args_range[i].start;
++		phys_addr_t end = start + args->kernel_args_range[i].size;
++		TRACE("  %" B_PRIxPHYSADDR " - %" B_PRIxPHYSADDR "\n", start, end);
+ 	}
+ #endif
++	
++	{
++		SatpReg satp(Satp());
++		sPageTable = satp.ppn * B_PAGE_SIZE;
++	}
++	
++	dprintf("physMapBase: %#" B_PRIxADDR "\n", args->arch_args.physMap.start);
++	dprintf("physMemBase: %#" B_PRIxADDR "\n", args->physical_memory_range[0].start);
++	gVirtFromPhysOffset = args->arch_args.physMap.start - args->physical_memory_range[0].start;
++
++	clear_ac();
++
++	*_physicalPageMapper = new(&sPhysicalPageMapperData)
++		RISCV64VMPhysicalPageMapper();
+ 
+ 	return B_OK;
+ }
+@@ -76,10 +148,19 @@ arch_vm_translation_map_init_post_area(kernel_args *args)
+ 
+ 
+ status_t
+-arch_vm_translation_map_early_map(kernel_args *args, addr_t va, phys_addr_t pa,
+-	uint8 attributes, phys_addr_t (*get_free_page)(kernel_args *))
++arch_vm_translation_map_early_map(kernel_args *args,
++	addr_t virtAdr, phys_addr_t physAdr, uint8 attributes,
++	phys_addr_t (*get_free_page)(kernel_args *))
+ {
+-	TRACE("early_tmap: entry pa 0x%lx va 0x%lx\n", pa, va);
++	//dprintf("early_map(%#" B_PRIxADDR ", %#" B_PRIxADDR ")\n", virtAdr, physAdr);
++	uint64 flags = 0;
++	if ((attributes & B_KERNEL_READ_AREA) != 0)
++		flags |= (1 << pteRead);
++	if ((attributes & B_KERNEL_WRITE_AREA) != 0)
++		flags |= (1 << pteWrite);
++	if ((attributes & B_KERNEL_EXECUTE_AREA) != 0)
++		flags |= (1 << pteExec);
++	Map(virtAdr, physAdr, flags, args, get_free_page);
+ 	return B_OK;
+ }
+ 
+@@ -87,6 +168,12 @@ arch_vm_translation_map_early_map(kernel_args *args, addr_t va, phys_addr_t pa,
+ status_t
+ arch_vm_translation_map_create_map(bool kernel, VMTranslationMap** _map)
+ {
++	*_map = new(std::nothrow) RISCV64VMTranslationMap(kernel,
++		(kernel) ? sPageTable : 0);
++
++	if (*_map == NULL)
++		return B_NO_MEMORY;
++
+ 	return B_OK;
+ }
+ 
+@@ -95,6 +182,5 @@ bool
+ arch_vm_translation_map_is_kernel_page_accessible(addr_t virtualAddress,
+ 	uint32 protection)
+ {
+-	return false;
++	return virtualAddress != 0;
+ }
+-
+-- 
+2.30.2
+

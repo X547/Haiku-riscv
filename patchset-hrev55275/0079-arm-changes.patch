@@ -1,0 +1,365 @@
+From e7a27df5bdb8136e29f45bc3a76e2b04755d75d1 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 02:48:32 +0900
+Subject: arm changes
+
+Change-Id: Iccbf199851e1e31315bd5130eb9e54621475223a
+---
+ build/jam/ArchitectureRules                   |  7 ++---
+ headers/private/kernel/arch/arm/arch_kernel.h | 18 ++++++------
+ .../kernel/arch/arm/arch_kernel_args.h        | 20 ++++++++++++-
+ src/system/boot/arch/arm/Jamfile              |  8 ------
+ src/system/kernel/arch/arm/Jamfile            |  4 +--
+ src/system/kernel/arch/arm/arch_int.cpp       | 13 +++++----
+ src/system/kernel/arch/arm/arch_timer.cpp     | 10 ++++---
+ src/system/kernel/arch/arm/arch_vm.cpp        |  3 --
+ .../arch/arm/arch_vm_translation_map.cpp      |  4 ++-
+ src/system/kernel/arch/arm/soc.h              | 28 ++++---------------
+ 10 files changed, 55 insertions(+), 60 deletions(-)
+
+diff --git a/build/jam/ArchitectureRules b/build/jam/ArchitectureRules
+index c71d219516..5ba6a504eb 100644
+--- a/build/jam/ArchitectureRules
++++ b/build/jam/ArchitectureRules
+@@ -39,7 +39,7 @@ rule ArchitectureSetup architecture
+ 	local archFlags ;
+ 	switch $(cpu) {
+ 		case ppc : archFlags += -mcpu=440fp ;
+-		case arm : archFlags += -march=armv7-a -mfloat-abi=hard ;
++		case arm : archFlags += -march=armv7-a -mfloat-abi=hard -fno-omit-frame-pointer ;
+ 		case x86 : archFlags += -march=pentium ;
+ 		case riscv64 : archFlags += -march=rv64gc ;
+ 	}
+@@ -397,9 +397,8 @@ rule KernelArchitectureSetup architecture
+ 
+ 	switch $(cpu) {
+ 		case arm :
+-			HAIKU_KERNEL_PIC_LINKFLAGS += -z max-page-size=0x1000 ;
+-			HAIKU_KERNEL_ADDON_LINKFLAGS += -z max-page-size=0x1000 ;
+-			HAIKU_KERNEL_PIC_CCFLAGS = -fpic ;
++			HAIKU_KERNEL_CCFLAGS += -fpic ;
++			HAIKU_KERNEL_C++FLAGS += -fpic ;
+ 			HAIKU_KERNEL_PIC_LINKFLAGS = -shared ;
+ 
+ 		case arm64 :
+diff --git a/headers/private/kernel/arch/arm/arch_kernel.h b/headers/private/kernel/arch/arm/arch_kernel.h
+index 29706219ad..b2367c615e 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel.h
++++ b/headers/private/kernel/arch/arm/arch_kernel.h
+@@ -10,9 +10,10 @@
+ // memory layout
+ #define KERNEL_LOAD_BASE	0x80000000
+ 
+-#define KERNEL_BASE	0x80000000
+-#define KERNEL_SIZE	0x80000000
+-#define KERNEL_TOP	(KERNEL_BASE + (KERNEL_SIZE - 1))
++#define USER_BASE	0x80000000
++#define USER_BASE_ANY		USER_BASE
++#define USER_SIZE	0x80000000
++#define USER_TOP	(USER_BASE + (USER_SIZE - 1))
+ 
+ /*
+ ** User space layout is a little special:
+@@ -22,13 +23,12 @@
+ ** region wont be placed there. The 64kb region assures a user space thread cannot pass
+ ** a buffer into the kernel as part of a syscall that would cross into kernel space.
+ */
+-#define USER_BASE		0x100000
+-#define USER_BASE_ANY		USER_BASE
+-#define USER_SIZE		(0x80000000 - (0x10000 + USER_BASE))
+-#define USER_TOP		(USER_BASE + (USER_SIZE - 1))
++#define KERNEL_BASE		0x100000
++#define KERNEL_SIZE		(0x80000000 - (0x10000 + KERNEL_BASE))
++#define KERNEL_TOP		(KERNEL_BASE + (KERNEL_SIZE - 1))
+ 
+-#define KERNEL_USER_DATA_BASE	0x60000000
+-#define USER_STACK_REGION	0x70000000
++#define KERNEL_USER_DATA_BASE	0xE0000000
++#define USER_STACK_REGION	0xF0000000
+ #define USER_STACK_REGION_SIZE	((USER_TOP - USER_STACK_REGION) + 1)
+ 
+ #endif	/* _KERNEL_ARCH_ARM_KERNEL_H */
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index 9758ea7035..fcc34c3fa9 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -15,6 +15,23 @@
+ 
+ #define _PACKED __attribute__((packed))
+ 
++
++enum {
++	kUartKindNone,
++	kUartKind8250,
++	kUartKindSifive,
++	kUartKindPl011,
++};
++
++
++typedef struct {
++	uint32 kind;
++	addr_range regs;
++	uint32 irq;
++	int64 clock;
++} _PACKED ArchUart;
++
++
+ // kernel args
+ typedef struct {
+ 	int		cpu_type; 
+@@ -28,9 +45,10 @@ typedef struct {
+ 	uint32	vir_pgdir;
+ 	uint32	next_pagetable;
+ 
+-	// needed for UEFI, otherwise kernel acpi support can't find ACPI root
+ 	FixedWidthPointer<void> acpi_root;
+ 	FixedWidthPointer<void> fdt;
++
++	ArchUart    uart;
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/src/system/boot/arch/arm/Jamfile b/src/system/boot/arch/arm/Jamfile
+index bc1cc0918b..44b9a114b6 100644
+--- a/src/system/boot/arch/arm/Jamfile
++++ b/src/system/boot/arch/arm/Jamfile
+@@ -20,13 +20,6 @@ local kernelArchSources =
+ 	arch_uart_8250.cpp
+ ;
+ 
+-local kernelDebugSources =
+-	blue_screen.cpp
+-	font.cpp
+-	font_spleen.cpp
+-	frame_buffer_console.cpp
+-;
+-
+ local kernelGenericDriverSources =
+ 	debug_uart_8250.cpp
+ ;
+@@ -44,7 +37,6 @@ for platform in [ MultiBootSubDirSetup u-boot efi ] {
+ 
+ 			# Reuse a subset of kernel debugging.
+ 			kernel_stubs.cpp
+-			$(kernelDebugSources)
+ 
+ 			$(librootGenericSources)
+ 			$(librootArchSources)
+diff --git a/src/system/kernel/arch/arm/Jamfile b/src/system/kernel/arch/arm/Jamfile
+index e7eca39cee..96675d3085 100644
+--- a/src/system/kernel/arch/arm/Jamfile
++++ b/src/system/kernel/arch/arm/Jamfile
+@@ -38,8 +38,8 @@ KernelMergeObject kernel_arch_arm.o :
+ 	# SoC minimal kernel-required support
+ 	# (timers, interrupts, rtc?)
+ 	soc.cpp
+-	soc_pxa.cpp
+-	soc_omap3.cpp
++	#soc_pxa.cpp
++	#soc_omap3.cpp
+ 
+ 	# paging
+ 	arm_physical_page_mapper_large_memory.cpp
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index d7184dc6f9..7087e1fc71 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -33,8 +33,8 @@
+ #include <drivers/bus/FDT.h>
+ #include "soc.h"
+ 
+-#include "soc_pxa.h"
+-#include "soc_omap3.h"
++//#include "soc_pxa.h"
++//#include "soc_omap3.h"
+ 
+ #define TRACE_ARCH_INT
+ #ifdef TRACE_ARCH_INT
+@@ -54,7 +54,6 @@ static area_id sVectorPageArea;
+ static void *sVectorPageAddress;
+ static area_id sUserVectorPageArea;
+ static void *sUserVectorPageAddress;
+-static fdt_module_info *sFdtModule;
+ 
+ // An iframe stack used in the early boot process when we don't have
+ // threads yet.
+@@ -116,6 +115,7 @@ arch_int_init(kernel_args *args)
+ extern "C" void arm_vector_init(void);
+ 
+ 
++#if 0
+ static struct fdt_device_info intc_table[] = {
+ 	{
+ 		.compatible = "marvell,pxa-intc",
+@@ -126,6 +126,7 @@ static struct fdt_device_info intc_table[] = {
+ 	}
+ };
+ static int intc_count = sizeof(intc_table) / sizeof(struct fdt_device_info);
++#endif
+ 
+ 
+ status_t
+@@ -164,7 +165,7 @@ arch_int_init_post_vm(kernel_args *args)
+ 		else
+ 			dprintf("Enabled high vectors\n");
+ 	}
+-
++#if 0
+ 	status_t rc = get_module(B_FDT_MODULE_NAME, (module_info**)&sFdtModule);
+ 	if (rc != B_OK)
+ 		panic("Unable to get FDT module: %08lx!\n", rc);
+@@ -172,7 +173,7 @@ arch_int_init_post_vm(kernel_args *args)
+ 	rc = sFdtModule->setup_devices(intc_table, intc_count, NULL);
+ 	if (rc != B_OK)
+ 		panic("No interrupt controllers found!\n");
+-
++#endif
+ 	return B_OK;
+ }
+ 
+@@ -311,7 +312,7 @@ arch_arm_data_abort(struct iframe *frame)
+ 
+ 	enable_interrupts();
+ 
+-	vm_page_fault(far, frame->pc, isWrite, false, isUser, &newip);
++	vm_page_fault(far, frame->pc, isWrite, false, isUser, true, &newip);
+ 
+ 	if (newip != 0) {
+ 		// the page fault handler wants us to modify the iframe to set the
+diff --git a/src/system/kernel/arch/arm/arch_timer.cpp b/src/system/kernel/arch/arm/arch_timer.cpp
+index f17f106b84..86daa4cd49 100644
+--- a/src/system/kernel/arch/arm/arch_timer.cpp
++++ b/src/system/kernel/arch/arm/arch_timer.cpp
+@@ -22,8 +22,8 @@
+ #include <drivers/bus/FDT.h>
+ #include "soc.h"
+ 
+-#include "soc_pxa.h"
+-#include "soc_omap3.h"
++//#include "soc_pxa.h"
++//#include "soc_omap3.h"
+ 
+ //#define TRACE_ARCH_TIMER
+ #ifdef TRACE_ARCH_TIMER
+@@ -32,6 +32,7 @@
+ #	define TRACE(x) ;
+ #endif
+ 
++#if 0
+ static fdt_module_info *sFdtModule;
+ 
+ static struct fdt_device_info intc_table[] = {
+@@ -44,6 +45,7 @@ static struct fdt_device_info intc_table[] = {
+ 	}
+ };
+ static int intc_count = sizeof(intc_table) / sizeof(struct fdt_device_info);
++#endif
+ 
+ 
+ void
+@@ -67,7 +69,7 @@ int
+ arch_init_timer(kernel_args *args)
+ {
+ 	TRACE(("%s\n", __func__));
+-
++#if 0
+ 	status_t rc = get_module(B_FDT_MODULE_NAME, (module_info**)&sFdtModule);
+ 	if (rc != B_OK)
+ 		panic("Unable to get FDT module: %08lx!\n", rc);
+@@ -75,7 +77,7 @@ arch_init_timer(kernel_args *args)
+ 	rc = sFdtModule->setup_devices(intc_table, intc_count, NULL);
+ 	if (rc != B_OK)
+ 		panic("No interrupt controllers found!\n");
+-
++#endif
+ 	return B_OK;
+ }
+ 
+diff --git a/src/system/kernel/arch/arm/arch_vm.cpp b/src/system/kernel/arch/arm/arch_vm.cpp
+index a17f317d70..f41719be8d 100644
+--- a/src/system/kernel/arch/arm/arch_vm.cpp
++++ b/src/system/kernel/arch/arm/arch_vm.cpp
+@@ -101,8 +101,5 @@ arch_vm_unset_memory_type(VMArea *area)
+ status_t
+ arch_vm_set_memory_type(VMArea *area, phys_addr_t physicalBase, uint32 type)
+ {
+-	if (type != 0)
+-		dprintf("%s: undefined type %lx!\n", __PRETTY_FUNCTION__, type);
+-
+ 	return B_OK;
+ }
+diff --git a/src/system/kernel/arch/arm/arch_vm_translation_map.cpp b/src/system/kernel/arch/arm/arch_vm_translation_map.cpp
+index a21a7e3d09..42cace63a0 100644
+--- a/src/system/kernel/arch/arm/arch_vm_translation_map.cpp
++++ b/src/system/kernel/arch/arm/arch_vm_translation_map.cpp
+@@ -17,7 +17,7 @@
+ //#include "paging/pae/ARMPagingMethodPAE.h"
+ 
+ 
+-//#define TRACE_VM_TMAP
++#define TRACE_VM_TMAP
+ #ifdef TRACE_VM_TMAP
+ #	define TRACE(x...) dprintf(x)
+ #else
+@@ -145,6 +145,8 @@ bool
+ arch_vm_translation_map_is_kernel_page_accessible(addr_t virtualAddress,
+ 	uint32 protection)
+ {
++	return true;
++
+ 	if (!gARMPagingMethod)
+ 		return true;
+ 
+diff --git a/src/system/kernel/arch/arm/soc.h b/src/system/kernel/arch/arm/soc.h
+index 4b1f4e8add..80398121f1 100644
+--- a/src/system/kernel/arch/arm/soc.h
++++ b/src/system/kernel/arch/arm/soc.h
+@@ -20,19 +20,11 @@ public:
+ 		return sInstance;
+ 	}
+ 
+-protected:
+-	InterruptController(fdt_module_info *fdtModule, fdt_device_node node)
+-		: fFDT(fdtModule), fNode(node) {
+-		if (sInstance) {
+-			panic("Multiple InterruptController objects created; that is currently unsupported!");
+-		}
+-		sInstance = this;
++	static void Install(InterruptController* instance) {
++		sInstance = instance;
+ 	}
+ 
+-	// Keep our node around as we might want to grab attributes from it
+-	fdt_module_info *fFDT;
+-	fdt_device_node fNode;
+-
++private:
+ 	static InterruptController *sInstance;
+ };
+ 
+@@ -49,19 +41,11 @@ public:
+ 		return sInstance;
+ 	}
+ 
+-protected:
+-	HardwareTimer(fdt_module_info *fdtModule, fdt_device_node node)
+-		: fFDT(fdtModule), fNode(node) {
+-		if (sInstance) {
+-			panic("Multiple HardwareTimer objects created; that is currently unsupported!");
+-		}
+-		sInstance = this;
++	static void Install(HardwareTimer* instance) {
++		sInstance = instance;
+ 	}
+ 
+-	// Keep our node around as we might want to grab attributes from it
+-	fdt_module_info *fFDT;
+-	fdt_device_node fNode;
+-
++private:
+ 	static HardwareTimer *sInstance;
+ };
+ 
+-- 
+2.30.2
+

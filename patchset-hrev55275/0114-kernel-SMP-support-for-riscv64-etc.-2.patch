@@ -1,0 +1,87 @@
+From 415578751cccb33d2a46ae974ceda0864fe35f6a Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 23 Sep 2021 00:52:48 +0900
+Subject: kernel: SMP support for riscv64 etc. (2)
+
+Change-Id: Ie4b8d4481b730c151a3579f83b22657896ff5a5b
+---
+ src/system/kernel/arch/riscv64/arch_int.cpp    | 2 +-
+ src/system/kernel/arch/riscv64/arch_smp.cpp    | 9 +++++----
+ src/system/kernel/arch/riscv64/arch_thread.cpp | 2 +-
+ src/system/kernel/arch/riscv64/arch_timer.cpp  | 4 ++--
+ 4 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/src/system/kernel/arch/riscv64/arch_int.cpp b/src/system/kernel/arch/riscv64/arch_int.cpp
+index b8bf80aae1..0dc661c360 100644
+--- a/src/system/kernel/arch/riscv64/arch_int.cpp
++++ b/src/system/kernel/arch/riscv64/arch_int.cpp
+@@ -532,7 +532,7 @@ STrap(iframe* frame)
+ 			return;
+ 		}
+ 		case causeInterrupt + sTimerInt: {
+-			SetSie(Sie() & ~(1 << sTimerInt));
++			//SetSie(Sie() & ~(1 << sTimerInt));
+ 			// dprintf("sTimerInt(%" B_PRId32 ")\n", smp_get_current_cpu());
+ 			timer_interrupt();
+ 			AfterInterrupt();
+diff --git a/src/system/kernel/arch/riscv64/arch_smp.cpp b/src/system/kernel/arch/riscv64/arch_smp.cpp
+index 061119a35b..5e1201040f 100644
+--- a/src/system/kernel/arch/riscv64/arch_smp.cpp
++++ b/src/system/kernel/arch/riscv64/arch_smp.cpp
+@@ -81,13 +81,14 @@ arch_smp_send_multicast_ici(CPUSet& cpuSet)
+ {
+ 	switch (gPlatform1) {
+ 	case kPlatform1Sbi: {
++		uint64 hartMask = 0;
+ 		int32 cpuCount = smp_get_num_cpus();
+ 		for (int32 i = 0; i < cpuCount; i++) {
+-			if (cpuSet.GetBit(i) && i != smp_get_current_cpu()) {
+-				// TODO: use bitset to send multiple IPI at once
+-				sbi_send_ipi((uint64)1 << gCPU[i].arch.hartId, 0);
+-			}
++			if (cpuSet.GetBit(i) && i != smp_get_current_cpu())
++				hartMask |= (uint64)1 << gCPU[i].arch.hartId;
+ 		}
++		// TODO: handle hart ID >= 64
++		sbi_send_ipi(hartMask, 0);
+ 		break;
+ 	}
+ 	default:
+diff --git a/src/system/kernel/arch/riscv64/arch_thread.cpp b/src/system/kernel/arch/riscv64/arch_thread.cpp
+index de34655192..b9a80d9d92 100644
+--- a/src/system/kernel/arch/riscv64/arch_thread.cpp
++++ b/src/system/kernel/arch/riscv64/arch_thread.cpp
+@@ -108,8 +108,8 @@ arch_thread_context_switch(Thread *from, Thread *to)
+ 		->address_space->TranslationMap();
+ 
+ 	int cpu = to->cpu->cpu_num;
+-	fromMap->ActiveOnCpus().ClearBitAtomic(cpu);
+ 	toMap->ActiveOnCpus().SetBitAtomic(cpu);
++	fromMap->ActiveOnCpus().ClearBitAtomic(cpu);
+ 
+ 	// TODO: save/restore FPU only if needed
+ 	save_fpu(&from->arch_info.fpuContext);
+diff --git a/src/system/kernel/arch/riscv64/arch_timer.cpp b/src/system/kernel/arch/riscv64/arch_timer.cpp
+index 28099266d2..924a567795 100644
+--- a/src/system/kernel/arch/riscv64/arch_timer.cpp
++++ b/src/system/kernel/arch/riscv64/arch_timer.cpp
+@@ -43,14 +43,14 @@ arch_timer_set_hardware_timer(bigtime_t timeout)
+ 			;
+ 	}
+ 
+-	SetSie(Sie() | (1 << sTimerInt));
++	//SetSie(Sie() | (1 << sTimerInt));
+ }
+ 
+ 
+ void
+ arch_timer_clear_hardware_timer()
+ {
+-	SetSie(Sie() & ~(1 << sTimerInt));
++	//SetSie(Sie() & ~(1 << sTimerInt));
+ 
+ 	switch (gPlatform1) {
+ 		case kPlatform1Riscv:
+-- 
+2.30.2
+

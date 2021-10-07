@@ -1,0 +1,29 @@
+From d7aa569a552b0018297d701b342ebf24731a2fd6 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Tue, 14 Jul 2020 21:42:08 +0900
+Subject: libbe_test: fix Tracker crash and mouse click behavior
+
+Change-Id: Idc00cb3c9c72240b942ef27cb0091f36268410bc
+---
+ src/kits/interface/InterfaceDefs.cpp | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/src/kits/interface/InterfaceDefs.cpp b/src/kits/interface/InterfaceDefs.cpp
+index 67bfc8ee3f..8c08bd3ac7 100644
+--- a/src/kits/interface/InterfaceDefs.cpp
++++ b/src/kits/interface/InterfaceDefs.cpp
+@@ -579,10 +579,7 @@ get_click_speed(bigtime_t *speed)
+ 	BMessage reply;
+ 
+ 	status_t err = _control_input_server_(&command, &reply);
+-	if (err != B_OK)
+-		return err;
+-
+-	if (reply.FindInt64("speed", speed) != B_OK)
++	if (err != B_OK || reply.FindInt64("speed", speed) != B_OK)
+ 		*speed = 500000;
+ 
+ 	return B_OK;
+-- 
+2.30.2
+

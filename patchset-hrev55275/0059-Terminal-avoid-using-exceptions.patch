@@ -1,0 +1,158 @@
+From 41fbfc1279625c275be8780b0304ca42cfe016b1 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sat, 29 May 2021 12:59:18 +0900
+Subject: Terminal: avoid using exceptions
+
+Exceptions currently not working on riscv64.
+
+Change-Id: If3d8128179777e5313e043319d5ad445fe281534
+---
+ src/apps/terminal/TermParse.cpp | 36 +++++++++++++++++++--------------
+ src/apps/terminal/TermParse.h   |  2 +-
+ 2 files changed, 22 insertions(+), 16 deletions(-)
+
+diff --git a/src/apps/terminal/TermParse.cpp b/src/apps/terminal/TermParse.cpp
+index d925ade1fc..0e46c7206a 100644
+--- a/src/apps/terminal/TermParse.cpp
++++ b/src/apps/terminal/TermParse.cpp
+@@ -57,21 +57,22 @@ extern const char* gLineDrawGraphSet[]; /* may be used for G0, G1, G2, G3 */
+ 
+ 
+ //! Get char from pty reader buffer.
+-inline uchar
+-TermParse::_NextParseChar()
++inline status_t
++TermParse::_NextParseChar(uchar& ch)
+ {
+ 	if (fParserBufferOffset >= fParserBufferSize) {
+ 		// parser buffer empty
+ 		status_t error = _ReadParserBuffer();
+ 		if (error != B_OK)
+-			throw error;
++			return error;
+ 	}
+ 
+ #ifdef USE_DEBUG_SNAPSHOTS
+ 	fBuffer->CaptureChar(fParserBuffer[fParserBufferOffset]);
+ #endif
+ 
+-	return fParserBuffer[fParserBufferOffset++];
++	ch = fParserBuffer[fParserBufferOffset++];
++	return B_OK;
+ }
+ 
+ 
+@@ -360,6 +361,9 @@ TermParse::_GuessGroundTable(int encoding)
+ }
+ 
+ 
++#define CheckSkip(res) {status_t _res = res; if (_res < B_OK) goto failed;}
++
++
+ int32
+ TermParse::EscParse()
+ {
+@@ -391,8 +395,9 @@ TermParse::EscParse()
+ 	BAutolock locker(fBuffer);
+ 
+ 	while (!fQuitting) {
+-		try {
+-			uchar c = _NextParseChar();
++		{
++			uchar c = 0;
++			CheckSkip(_NextParseChar(c));
+ 
+ 			//DumpState(groundtable, parsestate, c);
+ 
+@@ -433,7 +438,7 @@ TermParse::EscParse()
+ 						case B_JIS_CONVERSION:
+ 						case B_BIG5_CONVERSION:
+ 							cbuf[srcLen++] = c;
+-							c = _NextParseChar();
++							CheckSkip(_NextParseChar(c));
+ 							cbuf[srcLen++] = c;
+ 							break;
+ 
+@@ -441,7 +446,7 @@ TermParse::EscParse()
+ 							cbuf[srcLen++] = c;
+ 							do {
+ 								// GBK-compatible codepoints are 2-bytes long
+-								c = _NextParseChar();
++								CheckSkip(_NextParseChar(c));
+ 								cbuf[srcLen++] = c;
+ 
+ 								// GB18030 extends GBK with 4-byte codepoints
+@@ -495,7 +500,7 @@ TermParse::EscParse()
+ 
+ 				case CASE_SJIS_INSTRING:
+ 					cbuf[srcLen++] = c;
+-					c = _NextParseChar();
++					CheckSkip(_NextParseChar(c));
+ 					cbuf[srcLen++] = c;
+ 
+ 					convert_to_utf8(currentEncoding, cbuf, &srcLen,
+@@ -505,7 +510,7 @@ TermParse::EscParse()
+ 
+ 				case CASE_UTF8_2BYTE:
+ 					cbuf[srcLen++] = c;
+-					c = _NextParseChar();
++					CheckSkip(_NextParseChar(c));
+ 					if (groundtable[c] != CASE_UTF8_INSTRING)
+ 						break;
+ 					cbuf[srcLen++] = c;
+@@ -517,7 +522,7 @@ TermParse::EscParse()
+ 					cbuf[srcLen++] = c;
+ 
+ 					do {
+-						c = _NextParseChar();
++						CheckSkip(_NextParseChar(c));
+ 						if (groundtable[c] != CASE_UTF8_INSTRING) {
+ 							srcLen = 0;
+ 							break;
+@@ -554,7 +559,8 @@ TermParse::EscParse()
+ 					}
+ 
+ 					if (set > -1) {
+-						char page = _NextParseChar();
++						uchar page = 0;
++						CheckSkip(_NextParseChar(page));
+ 						switch (page) {
+ 							case '0':
+ 								graphSets[set] = gLineDrawGraphSet;
+@@ -1063,7 +1069,7 @@ TermParse::EscParse()
+ 						bool isParsed = false;
+ 						int32 skipCount = 0; // take care about UTF-8 characters
+ 						for (uint i = 0; !isParsed && i < sizeof(params); i++) {
+-							params[i] = _NextParseChar();
++							CheckSkip(_NextParseChar(params[i]));
+ 
+ 							if (skipCount > 0) {
+ 								skipCount--;
+@@ -1228,9 +1234,9 @@ TermParse::EscParse()
+ 				default:
+ 					break;
+ 			}
+-		} catch (...) {
+-			break;
+ 		}
++		failed:
++		;
+ 	}
+ 
+ 	return B_OK;
+diff --git a/src/apps/terminal/TermParse.h b/src/apps/terminal/TermParse.h
+index 26e57ecc78..a7a870b7ab 100644
+--- a/src/apps/terminal/TermParse.h
++++ b/src/apps/terminal/TermParse.h
+@@ -38,7 +38,7 @@ public:
+ 	status_t StopThreads();
+ 
+ private:
+-	inline uchar _NextParseChar();
++	inline status_t _NextParseChar(uchar& ch);
+ 
+ 	// Initialize TermParse and PtyReader thread.
+ 	status_t _InitTermParse();
+-- 
+2.30.2
+

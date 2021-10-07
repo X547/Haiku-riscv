@@ -1,0 +1,385 @@
+From 7315d8715338e8de5e6b0408763e8752022f350c Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:22:23 +0900
+Subject: haiku_loader.efi: update for riscv64 SMP support
+
+Change-Id: I3279930a70b3a162eb575e28479c5abc9dba19c7
+---
+ .../platform/efi/arch/riscv64/arch_mmu.cpp    |   3 +-
+ .../platform/efi/arch/riscv64/arch_smp.cpp    | 136 ++++++++++++++----
+ src/system/boot/platform/efi/dtb.cpp          |  43 +++++-
+ src/system/boot/platform/efi/mmu.cpp          |   2 +-
+ src/system/boot/platform/efi/smp.cpp          |   4 +-
+ src/system/boot/platform/efi/smp.h            |   2 +-
+ 6 files changed, 153 insertions(+), 37 deletions(-)
+
+diff --git a/src/system/boot/platform/efi/arch/riscv64/arch_mmu.cpp b/src/system/boot/platform/efi/arch/riscv64/arch_mmu.cpp
+index 91a0b4a21c..76fbcf4e8f 100644
+--- a/src/system/boot/platform/efi/arch/riscv64/arch_mmu.cpp
++++ b/src/system/boot/platform/efi/arch/riscv64/arch_mmu.cpp
+@@ -449,7 +449,8 @@ arch_mmu_generate_post_efi_page_tables(size_t memory_map_size,
+ 
+ 	sort_address_ranges(gKernelArgs.virtual_allocated_range, gKernelArgs.num_virtual_allocated_ranges);
+ 
+-	DumpPageTable(GetSatp());
++	if (false)
++		DumpPageTable(GetSatp());
+ 
+ 	return GetSatp();
+ }
+diff --git a/src/system/boot/platform/efi/arch/riscv64/arch_smp.cpp b/src/system/boot/platform/efi/arch/riscv64/arch_smp.cpp
+index f35ec105d7..aceecc09f1 100644
+--- a/src/system/boot/platform/efi/arch/riscv64/arch_smp.cpp
++++ b/src/system/boot/platform/efi/arch/riscv64/arch_smp.cpp
+@@ -7,6 +7,7 @@
+ #include "arch_smp.h"
+ 
+ #include <string.h>
++#include <algorithm>
+ 
+ #include <KernelExport.h>
+ 
+@@ -28,13 +29,14 @@
+ #endif
+ 
+ 
+-extern "C" void arch_enter_kernel(uint64 satp, struct kernel_args *kernelArgs,
+-        addr_t kernelEntry, addr_t kernelStackTop);
++typedef status_t (*KernelEntry) (kernel_args *bootKernelArgs, int currentCPU);
+ 
+ 
+ struct CpuEntryInfo {
+-	uint64 satp;
+-	uint64 kernelEntry;
++	uint64 satp;             //  0
++	uint64 stackBase;        //  8
++	uint64 stackSize;        // 16
++	KernelEntry kernelEntry; // 24
+ };
+ 
+ 
+@@ -42,12 +44,37 @@ static CpuInfo sCpus[SMP_MAX_CPUS];
+ uint32 sCpuCount = 0;
+ 
+ 
+-static void
+-CpuEntry(int hartId, CpuEntryInfo* info)
++static void __attribute__((naked)) CpuEntry(int hartId, CpuEntryInfo* info)
+ {
+-	arch_enter_kernel(info->satp, &gKernelArgs, info->kernelEntry,
+-		gKernelArgs.cpu_kstack[hartId].start
+-		+ gKernelArgs.cpu_kstack[hartId].size);
++	// enable MMU
++	asm("ld t0, 0(a1)");  // CpuEntryInfo::satp
++	asm("csrw satp, t0");
++	asm("sfence.vma");
++
++	// setup stack
++	asm("ld sp, 8(a1)");   // CpuEntryInfo::stackBase
++	asm("ld t0, 16(a1)");  // CpuEntryInfo::stackSize
++	asm("add sp, sp, t0");
++	asm("li fp, 0");
++
++	asm("tail CpuEntry2");
++}
++
++extern "C" void
++CpuEntry2(int hartId, CpuEntryInfo* info)
++{
++	dprintf("CpuEntry2(%d)\n", hartId);
++
++	uint32 cpu = 0;
++	while (cpu < sCpuCount && !(sCpus[cpu].hartId == (uint32)hartId))
++		cpu++;
++
++	if (!(cpu < sCpuCount))
++		panic("CPU for hart id %d not found\n", hartId);
++
++	info->kernelEntry(&gKernelArgs, cpu);
++
++	for (;;) {}
+ }
+ 
+ 
+@@ -65,6 +92,17 @@ arch_smp_register_cpu(CpuInfo** cpu)
+ }
+ 
+ 
++CpuInfo*
++arch_smp_find_cpu(uint32 phandle)
++{
++	for (uint32 i = 0; i < sCpuCount; i++) {
++		if (sCpus[i].phandle == phandle)
++			return &sCpus[i];
++	}
++	return NULL;
++}
++
++
+ int
+ arch_smp_get_current_cpu(void)
+ {
+@@ -75,8 +113,18 @@ arch_smp_get_current_cpu(void)
+ void
+ arch_smp_init_other_cpus(void)
+ {
+-	gKernelArgs.num_cpus = 1;
+-	return;
++	gKernelArgs.num_cpus = sCpuCount;
++
++	// make boot CPU first as expected by kernel
++	for (uint32 i = 1; i < sCpuCount; i++) {
++		if (sCpus[i].hartId == gBootHart)
++			std::swap(sCpus[i], sCpus[0]);
++	}
++
++	for (uint32 i = 0; i < sCpuCount; i++) {
++		gKernelArgs.arch_args.hartIds[i] = sCpus[i].hartId;
++		gKernelArgs.arch_args.plicContexts[i] = sCpus[i].plicContext;
++	}
+ 
+ 	if (get_safemode_boolean(B_SAFEMODE_DISABLE_SMP, false)) {
+ 		// SMP has been disabled!
+@@ -84,8 +132,6 @@ arch_smp_init_other_cpus(void)
+ 		gKernelArgs.num_cpus = 1;
+ 	}
+ 
+-	gKernelArgs.num_cpus = sCpuCount;
+-
+ 	if (gKernelArgs.num_cpus < 2)
+ 		return;
+ 
+@@ -103,33 +149,68 @@ arch_smp_init_other_cpus(void)
+ }
+ 
+ 
++static void
++WriteHartStatus(uint64 status)
++{
++	switch (status) {
++	case SBI_HART_STATE_STARTED:         dprintf("started"); break;
++	case SBI_HART_STATE_STOPPED:         dprintf("stopped"); break;
++	case SBI_HART_STATE_START_PENDING:   dprintf("startPending"); break;
++	case SBI_HART_STATE_STOP_PENDING:    dprintf("stopPending"); break;
++	case SBI_HART_STATE_SUSPENDED:       dprintf("suspended"); break;
++	case SBI_HART_STATE_SUSPEND_PENDING: dprintf("suspendPending"); break;
++	case SBI_HART_STATE_RESUME_PENDING:  dprintf("resumePending"); break;
++	default: dprintf("?(%" B_PRIu64 ")", status);
++	}
++}
++
++
++static void
++WriteHartsStatus()
++{
++	dprintf("  status:\n");
++	for (uint32 i = 0; i < sCpuCount; i++) {
++		dprintf("    hart %" B_PRIu32 ": ", i);
++		sbiret res = sbi_hart_get_status(sCpus[i].hartId);
++		if (res.error < 0)
++			dprintf("error: %" B_PRIu64 , res.error);
++		else {
++			WriteHartStatus(res.value);
++		}
++		dprintf("\n");
++	}
++}
++
+ void
+ arch_smp_boot_other_cpus(uint64 satp, uint64 kernel_entry)
+ {
+-	return;
++	dprintf("arch_smp_boot_other_cpus(%p, %p)\n", (void*)satp, (void*)kernel_entry);
++
++	WriteHartsStatus();
+ 
+-	dprintf("arch_smp_boot_other_cpus()\n");
+ 	for (uint32 i = 0; i < sCpuCount; i++) {
+-		if (0 != sCpus[i].id) {
++		if (sCpus[i].hartId != gBootHart) {
+ 			sbiret res;
+-			dprintf("starting CPU %" B_PRIu32 "\n", sCpus[i].id);
++			dprintf("  starting CPU %" B_PRIu32 "\n", sCpus[i].hartId);
+ 
+-			res = sbi_hart_get_status(sCpus[i].id);
+-			dprintf("[PRE] sbi_hart_get_status() -> (%ld, %ld)\n", res.error, res.value);
+-
+-			CpuEntryInfo info = {.satp = satp, .kernelEntry = kernel_entry};
+-			res = sbi_hart_start(sCpus[i].id, (addr_t)&CpuEntry, (addr_t)&info);
+-			dprintf("sbi_hart_start() -> (%ld, %ld)\n", res.error, res.value);
++			dprintf("  stack: %#" B_PRIx64 " - %#" B_PRIx64 "\n", gKernelArgs.cpu_kstack[i].start, gKernelArgs.cpu_kstack[i].start + gKernelArgs.cpu_kstack[i].size - 1);
++			CpuEntryInfo* info = new(std::nothrow) CpuEntryInfo{
++				.satp = satp,
++				.stackBase = gKernelArgs.cpu_kstack[i].start,
++				.stackSize = gKernelArgs.cpu_kstack[i].size,
++				.kernelEntry = (KernelEntry)kernel_entry
++			};
++			res = sbi_hart_start(sCpus[i].hartId, (addr_t)&CpuEntry, (addr_t)info);
+ 
+ 			for (;;) {
+-				res = sbi_hart_get_status(sCpus[i].id);
++				res = sbi_hart_get_status(sCpus[i].hartId);
+ 				if (res.error < 0 || res.value == SBI_HART_STATE_STARTED)
+ 					break;
+ 			}
+-
+-			dprintf("[POST] sbi_hart_get_status() -> (%ld, %ld)\n", res.error, res.value);
+ 		}
+ 	}
++
++	WriteHartsStatus();
+ }
+ 
+ 
+@@ -149,6 +230,9 @@ arch_smp_add_safemode_menus(Menu *menu)
+ }
+ 
+ 
++extern "C" void serial_switch_to_legacy(void);
++
++
+ void
+ arch_smp_init(void)
+ {
+diff --git a/src/system/boot/platform/efi/dtb.cpp b/src/system/boot/platform/efi/dtb.cpp
+index 4df865413d..cd7d20d116 100644
+--- a/src/system/boot/platform/efi/dtb.cpp
++++ b/src/system/boot/platform/efi/dtb.cpp
+@@ -14,6 +14,7 @@
+ #include <arch_smp.h>
+ #include <arch/generic/debug_uart_8250.h>
+ #include <arch/riscv64/arch_uart_sifive.h>
++#include <arch_cpu_defs.h>
+ 
+ #include <ByteOrder.h>
+ 
+@@ -32,7 +33,7 @@ extern "C" {
+ static void* sDtbTable = NULL;
+ static uint32 sDtbSize = 0;
+ 
+-static uint32 sBootHart = 0;
++uint32 gBootHart = 0;
+ static uint64 sTimerFrequrency = 10000000;
+ 
+ static addr_range sPlic = {0};
+@@ -335,7 +336,7 @@ HandleFdt(const void* fdt, int node, uint32 addressCells, uint32 sizeCells,
+ 	const char* name = fdt_get_name(fdt, node, NULL);
+ 	if (strcmp(name, "chosen") == 0) {
+ 		if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "boot-hartid", NULL))
+-			sBootHart = fdt32_to_cpu(*prop);
++			gBootHart = fdt32_to_cpu(*prop);
+ 	} else if (strcmp(name, "cpus") == 0) {
+ 		if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "timebase-frequency", NULL))
+ 			sTimerFrequrency = fdt32_to_cpu(*prop);
+@@ -346,13 +347,26 @@ HandleFdt(const void* fdt, int node, uint32 addressCells, uint32 sizeCells,
+ 
+ 	if (deviceType != NULL) {
+ 		if (strcmp(deviceType, "cpu") == 0) {
++			// TODO: improve incompatible CPU detection
++			if (!(fdt_getprop(fdt, node, "mmu-type", NULL) != NULL))
++				return;
++
+ 			CpuInfo* info;
+ 			arch_smp_register_cpu(&info);
+ 			if (info == NULL)
+ 				return;
+-			info->id = fdt32_to_cpu(*(uint32*)fdt_getprop(fdt, node, "reg", NULL));
++
++			info->hartId = fdt32_to_cpu(*(uint32*)fdt_getprop(fdt, node, "reg", NULL));
+ 			dprintf("cpu\n");
+-			dprintf("  id: %" B_PRIu32 "\n", info->id);
++			dprintf("  hartId: %" B_PRIu32 "\n", info->hartId);
++			
++			int subNode = fdt_subnode_offset(fdt, node, "interrupt-controller");
++			if (subNode < 0) {
++				dprintf("  [!] no interrupt controller\n");
++			} else {
++				info->phandle = fdt_get_phandle(fdt, subNode);
++				dprintf("  phandle: %" B_PRIu32 "\n", info->phandle);
++			}
+ 		}
+ 	}
+ 
+@@ -367,6 +381,24 @@ HandleFdt(const void* fdt, int node, uint32 addressCells, uint32 sizeCells,
+ 		HasFdtString(compatible, compatibleLen, "sifive,plic-1.0.0")
+ 	) {
+ 		GetReg(fdt, node, addressCells, sizeCells, 0, sPlic);
++		int propSize;
++		if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "interrupts-extended", &propSize)) {
++			dprintf("PLIC contexts\n");
++			uint32 contextId = 0;
++			for (uint32 *it = prop; (uint8_t*)it - (uint8_t*)prop < propSize; it += 2) {
++				uint32 phandle = fdt32_to_cpu(*it);
++				uint32 interrupt = fdt32_to_cpu(*(it + 1));
++				if (interrupt == sExternInt) {
++					CpuInfo* cpuInfo = arch_smp_find_cpu(phandle);
++					dprintf("  context %" B_PRIu32 ": %" B_PRIu32 "\n", contextId, phandle);
++					if (cpuInfo != NULL) {
++						cpuInfo->plicContext = contextId;
++						dprintf("    hartId: %" B_PRIu32 "\n", cpuInfo->hartId);
++					}
++				}
++				contextId++;
++			}
++		}
+ 	} else if (
+ 		sUart.kind == kUartKindNone && (
+ 			HasFdtString(compatible, compatibleLen, "ns16550a") ||
+@@ -457,8 +489,7 @@ dtb_set_kernel_args()
+ 	}
+ 
+ #ifdef __riscv
+-	dprintf("bootHart: %" B_PRIu32 "\n", sBootHart);
+-	gKernelArgs.arch_args.bootHart = sBootHart;
++	dprintf("bootHart: %" B_PRIu32 "\n", gBootHart);
+ 	dprintf("timerFrequrency: %" B_PRIu64 "\n", sTimerFrequrency);
+ 	gKernelArgs.arch_args.timerFrequrency = sTimerFrequrency;
+ 
+diff --git a/src/system/boot/platform/efi/mmu.cpp b/src/system/boot/platform/efi/mmu.cpp
+index f40a5f2770..aa0587c8de 100644
+--- a/src/system/boot/platform/efi/mmu.cpp
++++ b/src/system/boot/platform/efi/mmu.cpp
+@@ -262,7 +262,7 @@ platform_free_region(void *address, size_t size)
+ 			memory_region* old = *ref;
+ 			//pointer to current allocated_memory_region* now points to next
+ 			*ref = (*ref)->next;
+-			old->dprint("Freeing");
++			// old->dprint("Freeing");
+ 			delete old;
+ 			return B_OK;
+ 		}
+diff --git a/src/system/boot/platform/efi/smp.cpp b/src/system/boot/platform/efi/smp.cpp
+index 65bbdbca33..80f2fdb31e 100644
+--- a/src/system/boot/platform/efi/smp.cpp
++++ b/src/system/boot/platform/efi/smp.cpp
+@@ -48,12 +48,12 @@ smp_init_other_cpus(void)
+ 
+ 
+ void
+-smp_boot_other_cpus(uint32 pml4, uint64 kernel_entry)
++smp_boot_other_cpus(uint64 pageTable, uint64 kernel_entry)
+ {
+ 	if (gKernelArgs.num_cpus < 2)
+ 		return;
+ 
+-	arch_smp_boot_other_cpus(pml4, kernel_entry);
++	arch_smp_boot_other_cpus(pageTable, kernel_entry);
+ }
+ 
+ 
+diff --git a/src/system/boot/platform/efi/smp.h b/src/system/boot/platform/efi/smp.h
+index e9da945ccb..97d8bda5a3 100644
+--- a/src/system/boot/platform/efi/smp.h
++++ b/src/system/boot/platform/efi/smp.h
+@@ -19,7 +19,7 @@ extern "C" {
+ 
+ extern void smp_init(void);
+ extern void smp_init_other_cpus(void);
+-extern void smp_boot_other_cpus(uint32 pml4, uint64 kernel_entry);
++extern void smp_boot_other_cpus(uint64 pageTable, uint64 kernel_entry);
+ extern int smp_get_current_cpu(void);
+ 
+ #ifdef __cplusplus
+-- 
+2.30.2
+

@@ -1,0 +1,68 @@
+From 49b329ad45bfdcd0e44f0204ba64d3a501f23ca8 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 3 Dec 2020 11:41:28 +0900
+Subject: Revert "Tracker: make desktop color selection try user color first"
+
+This reverts commit 7377c398550edc1fc8176ee4dbcd09d70f80d454.
+---
+ src/kits/tracker/PoseView.cpp | 42 ++++++++++-------------------------
+ 1 file changed, 12 insertions(+), 30 deletions(-)
+
+diff --git a/src/kits/tracker/PoseView.cpp b/src/kits/tracker/PoseView.cpp
+index aa3307253f..944b99cfcb 100644
+--- a/src/kits/tracker/PoseView.cpp
++++ b/src/kits/tracker/PoseView.cpp
+@@ -9036,38 +9036,20 @@ BPoseView::DrawPose(BPose* pose, int32 index, bool fullDraw)
+ rgb_color
+ BPoseView::DeskTextColor() const
+ {
+-	// The desktop color is chosen independently for the desktop.
+-	// The text color is chosen globally for all directories.
+-	// It's fairly easy to get something unreadable (even with the default
+-	// settings, it's expected that text will be black on white in Tracker
+-	// folders, but white on blue on the desktop).
+-	// So here we check if the colors are different enough, and otherwise,
+-	// force the text to be either white or black.
+-	rgb_color textColor = ui_color(B_DOCUMENT_TEXT_COLOR);
+-	rgb_color viewColor;
+-	if (IsDesktopWindow())
+-		viewColor = ViewColor();
+-	else
+-		viewColor = ui_color(B_DOCUMENT_BACKGROUND_COLOR);
+-
+-	int textBrightness = BPrivate::perceptual_brightness(textColor);
+-	int viewBrightness = BPrivate::perceptual_brightness(viewColor);
+-	if (abs(viewBrightness - textBrightness) > 127) {
+-		// The colors are different enough, we can use them as is
+-		return textColor;
+-	} else {
+-		if (viewBrightness > 127) {
+-			textColor.red = 0;
+-			textColor.green = 0;
+-			textColor.blue = 0;
+-		} else {
+-			textColor.red = 255;
+-			textColor.green = 255;
+-			textColor.blue = 255;
+-		}
++	rgb_color color = ViewColor();
++	float thresh = color.red + (color.green * 1.25f) + (color.blue * 0.45f);
+ 
+-		return textColor;
++	if (thresh >= 360) {
++		color.red = 0;
++		color.green = 0;
++		color.blue = 0;
++ 	} else {
++		color.red = 255;
++		color.green = 255;
++		color.blue = 255;
+ 	}
++
++	return color;
+ }
+ 
+ 
+-- 
+2.30.2
+

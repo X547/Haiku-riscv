@@ -1,0 +1,112 @@
+From 4e4c584122c32334bd57074d056c659b9f9d12ac Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 6 Jun 2021 23:02:03 +0900
+Subject: kernel/arch/timer: implement for riscv64
+
+Change-Id: Ia854b0048a86b1427e975f482325ed4d4df1a12a
+---
+ .../system/arch/riscv64/arch_real_time_data.h |  3 +-
+ src/system/kernel/arch/riscv64/arch_timer.cpp | 41 +++++++++++++++----
+ src/system/kernel/lib/arch/riscv64/Jamfile    |  1 +
+ 3 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/headers/private/system/arch/riscv64/arch_real_time_data.h b/headers/private/system/arch/riscv64/arch_real_time_data.h
+index 4d63960eed..2cc01f92ff 100644
+--- a/headers/private/system/arch/riscv64/arch_real_time_data.h
++++ b/headers/private/system/arch/riscv64/arch_real_time_data.h
+@@ -13,8 +13,7 @@
+ 
+ struct arch_real_time_data {
+ 	bigtime_t	system_time_offset;
+-	uint32		system_time_conversion_factor;
+-	uint32		_padding;
++	uint64		system_time_conversion_factor;
+ };
+ 
+ #endif	/* _KERNEL_ARCH_REAL_TIME_DATA_H */
+diff --git a/src/system/kernel/arch/riscv64/arch_timer.cpp b/src/system/kernel/arch/riscv64/arch_timer.cpp
+index fc5193b4a4..7510930b7f 100644
+--- a/src/system/kernel/arch/riscv64/arch_timer.cpp
++++ b/src/system/kernel/arch/riscv64/arch_timer.cpp
+@@ -7,21 +7,54 @@
+  */
+ 
+ 
++#include <boot/kernel_args.h>
+ #include <kernel.h>
+ #include <debug.h>
+ #include <timer.h>
+ #include <arch/timer.h>
++#include <arch_int.h>
++#include <arch_cpu_defs.h>
++#include <Clint.h>
++#include <platform/sbi/sbi_syscalls.h>
++
++
++extern uint32 gPlatform1;
++extern uint32 gPlatform2;
+ 
+ 
+ void
+ arch_timer_set_hardware_timer(bigtime_t timeout)
+ {
++	// TODO: Read timer frequency from FDT
++	switch (gPlatform1) {
++		case kPlatform1Riscv:
++			MSyscall(kMSyscallSetTimer, true,
++				gClintRegs->mtime + timeout * 10);
++			break;
++		case kPlatform1Sbi: {
++			sbi_set_timer(CpuTime() + timeout);
++			break;
++		}
++		default:
++			;
++	}
+ }
+ 
+ 
+ void
+ arch_timer_clear_hardware_timer()
+ {
++	switch (gPlatform1) {
++		case kPlatform1Riscv:
++			MSyscall(kMSyscallSetTimer, false);
++			break;
++		case kPlatform1Sbi: {
++			sbi_set_timer(CpuTime() + (uint64)10000000 * 3600);
++			break;
++		}
++		default:
++			;
++	}
+ }
+ 
+ 
+@@ -30,11 +63,3 @@ arch_init_timer(kernel_args *args)
+ {
+ 	return B_OK;
+ }
+-
+-
+-bigtime_t
+-system_time(void)
+-{
+-	// TODO
+-	return 0;
+-}
+diff --git a/src/system/kernel/lib/arch/riscv64/Jamfile b/src/system/kernel/lib/arch/riscv64/Jamfile
+index 7b143796e6..603763cf5d 100644
+--- a/src/system/kernel/lib/arch/riscv64/Jamfile
++++ b/src/system/kernel/lib/arch/riscv64/Jamfile
+@@ -10,6 +10,7 @@ SEARCH_SOURCE += [ FDirName $(librootSources) os arch generic ] ;
+ 
+ KernelMergeObject kernel_os_arch_$(TARGET_ARCH).o :
+ 	byteorder.S
++	system_time.cpp
+ 
+ 	generic_atomic.cpp
+ 	generic_system_time_nsecs.cpp
+-- 
+2.30.2
+

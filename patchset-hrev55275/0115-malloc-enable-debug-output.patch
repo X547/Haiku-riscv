@@ -1,0 +1,91 @@
+From 9978805d604beddc38be752e75102da52442589d Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 23 Sep 2021 00:53:57 +0900
+Subject: malloc: enable debug output
+
+Change-Id: I2a20ce07f4ce98bbd4d014817722c6dcc3891f68
+---
+ .../libroot/posix/malloc_hoard2/arch-specific.cpp      |  3 +++
+ src/system/libroot/posix/malloc_hoard2/wrapper.cpp     | 10 +++++-----
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/src/system/libroot/posix/malloc_hoard2/arch-specific.cpp b/src/system/libroot/posix/malloc_hoard2/arch-specific.cpp
+index 20f4cdf913..686b7d9af9 100644
+--- a/src/system/libroot/posix/malloc_hoard2/arch-specific.cpp
++++ b/src/system/libroot/posix/malloc_hoard2/arch-specific.cpp
+@@ -237,6 +237,7 @@ hoardSbrk(long size)
+ 		sFreeHeapSize = oldHeapSize;
+ 
+ 		if (status == B_NO_MEMORY) {
++			debug_printf("hoard2: resize_area() failed\n");
+ 			hoardUnlock(sHeapLock);
+ 			return NULL;
+ 		}
+@@ -256,6 +257,7 @@ hoardSbrk(long size)
+ 				B_NO_LOCK, protection);
+ 
+ 			if (area == B_NO_MEMORY) {
++				debug_printf("hoard2: create_area() failed\n");
+ 				hoardUnlock(sHeapLock);
+ 				return NULL;
+ 			}
+@@ -270,6 +272,7 @@ hoardSbrk(long size)
+ 		}
+ 
+ 		if (area < 0) {
++			debug_printf("hoard2: create_area() failed\n");
+ 			hoardUnlock(sHeapLock);
+ 			return NULL;
+ 		}
+diff --git a/src/system/libroot/posix/malloc_hoard2/wrapper.cpp b/src/system/libroot/posix/malloc_hoard2/wrapper.cpp
+index 38a7c1258b..7a4d0f689d 100644
+--- a/src/system/libroot/posix/malloc_hoard2/wrapper.cpp
++++ b/src/system/libroot/posix/malloc_hoard2/wrapper.cpp
+@@ -315,7 +315,7 @@ malloc(size_t size)
+ 	if (addr == NULL) {
+ 		undefer_signals();
+ 		__set_errno(B_NO_MEMORY);
+-		debug_printf("hoard2: malloc(%lu) -> NULL", size);
++		debug_printf("hoard2: malloc(%lu) -> NULL\n", size);
+ 		return NULL;
+ 	}
+ 
+@@ -363,7 +363,7 @@ ok:
+ 		undefer_signals();
+ 	nomem:
+ 		__set_errno(B_NO_MEMORY);
+-		debug_printf("hoard2: calloc(%lu, %lu) -> NULL", nelem, elsize);
++		debug_printf("hoard2: calloc(%lu, %lu) -> NULL\n", nelem, elsize);
+ 		return NULL;
+ 	}
+ 
+@@ -428,7 +428,7 @@ memalign(size_t alignment, size_t size)
+ 	if (addr == NULL) {
+ 		undefer_signals();
+ 		__set_errno(B_NO_MEMORY);
+-		debug_printf("hoard2: memalign(%lu, %lu) -> NULL", alignment, size);
++		debug_printf("hoard2: memalign(%lu, %lu) -> NULL\n", alignment, size);
+ 		return NULL;
+ 	}
+ 
+@@ -470,7 +470,7 @@ posix_memalign(void **_pointer, size_t alignment, size_t size)
+ 		size);
+ 	if (pointer == NULL) {
+ 		undefer_signals();
+-		debug_printf("hoard2: posix_memalign(%p, %lu, %lu) -> NULL", _pointer, alignment,
++		debug_printf("hoard2: posix_memalign(%p, %lu, %lu) -> NULL\n", _pointer, alignment,
+ 			size);
+ 		return B_NO_MEMORY;
+ 	}
+@@ -535,7 +535,7 @@ realloc(void *ptr, size_t size)
+ 	if (buffer == NULL) {
+ 		// Allocation failed, leave old block and return
+ 		__set_errno(B_NO_MEMORY);
+-		debug_printf("hoard2: realloc(%p, %lu) -> NULL", ptr, size);
++		debug_printf("hoard2: realloc(%p, %lu) -> NULL\n", ptr, size);
+ 		return NULL;
+ 	}
+ 
+-- 
+2.30.2
+

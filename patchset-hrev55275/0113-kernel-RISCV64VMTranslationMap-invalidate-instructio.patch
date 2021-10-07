@@ -1,0 +1,143 @@
+From 7c3a3e1d75cc9fefa8283dd444fe1b25a3839f66 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 23 Sep 2021 00:14:17 +0900
+Subject: kernel/RISCV64VMTranslationMap: invalidate instruction cache when
+ setting executable page attribute
+
+Change-Id: I0bd2d37708b50f61ca4befa454868dce2af771b9
+---
+ .../system/arch/riscv64/arch_cpu_defs.h       |  4 ++
+ .../arch/riscv64/RISCV64VMTranslationMap.cpp  | 46 +++++++++++++++++--
+ .../arch/riscv64/RISCV64VMTranslationMap.h    |  1 +
+ 3 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/headers/private/system/arch/riscv64/arch_cpu_defs.h b/headers/private/system/arch/riscv64/arch_cpu_defs.h
+index 7dbd8e8f74..d321549432 100644
+--- a/headers/private/system/arch/riscv64/arch_cpu_defs.h
++++ b/headers/private/system/arch/riscv64/arch_cpu_defs.h
+@@ -326,6 +326,10 @@ static B_ALWAYS_INLINE void FlushTlbAllAsid(uint64 asid) {
+ static B_ALWAYS_INLINE void FlushTlbPageAsid(uint64 page, uint64 asid) {
+ 	asm volatile("sfence.vma %0, %0" : : "r" (page), "r" (asid) : "memory");}
+ 
++// flush instruction cache
++static B_ALWAYS_INLINE void FenceI() {
++	asm volatile("fence.i" : : : "memory");}
++
+ static B_ALWAYS_INLINE uint64 Sp() {
+ 	uint64 x; asm volatile("mv %0, sp" : "=r" (x)); return x;}
+ static B_ALWAYS_INLINE void SetSp(uint64 x) {
+diff --git a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+index ce05a89a6b..1cd0064252 100644
+--- a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
++++ b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+@@ -6,6 +6,7 @@
+ #include <vm/VMAddressSpace.h>
+ #include <vm/VMCache.h>
+ #include <slab/Slab.h>
++#include <platform/sbi/sbi_syscalls.h>
+ 
+ #include <util/AutoLock.h>
+ 
+@@ -21,6 +22,9 @@
+ 	panic("not implemented: %s\n", __PRETTY_FUNCTION__)
+ 
+ 
++extern uint32 gPlatform1;
++
++
+ static void
+ FreePageTable(page_num_t ppn, bool isKernel, uint32 level = 2)
+ {
+@@ -138,7 +142,8 @@ RISCV64VMTranslationMap::RISCV64VMTranslationMap(bool kernel,
+ 	fIsKernel(kernel),
+ 	fPageTable(pageTable),
+ 	fPageTableSize(GetPageTableSize(pageTable / B_PAGE_SIZE, kernel)),
+-	fInvalidPagesCount(0)
++	fInvalidPagesCount(0),
++	fInvalidCode(false)
+ {
+ 	TRACE("+RISCV64VMTranslationMap(%p, %d, 0x%" B_PRIxADDR ")\n", this,
+ 		kernel, pageTable);
+@@ -239,8 +244,10 @@ RISCV64VMTranslationMap::Map(addr_t virtualAddress,
+ 			newPte.flags |= (1 << pteRead);
+ 		if ((attributes & B_KERNEL_WRITE_AREA)   != 0)
+ 			newPte.flags |= (1 << pteWrite);
+-		if ((attributes & B_KERNEL_EXECUTE_AREA) != 0)
++		if ((attributes & B_KERNEL_EXECUTE_AREA) != 0) {
+ 			newPte.flags |= (1 << pteExec);
++			fInvalidCode = true;
++		}
+ 	}
+ 	*pte = newPte;
+ 
+@@ -639,15 +646,19 @@ status_t RISCV64VMTranslationMap::Protect(addr_t base, addr_t top,
+ 				newPte.flags |= (1 << pteRead);
+ 			if ((attributes & B_WRITE_AREA)   != 0)
+ 				newPte.flags |= (1 << pteWrite);
+-			if ((attributes & B_EXECUTE_AREA) != 0)
++			if ((attributes & B_EXECUTE_AREA) != 0) {
+ 				newPte.flags |= (1 << pteExec);
++				fInvalidCode = true;
++			}
+ 		} else {
+ 			if ((attributes & B_KERNEL_READ_AREA)    != 0)
+ 				newPte.flags |= (1 << pteRead);
+ 			if ((attributes & B_KERNEL_WRITE_AREA)   != 0)
+ 				newPte.flags |= (1 << pteWrite);
+-			if ((attributes & B_KERNEL_EXECUTE_AREA) != 0)
++			if ((attributes & B_KERNEL_EXECUTE_AREA) != 0) {
+ 				newPte.flags |= (1 << pteExec);
++				fInvalidCode = true;
++			}
+ 		}
+ 		*pte = newPte;
+ 
+@@ -837,6 +848,33 @@ RISCV64VMTranslationMap::Flush()
+ 		}
+ 	}
+ 	fInvalidPagesCount = 0;
++
++	if (fInvalidCode) {
++		FenceI();
++
++		int cpu = smp_get_current_cpu();
++		CPUSet cpuMask = fActiveOnCpus;
++		cpuMask.ClearBit(cpu);
++
++		if (!cpuMask.IsEmpty()) {
++			switch (gPlatform1) {
++			case kPlatform1Sbi: {
++				uint64 hartMask = 0;
++				int32 cpuCount = smp_get_num_cpus();
++				for (int32 i = 0; i < cpuCount; i++) {
++					if (cpuMask.GetBit(i))
++						hartMask |= (uint64)1 << gCPU[i].arch.hartId;
++				}
++				// TODO: handle hart ID >= 64
++				memory_full_barrier();
++				sbi_remote_fence_i(hartMask, 0);
++				break;
++			}
++			}
++		}
++
++		fInvalidCode = false;
++	}
+ }
+ 
+ 
+diff --git a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+index d3ab3b0dfb..47b82ead1c 100644
+--- a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
++++ b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+@@ -98,6 +98,7 @@ private:
+ 			CPUSet				fActiveOnCpus;
+ 			int					fInvalidPagesCount;
+ 			addr_t				fInvalidPages[PAGE_INVALIDATE_CACHE_SIZE];
++			bool				fInvalidCode;
+ };
+ 
+ 
+-- 
+2.30.2
+

@@ -1,0 +1,35 @@
+From cdbdf6c27b0695e3fa6e5eea0e13d50801197423 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 10 Dec 2020 04:02:02 +0900
+Subject: use .IsSet() instead if .Get() != NULL
+
+Change-Id: Ia2b7a719fd398e78cc3b11d4f7b02cb81179f65f
+---
+ src/kits/interface/Menu.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/kits/interface/Menu.cpp b/src/kits/interface/Menu.cpp
+index 1ddc385aed..d996419e5f 100644
+--- a/src/kits/interface/Menu.cpp
++++ b/src/kits/interface/Menu.cpp
+@@ -618,7 +618,7 @@ BMenu::MessageReceived(BMessage* message)
+ 							fTrackState->navigationAreaTimer.Unset();
+ 							_SelectItem(item, true);
+ 						} else {
+-							if (fTrackState->navigationAreaTimer.Get() != NULL)
++							if (fTrackState->navigationAreaTimer.IsSet())
+ 								fTrackState->navigationAreaTimer.SetTo(new(std::nothrow) BMessageRunner(BMessenger(this), BMessage(navigationAreaTimeoutMsg), kNavigationAreaTimeout, 1));
+ 						}
+ 					}
+@@ -638,7 +638,7 @@ BMenu::MessageReceived(BMessage* message)
+ 		}
+ 		
+ 		case navigationAreaTimeoutMsg: {
+-			if (fTrackState->navigationAreaTimer.Get() != NULL) {
++			if (fTrackState->navigationAreaTimer.IsSet()) {
+ 				fTrackState->navigationAreaTimer.Unset();
+ 				BPoint where;
+ 				GetMouse(&where, NULL);
+-- 
+2.30.2
+

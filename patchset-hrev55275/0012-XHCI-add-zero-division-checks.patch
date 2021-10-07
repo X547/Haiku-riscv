@@ -1,0 +1,42 @@
+From 5ffc38fc2f6eb8dacaf9b74706373519dae2eb0c Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Thu, 2 Jul 2020 14:48:01 +0900
+Subject: XHCI: add zero division checks
+
+Change-Id: I6f5bcc61f53c0fb665808229dee55d42632ce433
+---
+ src/add-ons/kernel/busses/usb/xhci.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/usb/xhci.cpp b/src/add-ons/kernel/busses/usb/xhci.cpp
+index 13cb0cc5c9..fdee4b592a 100644
+--- a/src/add-ons/kernel/busses/usb/xhci.cpp
++++ b/src/add-ons/kernel/busses/usb/xhci.cpp
+@@ -805,6 +805,11 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
+ 	// things simple by setting trbSize to the MBP. (XHCI 1.2 § 4.11.7.1 p235.)
+ 	size_t trbSize = endpoint->max_burst_payload;
+ 
++	if (trbSize == 0) {
++		TRACE_ALWAYS("[!] trbSize == 0\n");
++		return B_BAD_VALUE;
++	}
++
+ 	if (isochronousData != NULL) {
+ 		if (isochronousData->packet_count == 0)
+ 			return B_BAD_VALUE;
+@@ -825,6 +830,12 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
+ 
+ 	// Normal Stage
+ 	const size_t maxPacketSize = pipe->MaxPacketSize();
++
++	if (maxPacketSize == 0) {
++		TRACE_ALWAYS("[!] maxPacketSize == 0\n");
++		return B_BAD_VALUE;
++	}
++
+ 	size_t remaining = transfer->DataLength();
+ 	for (int32 i = 0; i < trbCount; i++) {
+ 		int32 trbLength = (remaining < trbSize) ? remaining : trbSize;
+-- 
+2.30.2
+

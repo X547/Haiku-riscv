@@ -1,0 +1,69 @@
+From cfae6046acda8e4061299b716c30b969c1d75e95 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Wed, 9 Dec 2020 18:33:38 +0900
+Subject: AutoDeleter: introduce FieldFunctionDeleter
+
+It allows to call destructor function stored in struct field such as
+device_manager_info::put_node.
+
+Change-Id: If9162f2f449d2b1c52c39509fa8732f21debf04a
+---
+ headers/private/shared/AutoDeleter.h | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/headers/private/shared/AutoDeleter.h b/headers/private/shared/AutoDeleter.h
+index 2d24368f2b..092e6770fd 100644
+--- a/headers/private/shared/AutoDeleter.h
++++ b/headers/private/shared/AutoDeleter.h
+@@ -11,6 +11,8 @@
+ 	ArrayDeleter   - deletes an array
+ 	MemoryDeleter  - free()s malloc()ed memory
+ 	CObjectDeleter - calls an arbitrary specified destructor function
++	FieldFunctionDeleter - calls an arbitrary field function in given struct
++		pointer
+ 	HandleDeleter  - use arbitrary handle type and destructor function
+ 	FileDescriptorCloser - closes a file descriptor, based on HandleDeleter
+ */
+@@ -218,6 +220,31 @@ struct MethodDeleter
+ };
+ 
+ 
++// FieldFunctionDeleter
++
++template<typename Type, typename Table, Table **table,
++	void (*Table::*Deleter)(Type*)>
++struct FieldFunctionDelete {
++	inline void operator()(Type *object)
++	{
++		if (object != NULL)
++			((**table).*Deleter)(object);
++	}
++};
++
++template<typename Type, typename Table, Table **table,
++	typename DestructorResult, DestructorResult (*Table::*Deleter)(Type*)>
++struct FieldFunctionDeleter
++	: AutoDeleter<Type, FieldFunctionDelete<Type, Table, table, Deleter> >
++{
++	typedef AutoDeleter<Type,
++		FieldFunctionDelete<Type, Table, table, Deleter> > Base;
++
++	FieldFunctionDeleter() : Base() {}
++	FieldFunctionDeleter(Type *object) : Base(object) {}
++};
++
++
+ // HandleDeleter
+ 
+ struct StatusHandleChecker
+@@ -308,6 +335,7 @@ using ::BPrivate::ArrayDeleter;
+ using ::BPrivate::MemoryDeleter;
+ using ::BPrivate::CObjectDeleter;
+ using ::BPrivate::MethodDeleter;
++using ::BPrivate::FieldFunctionDeleter;
+ using ::BPrivate::HandleDeleter;
+ using ::BPrivate::FileDescriptorCloser;
+ 
+-- 
+2.30.2
+

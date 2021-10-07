@@ -1,0 +1,27 @@
+From 15649792eff6f68846ae8fca7f4f198d8977e2a2 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Tue, 22 Jun 2021 02:58:58 +0900
+Subject: ati: fix for 64 bits and non-x86 architectures, SMAP fixes
+
+ATI graphics driver is useful for QEMU option `-device ati-vga`.
+
+Change-Id: Ia932d07d23b16cd9e2eefe65821a38a87427c416
+---
+ src/add-ons/kernel/drivers/graphics/ati/driver.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/ati/driver.cpp b/src/add-ons/kernel/drivers/graphics/ati/driver.cpp
+index c92c94ebfa..6c6d41ec5e 100644
+--- a/src/add-ons/kernel/drivers/graphics/ati/driver.cpp
++++ b/src/add-ons/kernel/drivers/graphics/ati/driver.cpp
+@@ -20,6 +20,7 @@
+ 
+ #undef TRACE
+ 
++#define ENABLE_DEBUG_TRACE
+ #ifdef ENABLE_DEBUG_TRACE
+ #	define TRACE(x...) dprintf("ati: " x)
+ #else
+-- 
+2.30.2
+

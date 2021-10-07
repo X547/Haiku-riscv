@@ -1,0 +1,26 @@
+From fea4a12e944e5c1533d3dbaf24682ed8da11e7ec Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 16 Aug 2021 05:12:58 +0900
+Subject: Revert "add more programs to package"
+
+This reverts commit 46c3465efae0dc4736e22d7e6df8eb1912448ef0.
+---
+ build/jam/images/definitions/minimum | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 1de59225fb..6d5eceb39d 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -33,8 +33,6 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
+ 	version vmstat
+ 	waitfor watch writembr@x86,x86_64 xres
+ 	dpms
+-	clipboard media_client mkdos
+-	play recover screenshot setcontrollook setdecor translate WindowShade
+ ] ;
+ 
+ SYSTEM_APPS = [ FFilterByBuildFeatures
+-- 
+2.30.2
+

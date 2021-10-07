@@ -1,0 +1,187 @@
+From 83e69f95782df0dd5df90f465cfee1e274058d76 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:24:17 +0900
+Subject: rumtime_loader: fix TLS for riscv64
+
+Change-Id: I55593dea936af31135b8e9159f8b6a64270369c0
+---
+ headers/private/system/arch/arm/arch_elf.h               | 5 +----
+ headers/private/system/arch/arm64/arch_elf.h             | 2 ++
+ headers/private/system/arch/m68k/arch_elf.h              | 2 ++
+ headers/private/system/arch/mipsel/arch_elf.h            | 2 ++
+ headers/private/system/arch/ppc/arch_elf.h               | 2 ++
+ headers/private/system/arch/riscv64/arch_elf.h           | 2 ++
+ headers/private/system/arch/sparc/arch_elf.h             | 2 ++
+ headers/private/system/arch/x86/arch_elf.h               | 2 ++
+ headers/private/system/arch/x86_64/arch_elf.h            | 2 ++
+ src/system/runtime_loader/arch/riscv64/arch_relocate.cpp | 4 ++--
+ src/system/runtime_loader/elf_tls.cpp                    | 9 +++++----
+ 11 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/headers/private/system/arch/arm/arch_elf.h b/headers/private/system/arch/arm/arch_elf.h
+index 1654c93601..848e00eb25 100644
+--- a/headers/private/system/arch/arm/arch_elf.h
++++ b/headers/private/system/arch/arm/arch_elf.h
+@@ -6,7 +6,6 @@
+ #define _KERNEL_ARCH_ARM_ELF_H
+ 
+ 
+-
+ /* ARM relocs.  */
+ #define R_ARM_NONE              0       /* No reloc */
+ #define R_ARM_PC24              1       /* PC relative 26 bit branch */
+@@ -47,9 +46,7 @@
+ #define R_ARM_RPC24             254
+ #define R_ARM_RBASE             255
+ 
+-
+-
+-
++#define TLS_DTV_OFFSET 0
+ 
+ 
+ #endif	/* _KERNEL_ARCH_M68K_ELF_H */
+diff --git a/headers/private/system/arch/arm64/arch_elf.h b/headers/private/system/arch/arm64/arch_elf.h
+index 73d5c3dab3..9bd0614dfa 100644
+--- a/headers/private/system/arch/arm64/arch_elf.h
++++ b/headers/private/system/arch/arm64/arch_elf.h
+@@ -22,4 +22,6 @@
+ #define	R_AARCH64_TLSDESC 	1031	/* Identify the TLS descriptor */
+ #define	R_AARCH64_IRELATIVE	1032
+ 
++#define TLS_DTV_OFFSET 0
++
+ #endif	/* _KERNEL_ARCH_ARM64_ELF_H */
+diff --git a/headers/private/system/arch/m68k/arch_elf.h b/headers/private/system/arch/m68k/arch_elf.h
+index 41c0200014..ad5ae45828 100644
+--- a/headers/private/system/arch/m68k/arch_elf.h
++++ b/headers/private/system/arch/m68k/arch_elf.h
+@@ -34,4 +34,6 @@
+ #define	R_68K_GNU_VTINHERIT 23
+ #define	R_68K_GNU_VTENTRY 24
+ 
++#define TLS_DTV_OFFSET 0
++
+ #endif	/* _KERNEL_ARCH_M68K_ELF_H */
+diff --git a/headers/private/system/arch/mipsel/arch_elf.h b/headers/private/system/arch/mipsel/arch_elf.h
+index 7e44f36fe6..a4be69aa7e 100644
+--- a/headers/private/system/arch/mipsel/arch_elf.h
++++ b/headers/private/system/arch/mipsel/arch_elf.h
+@@ -49,5 +49,7 @@
+ #define	R_MIPSEL_SECTOFF_HA			36
+ #define	R_MIPSEL_ADDR30				37
+ 
++#define TLS_DTV_OFFSET 0
++
+ #endif	/* _SYSTEM_ARCH_MIPSEL_ELF_H */
+ 
+diff --git a/headers/private/system/arch/ppc/arch_elf.h b/headers/private/system/arch/ppc/arch_elf.h
+index d78a66ed60..d7ef3a6f43 100644
+--- a/headers/private/system/arch/ppc/arch_elf.h
++++ b/headers/private/system/arch/ppc/arch_elf.h
+@@ -46,4 +46,6 @@
+ #define	R_PPC_SECTOFF_HA		36
+ #define	R_PPC_ADDR30			37
+ 
++#define TLS_DTV_OFFSET 0
++
+ #endif	/* _KERNEL_ARCH_PPC_ELF_H */
+diff --git a/headers/private/system/arch/riscv64/arch_elf.h b/headers/private/system/arch/riscv64/arch_elf.h
+index c6b79cd3e8..c8cf275f9c 100644
+--- a/headers/private/system/arch/riscv64/arch_elf.h
++++ b/headers/private/system/arch/riscv64/arch_elf.h
+@@ -61,5 +61,7 @@
+ #define R_RISCV_SET32				56
+ #define R_RISCV_32_PCREL			57
+ 
++#define TLS_DTV_OFFSET 0x800
++
+ 
+ #endif	/* _SYSTEM_ARCH_RISCV64_ELF_H */
+diff --git a/headers/private/system/arch/sparc/arch_elf.h b/headers/private/system/arch/sparc/arch_elf.h
+index 166fa6a6f3..47e57a7ff0 100644
+--- a/headers/private/system/arch/sparc/arch_elf.h
++++ b/headers/private/system/arch/sparc/arch_elf.h
+@@ -69,4 +69,6 @@
+ #define R_SPARC_SIZE32		86
+ #define R_SPARC_SIZE64		87
+ 
++#define TLS_DTV_OFFSET 0
++
+ #endif	/* _KERNEL_ARCH_SPARC_ELF_H */
+diff --git a/headers/private/system/arch/x86/arch_elf.h b/headers/private/system/arch/x86/arch_elf.h
+index c93ebd3d24..3d5abef7ca 100644
+--- a/headers/private/system/arch/x86/arch_elf.h
++++ b/headers/private/system/arch/x86/arch_elf.h
+@@ -21,6 +21,8 @@
+ #define R_386_TLS_DTPMOD32	35
+ #define R_386_TLS_DTPOFF32	36
+ 
++#define TLS_DTV_OFFSET 0
++
+ #ifdef _BOOT_MODE
+ # include "../x86_64/arch_elf.h"
+ #endif
+diff --git a/headers/private/system/arch/x86_64/arch_elf.h b/headers/private/system/arch/x86_64/arch_elf.h
+index b75648df16..147c81bb3d 100644
+--- a/headers/private/system/arch/x86_64/arch_elf.h
++++ b/headers/private/system/arch/x86_64/arch_elf.h
+@@ -46,6 +46,8 @@
+ #define R_X86_64_TLSDESC			36	/* TLS descriptor. */
+ #define R_X86_64_IRELATIVE			37	/* Adjust indirectly by program base. */
+ 
++#define TLS_DTV_OFFSET 0
++
+ 
+ #if defined(_BOOT_MODE) || defined(ELF32_COMPAT)
+ # include "../x86/arch_elf.h"
+diff --git a/src/system/runtime_loader/arch/riscv64/arch_relocate.cpp b/src/system/runtime_loader/arch/riscv64/arch_relocate.cpp
+index 10182fa98f..d42540c70d 100644
+--- a/src/system/runtime_loader/arch/riscv64/arch_relocate.cpp
++++ b/src/system/runtime_loader/arch/riscv64/arch_relocate.cpp
+@@ -58,10 +58,10 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
+ 			case R_RISCV_TLS_DTPMOD64:
+ 				relocValue = symbolImage == NULL
+ 							? image->dso_tls_id : symbolImage->dso_tls_id;
+-				continue;
++				break;
+ 			case R_RISCV_TLS_DTPREL64:
+ 				relocValue = symAddr;
+-				continue;
++				break;
+ 			default:
+ 				TRACE(("unhandled relocation type %d\n", type));
+ 				return B_BAD_DATA;
+diff --git a/src/system/runtime_loader/elf_tls.cpp b/src/system/runtime_loader/elf_tls.cpp
+index f02a81d6ea..117b39907e 100644
+--- a/src/system/runtime_loader/elf_tls.cpp
++++ b/src/system/runtime_loader/elf_tls.cpp
+@@ -27,7 +27,7 @@ public:
+ 			bool		IsInvalid() const	{ return fPointer == NULL; }
+ 
+ 			void*		operator+(addr_t offset) const
+-							{ return (void*)((addr_t)fPointer + offset); }
++							{ return (void*)((addr_t)fPointer + TLS_DTV_OFFSET + offset); }
+ 
+ private:
+ 			void*		fPointer;
+@@ -85,12 +85,13 @@ TLSBlockTemplate::SetBaseAddress(addr_t baseAddress)
+ TLSBlock
+ TLSBlockTemplate::CreateBlock()
+ {
+-	void* pointer = malloc(fMemorySize);
++	void* pointer = (uint8*)malloc(fMemorySize + TLS_DTV_OFFSET);
++	memset((uint8*)pointer, 0, TLS_DTV_OFFSET);
+ 	if (pointer == NULL)
+ 		return TLSBlock();
+-	memcpy(pointer, fAddress, fFileSize);
++	memcpy((char*)pointer + TLS_DTV_OFFSET, fAddress, fFileSize);
+ 	if (fMemorySize > fFileSize)
+-		memset((char*)pointer + fFileSize, 0, fMemorySize - fFileSize);
++		memset((char*)pointer + TLS_DTV_OFFSET + fFileSize, 0, fMemorySize - fFileSize);
+ 	return TLSBlock(pointer);
+ }
+ 
+-- 
+2.30.2
+

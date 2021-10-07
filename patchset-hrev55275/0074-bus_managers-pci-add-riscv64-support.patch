@@ -1,0 +1,1526 @@
+From 76e01fa00b1adb266b0f92cc3800fce820dd25eb Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 00:47:56 +0900
+Subject: bus_managers/pci: add riscv64 support
+
+Change-Id: I2b1324cd7af6ed203eb2fd07ec765da53b122387
+---
+ .../bus_managers/pci/arch/riscv64/Jamfile     |   8 +-
+ .../pci/arch/riscv64/pci_controller.cpp       | 894 +++++++++++++++++-
+ .../pci/arch/riscv64/pci_controller_private.h | 104 ++
+ .../bus_managers/pci/arch/riscv64/pci_io.c    |  61 --
+ .../bus_managers/pci/arch/riscv64/pci_io.cpp  |  76 ++
+ .../bus_managers/pci/arch/riscv64/pci_msi.cpp |  80 ++
+ .../bus_managers/pci/arch/riscv64/pci_msi.h   |  18 +
+ src/add-ons/kernel/bus_managers/pci/pci.cpp   |  23 +-
+ .../kernel/bus_managers/pci/pci_private.h     |   2 +
+ .../kernel/bus_managers/pci/pci_root.cpp      |  52 +-
+ 10 files changed, 1220 insertions(+), 98 deletions(-)
+ create mode 100644 src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller_private.h
+ delete mode 100644 src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.c
+ create mode 100644 src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.cpp
+ create mode 100644 src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.cpp
+ create mode 100644 src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.h
+
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/Jamfile b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/Jamfile
+index a09b7cbb37..21cf545281 100644
+--- a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/Jamfile
++++ b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/Jamfile
+@@ -1,10 +1,12 @@
+ SubDir HAIKU_TOP src add-ons kernel bus_managers pci arch $(TARGET_ARCH) ;
+ 
+ SubDirHdrs [ FDirName $(SUBDIR) $(DOTDOT) $(DOTDOT) ] ;
+-UsePrivateHeaders kernel [ FDirName kernel arch $(TARGET_ARCH) ]
+-	[ FDirName kernel boot platform $(HAIKU_BOOT_PLATFORM) ] ;
++UsePrivateKernelHeaders ;
++UsePrivateHeaders shared ;
++UsePrivateHeaders [ FDirName kernel util ] ;
+ 
+ KernelStaticLibrary pci_arch_bus_manager :
+ 	pci_controller.cpp
+-	pci_io.c
++	pci_io.cpp
++	pci_msi.cpp
+ ;
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller.cpp b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller.cpp
+index 91f81c0169..fa361d16aa 100644
+--- a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller.cpp
++++ b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller.cpp
+@@ -5,23 +5,903 @@
+ 
+ 
+ #include "pci_controller.h"
++#include "pci.h"
+ 
+-//#include <arch_platform.h>
++#include "pci_controller_private.h"
++#include "pci_msi.h"
++
++#include <drivers/bus/FDT.h>
++
++#include <AutoDeleterOS.h>
++#include <AutoDeleterDrivers.h>
++#include <util/AutoLock.h>
+ 
+ #include "pci_private.h"
+ 
+ 
+-status_t
+-pci_controller_init(void)
++extern PCI *gPCI;
++
++
++enum {
++	kRegIo,
++	kRegMmio32,
++	kRegMmio64,
++};
++
++
++uint32 gHostCtrlType = 0;
++
++AreaDeleter sPCIeConfigArea;
++addr_t gPCIeConfigPhysBase = 0;
++addr_t gPCIeConfigBase = 0;
++size_t gPCIeConfigSize = 0;
++
++AreaDeleter sPCIeDbiArea;
++addr_t gPCIeDbiPhysBase = 0;
++addr_t gPCIeDbiBase = 0;
++size_t gPCIeDbiSize = 0;
++
++AreaDeleter sPCIeIoArea;
++addr_t gPCIeIoBase = 0;
++
++
++struct {
++	phys_addr_t parentBase;
++	phys_addr_t childBase;
++	size_t size;
++	phys_addr_t free;
++} sPCIeRegisterRanges[3];
++
++
++struct {
++	uint32_t childAdr;
++	uint32_t childIrq;
++} sInterruptMapMask;
++
++struct InterruptMap {
++	uint32_t childAdr;
++	uint32_t childIrq;
++	uint32_t parentIrqCtrl;
++	uint32_t parentIrq;
++};
++
++ArrayDeleter<InterruptMap> sInterruptMap;
++uint32_t sInterruptMapLen = 0;
++
++
++static void
++SetRegisterRange(int kind, phys_addr_t parentBase, phys_addr_t childBase,
++	size_t size)
++{
++	auto& range = sPCIeRegisterRanges[kind];
++
++	range.parentBase = parentBase;
++	range.childBase = childBase;
++	range.size = size;
++	// Avoid allocating zero address.
++	range.free = (childBase != 0) ? childBase : 1;
++}
++
++
++static phys_addr_t
++AllocRegister(int kind, size_t size)
+ {
+-	/* no support yet */
+-#warning RISCV64: WRITEME
++	auto& range = sPCIeRegisterRanges[kind];
++
++	phys_addr_t adr = ROUNDUP(range.free, size);
++	if (adr - range.childBase + size > range.size)
++		return 0;
++
++	range.free = adr + size;
++
++	return adr;
++}
++
++
++static InterruptMap*
++LookupInterruptMap(uint32_t childAdr, uint32_t childIrq)
++{
++	childAdr &= sInterruptMapMask.childAdr;
++	childIrq &= sInterruptMapMask.childIrq;
++	for (uint32 i = 0; i < sInterruptMapLen; i++) {
++		if ((sInterruptMap[i].childAdr) == childAdr
++			&& (sInterruptMap[i].childIrq) == childIrq)
++			return &sInterruptMap[i];
++	}
++	return NULL;
++}
++
++
++static void
++WriteAtu()
++{
++	dprintf("ATU:\n");
++	for (uint32 direction = 0; direction < 2; direction++) {
++		switch (direction) {
++			case kPciAtuOutbound: dprintf("  outbound:\n"); break;
++			case kPciAtuInbound: dprintf("  inbound:\n"); break;
++		}
++		for (uint32 index = 0; index < 8; index++) {
++			volatile PciAtuRegs* atu = (PciAtuRegs*)(gPCIeDbiBase + kPciAtuOffset + (2*index + direction)*sizeof(PciAtuRegs));
++			dprintf("    %" B_PRIu32 ": ", index);
++			dprintf("base: %#08" B_PRIx64, atu->baseLo + ((uint64)atu->baseHi << 32));
++			dprintf(", limit: %#08" B_PRIx32, atu->limit);
++			dprintf(", target: %#08" B_PRIx64, atu->targetLo + ((uint64)atu->targetHi << 32));
++			dprintf(", ctrl1: ");
++			uint32 ctrl1 = atu->ctrl1;
++			switch (ctrl1) {
++				case kPciAtuTypeMem:  dprintf("mem"); break;
++				case kPciAtuTypeIo:   dprintf("io"); break;
++				case kPciAtuTypeCfg0: dprintf("cfg0"); break;
++				case kPciAtuTypeCfg1: dprintf("cfg1"); break;
++				default: dprintf("? (%#" B_PRIx32 ")", ctrl1);
++			}
++			dprintf(", ctrl2: {");
++			uint32 ctrl2 = atu->ctrl2;
++			bool first = true;
++			for (uint32 i = 0; i < 32; i++) {
++				if (((1 << i) & ctrl2) != 0) {
++					if (first) first = false; else dprintf(", ");
++					switch (i) {
++						case 30: dprintf("barModeEnable"); break;
++						case 31: dprintf("enable"); break;
++						default: dprintf("? (%" B_PRIu32 ")", i); break;
++					}
++				}
++			}
++			dprintf("}\n");
++		}
++	}
++}
++
++
++static status_t
++AtuMap(uint32 index, uint32 direction, uint32 type, uint64 parentAdr, uint64 childAdr, uint32 size)
++{
++/*
++	dprintf("AtuMap(%" B_PRIu32 ", %" B_PRIu32 ", %#" B_PRIx64 ", %#" B_PRIx64 ", %#" B_PRIx32 ")\n",
++		index, type, parentAdr, childAdr, size
++	);
++*/
++	volatile PciAtuRegs* atu = (PciAtuRegs*)(gPCIeDbiBase + kPciAtuOffset + (2*index + direction)*sizeof(PciAtuRegs));
++	atu->baseLo = (uint32)parentAdr;
++	atu->baseHi = (uint32)(parentAdr >> 32);
++	atu->limit = (uint32)(parentAdr + size - 1);
++	atu->targetLo = (uint32)childAdr;
++	atu->targetHi = (uint32)(childAdr >> 32);
++	atu->ctrl1 = type;
++	atu->ctrl2 = kPciAtuEnable;
++
++	for (;;) {
++		if ((atu->ctrl2 & kPciAtuEnable) != 0)
++			break;
++	}
++
+ 	return B_OK;
+ }
+ 
+ 
++static uint32_t
++EncodePciAddress(uint8 bus, uint8 device, uint8 function)
++{
++	return bus % (1 << 8) * (1 << 16)
++		+ device % (1 << 5) * (1 << 11)
++		+ function % (1 << 3) * (1 << 8);
++}
++
++
++static void
++DecodePciAddress(uint32_t adr, uint8& bus, uint8& device, uint8& function)
++{
++	bus = adr / (1 << 16) % (1 << 8);
++	device = adr / (1 << 11) % (1 << 5);
++	function = adr / (1 << 8) % (1 << 3);
++}
++
++
++static inline addr_t
++PciConfigAdrEcam(uint8 bus, uint8 device, uint8 function, uint16 offset)
++{
++	addr_t address = gPCIeConfigBase + EncodePciAddress(bus, device, function) * (1 << 4) + offset;
++	if (address < gPCIeConfigBase
++		|| address /*+ size*/ > gPCIeConfigBase + gPCIeConfigSize)
++		return 0;
++
++	return address;
++}
++
++
++static inline addr_t
++PciConfigAdrSifive(uint8 bus, uint8 device, uint8 function, uint16 offset)
++{
++	uint32 atuType;
++	if (bus == 0) {
++		if (device != 0 || function != 0)
++			return 0;
++
++		return gPCIeDbiBase + offset;
++	} else if (bus == 1)
++		atuType = kPciAtuTypeCfg0;
++	else
++		atuType = kPciAtuTypeCfg1;
++
++	status_t res = AtuMap(1, kPciAtuOutbound, atuType, gPCIeConfigPhysBase, EncodePciAddress(bus, device, function) << 8, gPCIeConfigSize);
++	if (res < B_OK)
++		return 0;
++
++	return gPCIeConfigBase + offset;
++}
++
++
++static inline addr_t
++PciConfigAdr(uint8 bus, uint8 device, uint8 function, uint16 offset)
++{
++	switch (gHostCtrlType) {
++		case kHostCtrlEcam:
++			return PciConfigAdrEcam(bus, device, function, offset);
++		case kHostCtrlSifive:
++			return PciConfigAdrSifive(bus, device, function, offset);
++		default:
++			return 0;
++	}
++}
++
++
++static status_t
++read_pci_config(void *cookie, uint8 bus, uint8 device, uint8 function,
++	uint16 offset, uint8 size, uint32 *value)
++{
++	// PciConfigAdr may use sliding window
++	// TODO: SMP
++	InterruptsLocker locker;
++
++	addr_t address = PciConfigAdr(bus, device, function, offset);
++	if (address == 0)
++		return B_ERROR;
++
++	switch (size) {
++		case 1: *value = *(uint8 *)address; break;
++		case 2: *value = *(uint16*)address; break;
++		case 4: *value = *(uint32*)address; break;
++		default:
++			return B_ERROR;
++	}
++
++	return B_OK;
++}
++
++
++static status_t
++write_pci_config(void *cookie, uint8 bus, uint8 device, uint8 function,
++	uint16 offset, uint8 size, uint32 value)
++{
++	// PciConfigAdr may use sliding window
++	// TODO: SMP
++	InterruptsLocker locker;
++/*
++	dprintf("write_pci_config(%d:%d:%d, 0x%04x, %d, 0x%08x)\n", bus, device,
++		function, offset, size, value);
++*/
++	addr_t address = PciConfigAdr(bus, device, function, offset);
++	if (address == 0)
++		return B_ERROR;
++
++	switch (size) {
++		case 1: *(uint8 *)address = value; break;
++		case 2: *(uint16*)address = value; break;
++		case 4: *(uint32*)address = value; break;
++		default:
++			return B_ERROR;
++	}
++
++	return B_OK;
++}
++
++
++static status_t
++get_max_bus_devices(void *cookie, int32 *count)
++{
++	*count = 32;
++	return B_OK;
++}
++
++status_t 
++read_pci_irq(void *cookie, uint8 bus, uint8 device, uint8 function, uint8 pin,
++	uint8 *irq)
++{
++	return B_NOT_SUPPORTED;
++}
++
++
++status_t 
++write_pci_irq(void *cookie, uint8 bus, uint8 device, uint8 function, uint8 pin,
++	uint8 irq)
++{
++	return B_NOT_SUPPORTED;
++}
++
++
++pci_controller pci_controller_riscv64 =
++{
++	read_pci_config,
++	write_pci_config,
++	get_max_bus_devices,
++	read_pci_irq,
++	write_pci_irq,
++};
++
++
++static void
++InitMsiForDevice(uint8 bus, uint8 device, uint8 function)
++{
++#if 0
++	uint32	status;
++	uint32	capPtr;
++	uint32	capId;
++	int		i;
++	
++	uint32 offset;
++	dprintf("  %02x", 0);
++	for (offset = 0; offset < 0x100; offset += 4) {
++		uint32 value;
++		read_pci_config(NULL, bus, device, function, offset, 4, &value);
++		dprintf(" %08" B_PRIx32, B_BENDIAN_TO_HOST_INT32(value));
++		if (offset % 0x10 == 0x10 - 4)
++			dprintf("\n  %02x", offset + 4);
++	}
++	dprintf("\n");
++
++	read_pci_config(NULL, bus, device, function, PCI_status, 2, &status);
++	if (!(status & PCI_status_capabilities)) {
++		return;
++	}
++
++	dprintf("  capabilities: ");
++
++	uint32 headerType;
++	read_pci_config(NULL, bus, device, function,
++		PCI_header_type, 1, &headerType);
++
++	switch (headerType & PCI_header_type_mask) {
++		case PCI_header_type_generic:
++		case PCI_header_type_PCI_to_PCI_bridge:
++			read_pci_config(NULL, bus, device, function, PCI_capabilities_ptr, 1, &capPtr);
++			break;
++		case PCI_header_type_cardbus:
++			read_pci_config(NULL, bus, device, function, PCI_capabilities_ptr_2, 1, &capPtr);
++			break;
++		default:
++			dprintf("(unknown header type)\n");
++			return;
++	}
++
++	capPtr &= ~3;
++	if (capPtr == 0) {
++		dprintf("\n");
++		return;
++	}
++
++	for (i = 0; i < 48; i++) {
++		read_pci_config(NULL, bus, device, function, capPtr + 0, 1, &capId);
++		if (i > 0)
++			dprintf(", ");
++
++		dprintf("%#" B_PRIx32 ":%#" B_PRIx32, capPtr, capId);
++
++		read_pci_config(NULL, bus, device, function, capPtr + 1, 1, &capPtr);
++		capPtr &= ~3;
++		if (capPtr == 0)
++			break;
++	}
++	dprintf("\n");
++#endif	
++	uint32	status;
++	uint32	capPtr;
++	uint32	capId;
++
++	read_pci_config(NULL, bus, device, function, PCI_status, 2, &status);
++	if ((status & PCI_status_capabilities) == 0)
++		return;
++
++	uint32 headerType;
++	read_pci_config(NULL, bus, device, function,
++		PCI_header_type, 1, &headerType);
++
++	switch (headerType & PCI_header_type_mask) {
++		case PCI_header_type_generic:
++		case PCI_header_type_PCI_to_PCI_bridge:
++			read_pci_config(NULL, bus, device, function, PCI_capabilities_ptr, 1, &capPtr);
++			break;
++		case PCI_header_type_cardbus:
++			read_pci_config(NULL, bus, device, function, PCI_capabilities_ptr_2, 1, &capPtr);
++			break;
++		default:
++			return;
++	}
++
++	capPtr &= ~3;
++	if (capPtr == 0)
++		return;
++
++	for (int i = 0; i < 48; i++) {
++		read_pci_config(NULL, bus, device, function, capPtr + 0, 1, &capId);
++		
++		if (capId == PCI_cap_id_msi)
++			break;
++		
++		read_pci_config(NULL, bus, device, function, capPtr + 1, 1, &capPtr);
++		capPtr &= ~3;
++		if (capPtr == 0)
++			return;
++	}
++
++	dprintf("  MSI offset: %#x\n", capPtr);
++	
++	int32 msiIrq = AllocMsiInterrupt();
++	dprintf("  msiIrq: %" B_PRId32 "\n", msiIrq);
++	
++	uint32 control;
++	read_pci_config(NULL, bus, device, function, capPtr + PCI_msi_control, 2, &control);
++	
++	write_pci_config(NULL, bus, device, function, capPtr + PCI_msi_address, 4, (uint32)gMsiPhysAddr);
++	if ((control & PCI_msi_control_64bit) != 0) {
++		write_pci_config(NULL, bus, device, function, capPtr + PCI_msi_address_high, 4, (uint32)(gMsiPhysAddr >> 32));
++		write_pci_config(NULL, bus, device, function, capPtr + PCI_msi_data_64bit, 2, msiIrq);
++	} else
++		write_pci_config(NULL, bus, device, function, capPtr + PCI_msi_data, 2, msiIrq);
++
++	control &= ~PCI_msi_control_mme_mask;
++	control |= (ffs(1) - 1) << 4;
++	control |= PCI_msi_control_enable;
++	write_pci_config(NULL, bus, device, function, capPtr + PCI_msi_control, 2, control);
++
++	write_pci_config(NULL, bus, device, function, PCI_interrupt_line, 1, gStartMsiIrq + msiIrq);
++}
++
++
++static void
++AllocRegsForDevice(uint8 bus, uint8 device, uint8 function)
++{
++	dprintf("AllocRegsForDevice(bus: %d, device: %d, function: %d)\n", bus,
++		device, function);
++
++	bool allocBars = gHostCtrlType == kHostCtrlEcam;
++
++	uint32 vendorID, deviceID;
++	read_pci_config(NULL, bus, device, function, PCI_vendor_id, 2, &vendorID);
++	read_pci_config(NULL, bus, device, function, PCI_device_id, 2, &deviceID);
++	dprintf("  vendorID: %#04" B_PRIx32 "\n", vendorID);
++	dprintf("  deviceID: %#04" B_PRIx32 "\n", deviceID);
++	
++	uint32 headerType;
++	read_pci_config(NULL, bus, device, function,
++		PCI_header_type, 1, &headerType);
++	headerType = headerType % 0x80;
++
++	dprintf("  headerType: ");
++	switch (headerType) {
++		case PCI_header_type_generic: dprintf("generic"); break;
++		case PCI_header_type_PCI_to_PCI_bridge: dprintf("bridge"); break;
++		case PCI_header_type_cardbus: dprintf("cardbus"); break;
++		default: dprintf("?(%u)", headerType);
++	}
++	dprintf("\n");
++	
++	if (headerType == PCI_header_type_PCI_to_PCI_bridge) {
++		uint32 primaryBus, secondaryBus, subordinateBus;
++		read_pci_config(NULL, bus, device, function, PCI_primary_bus, 1, &primaryBus);
++		read_pci_config(NULL, bus, device, function, PCI_secondary_bus, 1, &secondaryBus);
++		read_pci_config(NULL, bus, device, function, PCI_subordinate_bus, 1, &subordinateBus);
++		dprintf("  primaryBus: %u\n", primaryBus);
++		dprintf("  secondaryBus: %u\n", secondaryBus);
++		dprintf("  subordinateBus: %u\n", subordinateBus);
++	}
++
++	uint32 oldValLo = 0, oldValHi = 0, sizeLo = 0, sizeHi = 0;
++	uint64 val, size;
++	for (int i = 0; i < ((headerType == PCI_header_type_PCI_to_PCI_bridge) ? 2 : 6); i++) {
++
++		dprintf("  bar[%d]: ", i);
++
++		read_pci_config(NULL, bus, device, function,
++			PCI_base_registers + i*4, 4, &oldValLo);
++
++		int regKind;
++		if (oldValLo % 2 == 1) {
++			regKind = kRegIo;
++			dprintf("IOPORT");
++		} else if (oldValLo / 2 % 4 == 0) {
++			regKind = kRegMmio32;
++			dprintf("MMIO32");
++		} else if (oldValLo / 2 % 4 == 2) {
++			regKind = kRegMmio64;
++			dprintf("MMIO64");
++		} else {
++			dprintf("?(%d)", oldValLo / 2 % 4);
++			dprintf("\n");
++			continue;
++		}
++
++		read_pci_config (NULL, bus, device, function,
++			PCI_base_registers + i*4, 4, &oldValLo);
++		write_pci_config(NULL, bus, device, function,
++			PCI_base_registers + i*4, 4, 0xffffffff);
++		read_pci_config (NULL, bus, device, function,
++			PCI_base_registers + i*4, 4, &sizeLo);
++		write_pci_config(NULL, bus, device, function,
++			PCI_base_registers + i*4, 4, oldValLo);
++		val = oldValLo;
++		size = sizeLo;
++		if (regKind == kRegMmio64) {
++			read_pci_config (NULL, bus, device, function,
++				PCI_base_registers + (i + 1)*4, 4, &oldValHi);
++			write_pci_config(NULL, bus, device, function,
++				PCI_base_registers + (i + 1)*4, 4, 0xffffffff);
++			read_pci_config (NULL, bus, device, function,
++				PCI_base_registers + (i + 1)*4, 4, &sizeHi);
++			write_pci_config(NULL, bus, device, function,
++				PCI_base_registers + (i + 1)*4, 4, oldValHi);
++			val  += ((uint64)oldValHi) << 32;
++			size += ((uint64)sizeHi  ) << 32;
++		} else {
++			if (sizeLo != 0)
++				size += ((uint64)0xffffffff) << 32;
++		}
++		val &= ~(uint64)0xf;
++		size = ~(size & ~(uint64)0xf) + 1;
++/*
++		dprintf(", oldValLo: 0x%" B_PRIx32 ", sizeLo: 0x%" B_PRIx32, oldValLo,
++			sizeLo);
++		if (regKind == regMmio64) {
++			dprintf(", oldValHi: 0x%" B_PRIx32 ", sizeHi: 0x%" B_PRIx32,
++				oldValHi, sizeHi);
++		}
++*/
++		dprintf(", adr: 0x%" B_PRIx64 ", size: 0x%" B_PRIx64, val, size);
++
++		if (allocBars && /*val == 0 &&*/ size != 0) {
++			if (regKind == kRegMmio64) {
++				val = AllocRegister(regKind, size);
++				write_pci_config(NULL, bus, device, function,
++					PCI_base_registers + (i + 0)*4, 4, (uint32)val);
++				write_pci_config(NULL, bus, device, function,
++					PCI_base_registers + (i + 1)*4, 4,
++					(uint32)(val >> 32));
++				dprintf(" -> 0x%" B_PRIx64, val);
++			} else {
++				val = AllocRegister(regKind, size);
++				write_pci_config(NULL, bus, device, function,
++					PCI_base_registers + i*4, 4, (uint32)val);
++				dprintf(" -> 0x%" B_PRIx64, val);
++			}
++		}
++
++		dprintf("\n");
++
++		if (regKind == kRegMmio64)
++			i++;
++	}
++
++	// ROM
++	dprintf("  rom_bar: ");
++	uint32 romBaseOfs = (headerType == PCI_header_type_PCI_to_PCI_bridge) ? PCI_bridge_rom_base : PCI_rom_base;
++	read_pci_config (NULL, bus, device, function, romBaseOfs, 4, &oldValLo);
++	write_pci_config(NULL, bus, device, function, romBaseOfs, 4, 0xfffffffe);
++	read_pci_config (NULL, bus, device, function, romBaseOfs, 4, &sizeLo);
++	write_pci_config(NULL, bus, device, function, romBaseOfs, 4, oldValLo);
++
++	val = oldValLo & PCI_rom_address_mask;
++	size = ~(sizeLo & ~(uint32)0xf) + 1;
++	dprintf("adr: 0x%" B_PRIx64 ", size: 0x%" B_PRIx64, val, size);
++	if (allocBars && /*val == 0 &&*/ size != 0) {
++		val = AllocRegister(kRegMmio32, size);
++		write_pci_config(NULL, bus, device, function,
++			PCI_rom_base, 4, (uint32)val);
++		dprintf(" -> 0x%" B_PRIx64, val);
++	}
++	dprintf("\n");
++
++	uint32 intPin;
++	read_pci_config(NULL, bus, device, function,
++		PCI_interrupt_pin, 1, &intPin);
++
++	InterruptMap* intMap = LookupInterruptMap(EncodePciAddress(bus, device, function), intPin);
++	if (intMap == NULL)
++		dprintf("no interrupt mapping for childAdr: (%d:%d:%d), childIrq: %d)\n", bus, device, function, intPin);
++	else {
++		write_pci_config(NULL, bus, device, function,
++			PCI_interrupt_line, 1, intMap->parentIrq);
++	}
++
++	if (gHostCtrlType == kHostCtrlSifive)
++		InitMsiForDevice(bus, device, function);
++
++	uint32 intLine;
++	read_pci_config(NULL, bus, device, function,
++		PCI_interrupt_line, 1, &intLine);
++	dprintf("  intLine: %u\n", intLine);
++	dprintf("  intPin: ");
++	switch (intPin) {
++	case 0: dprintf("-"); break;
++	case 1: dprintf("INTA#"); break;
++	case 2: dprintf("INTB#"); break;
++	case 3: dprintf("INTC#"); break;
++	case 4: dprintf("INTD#"); break;
++	default: dprintf("?(%u)", intPin); break;
++	}
++	dprintf("\n");
++}
++
++
++static void
++AllocRegs()
++{
++	dprintf("AllocRegs()\n");
++	// TODO: improve enumeration
++	for (int j = 0; j < 8; j++) {
++		for (int i = 0; i < 32; i++) {
++			uint32 vendorID;
++			status_t res = read_pci_config(NULL, j, i, 0, PCI_vendor_id, 2, &vendorID);
++			if (res >= B_OK && vendorID != 0xffff) {
++				uint32 headerType;
++				read_pci_config(NULL, j, i, 0,
++					PCI_header_type, 1, &headerType);
++				if ((headerType & 0x80) != 0) {
++					for (int k = 0; k < 8; k++)
++						AllocRegsForDevice(j, i, k);
++				} else
++					AllocRegsForDevice(j, i, 0);
++			}
++		}
++	}
++}
++
++
++//#pragma mark -
++
++status_t
++pci_controller_init()
++{
++	dprintf("pci_controller_init()\n");
++	
++	dprintf("sizeof(PciDbi): %#" B_PRIxSIZE "\n", sizeof(PciDbiRegs));
++
++	if (gPCIRootNode == NULL)
++		return B_OK;
++
++	DeviceNodePutter<&gDeviceManager> parent(
++		gDeviceManager->get_parent_node(gPCIRootNode));
++	fdt_device_module_info *parentModule;
++	fdt_device* parentDev;
++	if (gDeviceManager->get_driver(parent.Get(),
++		(driver_module_info**)&parentModule, (void**)&parentDev))
++		panic("can't get parent node driver");
++
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent.Get(), "fdt/compatible", &compatible,
++		false) < B_OK)
++		return B_ERROR;
++
++	dprintf("hostCtrlType: ");
++	if (strcmp(compatible, "pci-host-ecam-generic") == 0) {
++		gHostCtrlType = kHostCtrlEcam;
++		dprintf("ecam\n");
++	} else if (strcmp(compatible, "sifive,fu740-pcie") == 0) {
++		gHostCtrlType = kHostCtrlSifive;
++		dprintf("sifive\n");
++	} else {
++		gHostCtrlType = kHostCtrlUnknown;
++		dprintf("unknown\n");
++		return B_ERROR;
++	}
++	
++	uint64 regs;
++	uint64 regsLen;
++	for (uint32 i = 0; parentModule->get_reg(parentDev, i, &regs, &regsLen);
++		i++) {
++		dprintf("  reg[%" B_PRIu32 "]: (0x%" B_PRIx64 ", 0x%" B_PRIx64 ")\n",
++			i, regs, regsLen);
++	}
++
++	uint64 configRegs = 0;
++	uint64 configRegsLen = 0;
++	uint64 dbiRegs = 0;
++	uint64 dbiRegsLen = 0;
++	switch (gHostCtrlType) {
++		case kHostCtrlEcam:
++			if (!parentModule->get_reg(parentDev, 0, &configRegs, &configRegsLen)) {
++				dprintf("  no regs\n");
++				return B_ERROR;
++			}
++			break;
++		case kHostCtrlSifive:
++			if (
++				!parentModule->get_reg(parentDev, 0, &dbiRegs, &dbiRegsLen) ||
++				!parentModule->get_reg(parentDev, 1, &configRegs, &configRegsLen)
++			) {
++				dprintf("  no regs\n");
++				return B_ERROR;
++			}
++/*
++			// !!!
++			configRegs = 0x60070000;
++			configRegsLen = 0x10000;
++*/
++			break;
++	}
++
++	dprintf("  configRegs: (0x%" B_PRIx64 ", 0x%" B_PRIx64 ")\n",
++		configRegs, configRegsLen);
++	dprintf("  dbiRegs: (0x%" B_PRIx64 ", 0x%" B_PRIx64 ")\n",
++		dbiRegs, dbiRegsLen);
++
++	int intMapLen;
++	const void* intMapAdr = parentModule->get_prop(parentDev, "interrupt-map",
++		&intMapLen);
++	if (intMapAdr == NULL) {
++		dprintf("  \"interrupt-map\" property not found");
++		return B_ERROR;
++	} else {
++		int intMapMaskLen;
++		const void* intMapMask = parentModule->get_prop(parentDev, "interrupt-map-mask",
++			&intMapMaskLen);
++
++		if (intMapMask == NULL || intMapMaskLen != 4 * 4) {
++			dprintf("  \"interrupt-map-mask\" property not found or invalid");
++			return B_ERROR;
++		}
++
++		sInterruptMapMask.childAdr = B_BENDIAN_TO_HOST_INT32(*((uint32*)intMapMask + 0));
++		sInterruptMapMask.childIrq = B_BENDIAN_TO_HOST_INT32(*((uint32*)intMapMask + 3));
++
++		sInterruptMapLen = (uint32)intMapLen / (6 * 4);
++		sInterruptMap.SetTo(new(std::nothrow) InterruptMap[sInterruptMapLen]);
++		if (!sInterruptMap.IsSet())
++			return B_NO_MEMORY;
++
++		for (uint32_t *it = (uint32_t*)intMapAdr;
++			(uint8_t*)it - (uint8_t*)intMapAdr < intMapLen; it += 6) {
++			size_t i = (it - (uint32_t*)intMapAdr) / 6;
++
++			sInterruptMap[i].childAdr = B_BENDIAN_TO_HOST_INT32(*(it + 0));
++			sInterruptMap[i].childIrq = B_BENDIAN_TO_HOST_INT32(*(it + 3));
++			sInterruptMap[i].parentIrqCtrl = B_BENDIAN_TO_HOST_INT32(*(it + 4));
++			sInterruptMap[i].parentIrq = B_BENDIAN_TO_HOST_INT32(*(it + 5));
++		}
++
++		dprintf("  interrupt-map:\n");
++		for (size_t i = 0; i < sInterruptMapLen; i++) {
++			dprintf("    ");
++			// child unit address
++			uint8 bus, device, function;
++			DecodePciAddress(sInterruptMap[i].childAdr, bus, device, function);
++			dprintf("bus: %" B_PRIu32, bus);
++			dprintf(", dev: %" B_PRIu32, device);
++			dprintf(", fn: %" B_PRIu32, function);
++
++			dprintf(", childIrq: %" B_PRIu32,
++				sInterruptMap[i].childIrq);
++			dprintf(", parentIrq: (%" B_PRIu32,
++				sInterruptMap[i].parentIrqCtrl);
++			dprintf(", %" B_PRIu32, sInterruptMap[i].parentIrq);
++			dprintf(")\n");
++			if (i % 4 == 3 && (i + 1 < sInterruptMapLen))
++				dprintf("\n");
++		}
++	}
++
++	memset(sPCIeRegisterRanges, 0, sizeof(sPCIeRegisterRanges));
++	int rangesLen;
++	const void* rangesAdr = parentModule->get_prop(parentDev, "ranges",
++		&rangesLen);
++	if (rangesAdr == NULL) {
++		dprintf("  \"ranges\" property not found");
++	} else {
++		dprintf("  ranges:\n");
++		for (uint32_t *it = (uint32_t*)rangesAdr;
++			(uint8_t*)it - (uint8_t*)rangesAdr < rangesLen; it += 7) {
++			dprintf("    ");
++			uint32_t kind = B_BENDIAN_TO_HOST_INT32(*(it + 0));
++			uint64_t childAdr = B_BENDIAN_TO_HOST_INT64(*(uint64_t*)(it + 1));
++			uint64_t parentAdr = B_BENDIAN_TO_HOST_INT64(*(uint64_t*)(it + 3));
++			uint64_t len = B_BENDIAN_TO_HOST_INT64(*(uint64_t*)(it + 5));
++
++			switch (kind & 0x03000000) {
++			case 0x01000000:
++				SetRegisterRange(kRegIo, parentAdr, childAdr, len);
++				break;
++			case 0x02000000:
++				SetRegisterRange(kRegMmio32, parentAdr, childAdr, len);
++				break;
++			case 0x03000000:
++				SetRegisterRange(kRegMmio64, parentAdr, childAdr, len);
++				break;
++			}
++
++			switch (kind & 0x03000000) {
++			case 0x00000000: dprintf("CONFIG"); break;
++			case 0x01000000: dprintf("IOPORT"); break;
++			case 0x02000000: dprintf("MMIO32"); break;
++			case 0x03000000: dprintf("MMIO64"); break;
++			}
++
++			dprintf(" (0x%08" B_PRIx32 "): ", kind);
++			dprintf("child: %08" B_PRIx64, childAdr);
++			dprintf(", parent: %08" B_PRIx64, parentAdr);
++			dprintf(", len: %" B_PRIx64 "\n", len);
++		}
++	}
++
++
++	gPCIeConfigPhysBase = configRegs;
++	gPCIeConfigSize = configRegsLen;
++	sPCIeConfigArea.SetTo(map_physical_memory(
++		"PCI Config MMIO",
++		configRegs, gPCIeConfigSize, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(void**)&gPCIeConfigBase
++	));
++
++	if (dbiRegs != 0) {
++		gPCIeDbiPhysBase = dbiRegs;
++		gPCIeDbiSize = dbiRegsLen;
++		sPCIeDbiArea.SetTo(map_physical_memory(
++			"PCI DBI MMIO",
++			dbiRegs, gPCIeDbiSize, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++			(void**)&gPCIeDbiBase
++		));
++	}
++
++	sPCIeIoArea.SetTo(map_physical_memory(
++		"PCI IO",
++		sPCIeRegisterRanges[kRegIo].parentBase,
++		sPCIeRegisterRanges[kRegIo].size,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(void**)&gPCIeIoBase
++	));
++
++	if (!sPCIeConfigArea.IsSet()) {
++		dprintf("  can't map Config MMIO\n");
++		return sPCIeConfigArea.Get();
++	}
++
++	if (!sPCIeIoArea.IsSet()) {
++		dprintf("  can't map IO\n");
++		return sPCIeIoArea.Get();
++	}
++
++	if (gHostCtrlType == kHostCtrlSifive) {
++		WriteAtu();
++		// TODO read MSI IRQ from FDT
++		InitPciMsi(0x38);
++	}
++
++	AllocRegs();
++
++	if (gHostCtrlType == kHostCtrlSifive)
++		WriteAtu();
++
++	return pci_controller_add(&pci_controller_riscv64, NULL);
++}
++
++
+ phys_addr_t
+-pci_ram_address(phys_addr_t physical_address_in_system_memory)
++pci_ram_address(phys_addr_t childAdr)
+ {
+-	return physical_address_in_system_memory;
++	// dprintf("pci_ram_address(0x%" B_PRIxPHYSADDR "): ", childAdr);
++	phys_addr_t parentAdr = 0;
++	for (int kind = kRegIo; kind <= kRegMmio64; kind++) {
++		auto& range = sPCIeRegisterRanges[kind];
++		if (childAdr >= range.childBase
++			&& childAdr < range.childBase + range.size) {
++			parentAdr = childAdr - range.childBase;
++			if (kind != kRegIo)
++				parentAdr += range.parentBase;
++			// dprintf("0x%" B_PRIxPHYSADDR "\n", parentAdr);
++			return parentAdr;
++		}
++	}
++	// dprintf("?\n");
++	return 0;
+ }
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller_private.h b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller_private.h
+new file mode 100644
+index 0000000000..875af6d4c3
+--- /dev/null
++++ b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_controller_private.h
+@@ -0,0 +1,104 @@
++#ifndef _PCI_CONTROLLER_PRIVATE_H_
++#define _PCI_CONTROLLER_PRIVATE_H_
++
++
++#include <SupportDefs.h>
++
++
++struct PciDbiRegs {
++	uint8 unknown0[0x700];
++
++	uint32 unknown1[3];
++	uint32 portAfr;
++	uint32 linkControl;
++	uint32 unknown2[5];
++	uint32 portDebug0;
++	uint32 portDebug1;
++	uint32 unknown3[55];
++	uint32 linkWidthSpeedControl;
++	uint32 unknown4[4];
++	uint32 msiAddrLo;
++	uint32 msiAddrHi;
++	struct {
++		uint32 enable;
++		uint32 mask;
++		uint32 status;
++	} msiIntr[8];
++	uint32 unknown5[13];
++	uint32 miscControl1Off;
++	uint32 miscPortMultiLaneCtrl;
++	uint32 unknown6[15];
++
++	uint32 atuViewport;
++	uint32 atuCr1;
++	uint32 atuCr2;
++	uint32 atuBaseLo;
++	uint32 atuBaseHi;
++	uint32 atuLimit;
++	uint32 atuTargetLo;
++	uint32 atuTargetHi;
++	uint32 unknown7;
++	uint32 atuLimitHi;
++	uint32 unknown8[8];
++
++	uint32 msixDoorbell;
++	uint32 unknown9[117];
++
++	uint32 plChkRegControlStatus;
++	uint32 unknown10;
++	uint32 plChkRegErrAddr;
++	uint32 unknown11[309];
++};
++
++
++enum {
++	kPciAtuOffset = 0x300000,
++};
++
++enum {
++	kPciAtuOutbound  = 0,
++	kPciAtuInbound   = 1,
++};
++
++enum {
++	// ctrl1
++	kPciAtuTypeMem  = 0,
++	kPciAtuTypeIo   = 2,
++	kPciAtuTypeCfg0 = 4,
++	kPciAtuTypeCfg1 = 5,
++	// ctrl2
++	kPciAtuBarModeEnable = 1 << 30,
++	kPciAtuEnable        = 1 << 31,
++};
++
++struct PciAtuRegs {
++	uint32 ctrl1;
++	uint32 ctrl2;
++	uint32 baseLo;
++	uint32 baseHi;
++	uint32 limit;
++	uint32 targetLo;
++	uint32 targetHi;
++	uint32 unused[57];
++};
++
++
++enum {
++	kHostCtrlUnknown = 0,
++	kHostCtrlEcam = 1,
++	kHostCtrlSifive = 2,
++};
++
++extern uint32 gHostCtrlType;
++
++
++extern addr_t gPCIeConfigPhysBase;
++extern addr_t gPCIeConfigBase;
++extern size_t sPCIeConfigSize;
++
++extern addr_t gPCIeDbiPhysBase;
++extern addr_t gPCIeDbiBase;
++extern size_t gPCIeDbiSize;
++
++
++#endif	// _PCI_CONTROLLER_PRIVATE_H_
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.c b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.c
+deleted file mode 100644
+index 79738743dd..0000000000
+--- a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.c
++++ /dev/null
+@@ -1,61 +0,0 @@
+-/*
+- * Copyright 2009-2020, Haiku Inc., All rights reserved.
+- * Distributed under the terms of the MIT License.
+- */
+-
+-
+-#include "pci_io.h"
+-#include "pci_private.h"
+-#warning RISCV64: WRITEME
+-
+-
+-status_t
+-pci_io_init()
+-{
+-	return B_OK;
+-}
+-
+-
+-uint8
+-pci_read_io_8(int mapped_io_addr)
+-{
+-	/* NOT IMPLEMENTED */
+-	return 0;
+-}
+-
+-
+-void
+-pci_write_io_8(int mapped_io_addr, uint8 value)
+-{
+-	/* NOT IMPLEMENTED */
+-}
+-
+-
+-uint16
+-pci_read_io_16(int mapped_io_addr)
+-{
+-	/* NOT IMPLEMENTED */
+-	return 0;
+-}
+-
+-
+-void
+-pci_write_io_16(int mapped_io_addr, uint16 value)
+-{
+-	/* NOT IMPLEMENTED */
+-}
+-
+-
+-uint32
+-pci_read_io_32(int mapped_io_addr)
+-{
+-	/* NOT IMPLEMENTED */
+-	return 0;
+-}
+-
+-
+-void
+-pci_write_io_32(int mapped_io_addr, uint32 value)
+-{
+-	/* NOT IMPLEMENTED */
+-}
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.cpp b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.cpp
+new file mode 100644
+index 0000000000..b82c659e71
+--- /dev/null
++++ b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_io.cpp
+@@ -0,0 +1,76 @@
++/*
++ * Copyright 2009-2020, Haiku Inc., All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "pci_io.h"
++#include "pci_private.h"
++
++#include <AutoDeleterOS.h>
++
++
++extern addr_t gPCIeIoBase;
++extern size_t gPCIeIoSize;
++
++
++status_t
++pci_io_init()
++{
++	dprintf("pci_io_init()\n");
++	return B_OK;
++}
++
++
++uint8
++pci_read_io_8(int mapped_io_addr)
++{
++	dprintf("pci_read_io_8(%d)\n", mapped_io_addr);
++	volatile uint8* ptr = (uint8*)(gPCIeIoBase + mapped_io_addr);
++	return *ptr;
++}
++
++
++void
++pci_write_io_8(int mapped_io_addr, uint8 value)
++{
++	dprintf("pci_write_io_8(%d)\n", mapped_io_addr);
++	volatile uint8* ptr = (uint8*)(gPCIeIoBase + mapped_io_addr);
++	*ptr = value;
++}
++
++
++uint16
++pci_read_io_16(int mapped_io_addr)
++{
++	dprintf("pci_read_io_16(%d)\n", mapped_io_addr);
++	volatile uint16* ptr = (uint16*)(gPCIeIoBase + mapped_io_addr);
++	return *ptr;
++}
++
++
++void
++pci_write_io_16(int mapped_io_addr, uint16 value)
++{
++	dprintf("pci_write_io_16(%d)\n", mapped_io_addr);
++	volatile uint16* ptr = (uint16*)(gPCIeIoBase + mapped_io_addr);
++	*ptr = value;
++}
++
++
++uint32
++pci_read_io_32(int mapped_io_addr)
++{
++	dprintf("pci_read_io_32(%d)\n", mapped_io_addr);
++	volatile uint32* ptr = (uint32*)(gPCIeIoBase + mapped_io_addr);
++	return *ptr;
++}
++
++
++void
++pci_write_io_32(int mapped_io_addr, uint32 value)
++{
++	dprintf("pci_write_io_32(%d)\n", mapped_io_addr);
++	volatile uint32* ptr = (uint32*)(gPCIeIoBase + mapped_io_addr);
++	*ptr = value;
++}
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.cpp b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.cpp
+new file mode 100644
+index 0000000000..d7ff27dc2f
+--- /dev/null
++++ b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.cpp
+@@ -0,0 +1,80 @@
++#include "pci_msi.h"
++#include "pci_controller_private.h"
++#include <int.h>
++
++#include <kernel/debug.h>
++
++
++long gStartMsiIrq = 0;
++static uint32 sAllocatedMsiIrqs[1] = {0};
++static uint64 sMsiData = 0;
++phys_addr_t gMsiPhysAddr = 0;
++ 
++
++static inline volatile PciDbiRegs*
++GetDbuRegs()
++{
++	return (PciDbiRegs*)gPCIeDbiBase;
++}
++
++
++int32
++AllocMsiInterrupt()
++{
++	for (int i = 0; i < 32; i++) {
++		if (((1 << i) & sAllocatedMsiIrqs[0]) == 0) {
++			sAllocatedMsiIrqs[0] |= (1 << i);
++			GetDbuRegs()->msiIntr[0].mask &= ~(1 << i);
++			return i;
++		}
++	}
++	return B_ERROR;
++}
++
++
++void
++FreeMsiInterrupt(int32 irq)
++{
++	if (irq >= 0 && irq < 32 && ((1 << irq) & sAllocatedMsiIrqs[0]) != 0) {
++		GetDbuRegs()->msiIntr[0].mask |= (1 << (uint32)irq);
++		sAllocatedMsiIrqs[0] &= ~(1 << (uint32)irq);
++	}
++}
++
++
++static int32
++MsiInterruptHandler(void* arg)
++{
++//	dprintf("MsiInterruptHandler()\n");
++	uint32 status = GetDbuRegs()->msiIntr[0].status;
++	for (int i = 0; i < 32; i++) {
++		if (((1 << i) & status) != 0) {
++//			dprintf("MSI IRQ: %d (%ld)\n", i, gStartMsiIrq + i);
++			int_io_interrupt_handler(gStartMsiIrq + i, false);
++			GetDbuRegs()->msiIntr[0].status = (1 << i);
++		}
++	}
++	return B_HANDLED_INTERRUPT;
++}
++
++
++void
++InitPciMsi(int32 msiIrq)
++{
++	dprintf("InitPciMsi()\n");
++	dprintf("  msiIrq: %" B_PRId32 "\n", msiIrq);
++
++	physical_entry pe;
++	ASSERT_ALWAYS(get_memory_map(&sMsiData, sizeof(sMsiData), &pe, 1) >= B_OK);
++	gMsiPhysAddr = pe.address;
++	dprintf("  gMsiPhysAddr: %#" B_PRIxADDR "\n", gMsiPhysAddr);
++	GetDbuRegs()->msiAddrLo = (uint32)gMsiPhysAddr;
++	GetDbuRegs()->msiAddrHi = (uint32)(gMsiPhysAddr >> 32);
++
++	GetDbuRegs()->msiIntr[0].enable = 0xffffffff;
++	GetDbuRegs()->msiIntr[0].mask = 0xffffffff;
++
++	ASSERT_ALWAYS(install_io_interrupt_handler(msiIrq, MsiInterruptHandler, NULL, 0) >= B_OK);
++	ASSERT_ALWAYS(allocate_io_interrupt_vectors(32, &gStartMsiIrq, INTERRUPT_TYPE_IRQ) >= B_OK);
++	dprintf("  gStartMsiIrq: %ld\n", gStartMsiIrq);
++}
+diff --git a/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.h b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.h
+new file mode 100644
+index 0000000000..4f7a9ba991
+--- /dev/null
++++ b/src/add-ons/kernel/bus_managers/pci/arch/riscv64/pci_msi.h
+@@ -0,0 +1,18 @@
++#ifndef _PCI_MSI_H_
++#define _PCI_MSI_H_
++
++
++#include <SupportDefs.h>
++
++
++extern long gStartMsiIrq;
++extern phys_addr_t gMsiPhysAddr;
++
++
++int32 AllocMsiInterrupt();
++void FreeMsiInterrupt(int32 irq);
++
++void InitPciMsi(int32 msiIrq);
++
++
++#endif	// _PCI_MSI_H_
+diff --git a/src/add-ons/kernel/bus_managers/pci/pci.cpp b/src/add-ons/kernel/bus_managers/pci/pci.cpp
+index 346d8b5452..baa1e76a79 100644
+--- a/src/add-ons/kernel/bus_managers/pci/pci.cpp
++++ b/src/add-ons/kernel/bus_managers/pci/pci.cpp
+@@ -123,10 +123,6 @@ pci_reserve_device(uchar virtualBus, uchar device, uchar function,
+ 	//TRACE(("%s(%d [%d:%d], %d, %d, %s, %p)\n", __FUNCTION__, virtualBus,
+ 	//	domain, bus, device, function, driverName, nodeCookie));
+ 
+-	device_attr matchPCIRoot[] = {
+-		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {string: "PCI"}},
+-		{NULL}
+-	};
+ 	device_attr matchThis[] = {
+ 		// info about device
+ 		{B_DEVICE_BUS, B_STRING_TYPE, {string: "pci"}},
+@@ -152,19 +148,14 @@ pci_reserve_device(uchar virtualBus, uchar device, uchar function,
+ 		{"legacy_driver_cookie", B_UINT64_TYPE, {ui64: (uint64)nodeCookie}},
+ 		{NULL}
+ 	};
+-	device_node *root, *pci, *node, *legacy;
++	device_node *node, *legacy;
+ 
+ 	status = B_DEVICE_NOT_FOUND;
+-	root = gDeviceManager->get_root_node();
+-	if (!root)
+-		return status;
+-
+-	pci = NULL;
+-	if (gDeviceManager->get_next_child_node(root, matchPCIRoot, &pci) < B_OK)
+-		goto err0;
++	if (gPCIRootNode == NULL)
++		goto err1;
+ 
+ 	node = NULL;
+-	if (gDeviceManager->get_next_child_node(pci, matchThis, &node) < B_OK)
++	if (gDeviceManager->get_next_child_node(gPCIRootNode, matchThis, &node) < B_OK)
+ 		goto err1;
+ 
+ 	// common API for all legacy modules ?
+@@ -181,8 +172,6 @@ pci_reserve_device(uchar virtualBus, uchar device, uchar function,
+ 		goto err3;
+ 
+ 	gDeviceManager->put_node(node);
+-	gDeviceManager->put_node(pci);
+-	gDeviceManager->put_node(root);
+ 
+ 	return B_OK;
+ 
+@@ -191,9 +180,6 @@ err3:
+ err2:
+ 	gDeviceManager->put_node(node);
+ err1:
+-	gDeviceManager->put_node(pci);
+-err0:
+-	gDeviceManager->put_node(root);
+ 	TRACE(("pci_reserve_device for driver %s failed: %s\n", driverName,
+ 		strerror(status)));
+ 	return status;
+@@ -488,7 +474,6 @@ pci_init(void)
+ 
+ 	if (pci_controller_init() != B_OK) {
+ 		TRACE(("PCI: pci_controller_init failed\n"));
+-		panic("PCI: pci_controller_init failed\n");
+ 		return B_ERROR;
+ 	}
+ 
+diff --git a/src/add-ons/kernel/bus_managers/pci/pci_private.h b/src/add-ons/kernel/bus_managers/pci/pci_private.h
+index 0958ab6bb4..0787b40c6d 100644
+--- a/src/add-ons/kernel/bus_managers/pci/pci_private.h
++++ b/src/add-ons/kernel/bus_managers/pci/pci_private.h
+@@ -39,6 +39,8 @@ typedef struct pci_root_module_info {
+ extern pci_root_module_info gPCIRootModule;
+ extern pci_device_module_info gPCIDeviceModule;
+ 
++extern device_node* gPCIRootNode;
++
+ 
+ #ifdef __cplusplus
+ extern "C" {
+diff --git a/src/add-ons/kernel/bus_managers/pci/pci_root.cpp b/src/add-ons/kernel/bus_managers/pci/pci_root.cpp
+index 84382fb6db..7a7131eec4 100644
+--- a/src/add-ons/kernel/bus_managers/pci/pci_root.cpp
++++ b/src/add-ons/kernel/bus_managers/pci/pci_root.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <device_manager.h>
+ #include <PCI.h>
++#include <drivers/bus/FDT.h>
+ 
+ #include <string.h>
+ 
+@@ -19,16 +20,34 @@
+ #define PCI_ROOT_MODULE_NAME "bus_managers/pci/root/driver_v1"
+ 
+ 
++device_node* gPCIRootNode = NULL;
++
++
+ static float
+ pci_root_supports_device(device_node* parent)
+ {
+-	// make sure parent is really device root
+ 	const char* bus;
+-	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false))
+-		return B_ERROR;
+-
+-	if (strcmp(bus, "root"))
+-		return 0.0;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false) < B_OK)
++		return -1.0f;
++
++#ifdef __riscv
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++		false) < B_OK)
++		return -1.0f;
++
++	if (strcmp(bus, "fdt") != 0)
++		return 0.0f;
++
++	if (
++		strcmp(compatible, "pci-host-ecam-generic") != 0 &&
++		strcmp(compatible, "sifive,fu740-pcie") != 0
++	)
++		return 0.0f;
++#else
++	if (strcmp(bus, "root") != 0)
++		return 0.0f;
++#endif
+ 
+ 	return 1.0;
+ }
+@@ -37,6 +56,7 @@ pci_root_supports_device(device_node* parent)
+ static status_t
+ pci_root_register_device(device_node* parent)
+ {
++	dprintf("pci_root_register_device()\n");
+ // XXX how do we handle this for PPC?
+ // I/O port for PCI config space address
+ #define PCI_CONFIG_ADDRESS 0xcf8
+@@ -59,6 +79,7 @@ pci_root_register_device(device_node* parent)
+ static status_t
+ pci_root_register_child_devices(void* cookie)
+ {
++	dprintf("pci_root_register_child_devices()\n");
+ 	device_node* node = (device_node*)cookie;
+ 
+ 	pci_info info;
+@@ -66,7 +87,7 @@ pci_root_register_child_devices(void* cookie)
+ 		uint8 domain;
+ 		uint8 bus;
+ 		if (gPCI->ResolveVirtualBus(info.bus, &domain, &bus) != B_OK) {
+-dprintf("FAILED!!!!\n");
++			dprintf("ResolveVirtualBus(%u) failed\n", info.bus);
+ 			continue;
+ 		}
+ 
+@@ -103,7 +124,16 @@ dprintf("FAILED!!!!\n");
+ static status_t
+ pci_root_init(device_node* node, void** _cookie)
+ {
++	dprintf("pci_root_init()\n");
+ 	*_cookie = node;
++
++	gPCIRootNode = node;
++
++	module_info *module;
++	status_t res = get_module(B_PCI_MODULE_NAME, &module);
++	if (res < B_OK)
++		return res;
++
+ 	return B_OK;
+ }
+ 
+@@ -114,13 +144,19 @@ pci_root_std_ops(int32 op, ...)
+ 	switch (op) {
+ 		case B_MODULE_INIT:
+ 		{
++			dprintf("+pci_root\n");
++/*
+ 			module_info *module;
+ 			return get_module(B_PCI_MODULE_NAME, &module);
+ 				// this serializes our module initialization
++*/
++			return B_OK;
+ 		}
+ 
+ 		case B_MODULE_UNINIT:
+-			return put_module(B_PCI_MODULE_NAME);
++			dprintf("-pci_root\n");
++			// return put_module(B_PCI_MODULE_NAME);
++			return B_OK;
+ 	}
+ 
+ 	return B_BAD_VALUE;
+-- 
+2.30.2
+

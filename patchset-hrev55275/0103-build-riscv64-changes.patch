@@ -1,0 +1,177 @@
+From af9fb48b1797b104e28515b89f5066c294b6c2bf Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:20:20 +0900
+Subject: build: riscv64 changes
+
+Change-Id: Id3e36d92445caeb352da56fc55948ef17419c559
+---
+ build/jam/SystemLibraryRules              |  2 --
+ build/jam/images/definitions/regular      | 29 ++++++++----------
+ build/jam/packages/Haiku                  |  4 +--
+ build/jam/repositories/HaikuPorts/riscv64 | 36 +++++++++++++++++++++--
+ 4 files changed, 49 insertions(+), 22 deletions(-)
+
+diff --git a/build/jam/SystemLibraryRules b/build/jam/SystemLibraryRules
+index d7d75cc7f7..458190a570 100644
+--- a/build/jam/SystemLibraryRules
++++ b/build/jam/SystemLibraryRules
+@@ -169,8 +169,6 @@ rule TargetLibgcc asPath
+ 			# from the gcc_syslibs_devel build feature.
+ 			return [
+ 				BuildFeatureAttribute gcc_syslibs : libgcc_s.so.1 : $(flags)
+-			] [
+-				BuildFeatureAttribute gcc_syslibs_devel : libgcc.a : $(flags)
+ 			] ;
+ 		}
+ 	} else {
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index e376d3000a..23d78b393b 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -111,13 +111,11 @@ SYSTEM_ADD_ONS_DRIVERS_BT_H2 +=
+ 
+ SYSTEM_ADD_ONS_ACCELERANTS += [ FFilterByBuildFeatures
+ 	ati.accelerant
+-	x86,x86_64 @{
+-		intel_810.accelerant intel_extreme.accelerant
+-		matrox.accelerant
+-		nvidia.accelerant
+-		radeon.accelerant radeon_hd.accelerant
+-		via.accelerant
+-	}@ # x86,x86_64
++	intel_810.accelerant intel_extreme.accelerant
++	matrox.accelerant
++	nvidia.accelerant
++	radeon.accelerant radeon_hd.accelerant
++	via.accelerant
+ 	x86 @{
+ 		3dfx.accelerant neomagic.accelerant s3.accelerant
+ 	}@ # x86
+@@ -131,7 +129,8 @@ SYSTEM_ADD_ONS_TRANSLATORS += [ FFilterByBuildFeatures
+ 	ICOTranslator ICNSTranslator@libicns
+ 	JPEGTranslator@jpeg	JPEG2000Translator@jasper
+ 	PCXTranslator PNGTranslator@libpng PPMTranslator PSDTranslator
+-	RAWTranslator RTFTranslator
++	#RAWTranslator
++	RTFTranslator
+ 	SGITranslator
+ 	TGATranslator TIFFTranslator@tiff
+ 	WebPTranslator@libwebp WonderBrushTranslator
+@@ -207,13 +206,11 @@ SYSTEM_ADD_ONS_DRIVERS_AUDIO_OLD +=
+ 
+ SYSTEM_ADD_ONS_DRIVERS_GRAPHICS += [ FFilterByBuildFeatures
+ 	ati
+-	x86,x86_64 @{
+-		intel_810 intel_extreme
+-		matrox
+-		nvidia
+-		radeon radeon_hd
+-		via
+-	}@ # x86,x86_64
++	intel_810 intel_extreme
++	matrox
++	nvidia
++	radeon radeon_hd
++	via
+ 	x86 @{
+ 		3dfx
+ 		neomagic
+@@ -229,11 +226,11 @@ SYSTEM_ADD_ONS_DRIVERS_MIDI +=
+ 
+ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
+ 	# WLAN drivers
++	idualwifi7260
+ 	x86,x86_64 @{
+ 		aironetwifi atheroswifi
+ 		broadcom43xx
+ 		iprowifi2100 iprowifi2200 iprowifi3945 iprowifi4965
+-		idualwifi7260
+ 		marvell88w8363 marvell88w8335
+ 		ralinkwifi realtekwifi
+ 	}@ # x86,x86_64
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 11febe3ea0..a04e1c50a4 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -66,7 +66,7 @@ if $(TARGET_ARCH) = x86 || $(TARGET_ARCH) = x86_64 {
+ 
+ # drivers
+ AddNewDriversToPackage 				: wmi@x86,x86_64 ;
+-AddNewDriversToPackage disk			: nvme_disk@x86,x86_64 ;
++AddNewDriversToPackage disk			: nvme_disk ;
+ AddNewDriversToPackage disk mmc		: mmc_disk ;
+ AddNewDriversToPackage disk scsi	: scsi_cd scsi_disk ;
+ AddNewDriversToPackage disk virtual : virtio_block ram_disk ;
+@@ -201,7 +201,7 @@ AddBootModuleSymlinksToPackage
+ 	ide_isa@x86 isa@x86,x86_64 intel it8211
+ 	legacy_sata locked_pool
+ 	mmc mmc_disk
+-	nvme_disk@x86,x86_64
++	nvme_disk
+ 	openpic@ppc
+ 	packagefs pci
+ 	fdt@riscv64
+diff --git a/build/jam/repositories/HaikuPorts/riscv64 b/build/jam/repositories/HaikuPorts/riscv64
+index cc0d54719b..dfe5e0ed85 100644
+--- a/build/jam/repositories/HaikuPorts/riscv64
++++ b/build/jam/repositories/HaikuPorts/riscv64
+@@ -43,6 +43,38 @@ RemotePackageRepository HaikuPorts
+ 	texinfo-4.13a-1
+ 	zlib-1.2.11-1
+ 	zlib_devel-1.2.11-1
++	libpng16-1.6.37-1
++	libpng16_devel-1.6.37-1
++	libedit-20210419_3.1-1
++	libedit_devel-20210419_3.1-1
++	openssl-1.1.1k-1
++	openssl_devel-1.1.1k-1
++	openssl_man-1.1.1k-1
++	giflib-5.2.1-1
++	giflib_devel-5.2.1-1
++	ffmpeg-4.3-2
++	ffmpeg_devel-4.3-2
++	ffmpeg_tools-4.3-2
++	ffmpeg_avdevice-4.3-2
++	libogg-1.3.4-1
++	libogg_devel-1.3.4-1
++	libvorbis-1.3.7-1
++	libvorbis_devel-1.3.7-1
++	fluidlite-1.0.0-3
++	fluidlite_devel-1.0.0-3
++	zip-3.0-4
++	unzip-6.10c23-4
++	tar-1.34-1
++	gzip-1.10-1
++	bzip2-1.0.8-1
++	bzip2_devel-1.0.8-1
++	wget-1.21.1-1
++	diffutils-3.7-1
++	xz_utils-5.2.5-1
++	xz_utils_devel-5.2.5-1
++	nano-5.7-1
++	openssh-8.4p1-2
++	mandoc-1.14.3-2
+ 	:
+ 	# source packages
+ 	apr
+@@ -80,7 +112,7 @@ RemotePackageRepository HaikuPorts
+ 	jpeg
+ 	keymapswitcher
+ 	less
+-	libedit
++#	libedit
+ 	libiconv
+ #	libogg
+ 	libpcre
+@@ -101,7 +133,7 @@ RemotePackageRepository HaikuPorts
+ 	ncurses6
+ 	neon
+ 	openssh
+-	openssl
++#	openssl
+ 	p7zip
+ 	pe
+ 	perl
+-- 
+2.30.2
+

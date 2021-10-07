@@ -1,0 +1,160 @@
+From 2f8d58af7ee659e29bdd366a48c44120308bdc1e Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Tue, 14 Sep 2021 22:23:54 +0900
+Subject: [wip] radeon_hd: add clone support
+
+Change-Id: Ic03416473e1f374de9dc06e5a5113b5d0dc65e35
+---
+ .../accelerants/radeon_hd/accelerant.cpp      | 46 +++++++++++++++++++
+ .../accelerants/radeon_hd/accelerant_protos.h |  4 ++
+ src/add-ons/accelerants/radeon_hd/hooks.cpp   |  6 ++-
+ src/add-ons/accelerants/radeon_hd/mode.cpp    | 25 ++++++++++
+ 4 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/accelerants/radeon_hd/accelerant.cpp b/src/add-ons/accelerants/radeon_hd/accelerant.cpp
+index 4939654f31..00773b4bae 100644
+--- a/src/add-ons/accelerants/radeon_hd/accelerant.cpp
++++ b/src/add-ons/accelerants/radeon_hd/accelerant.cpp
+@@ -269,6 +269,52 @@ radeon_init_accelerant(int device)
+ }
+ 
+ 
++ssize_t
++radeon_accelerant_clone_info_size(void)
++{
++	// clone info is device name, so return its maximum size
++	return B_PATH_NAME_LENGTH;
++}
++
++
++void
++radeon_get_accelerant_clone_info(void* info)
++{
++	ioctl(gInfo->device, RADEON_GET_DEVICE_NAME, info, B_PATH_NAME_LENGTH);
++}
++
++
++status_t
++radeon_clone_accelerant(void* info)
++{
++	// create full device name
++	char path[B_PATH_NAME_LENGTH];
++	strcpy(path, "/dev/");
++	strlcat(path, (const char*)info, sizeof(path));
++
++	FileDescriptorCloser fd(open(path, B_READ_WRITE));
++	if (!fd.IsSet())
++		return errno;
++
++	status_t status = init_common(fd.Get(), true);
++	if (status < B_OK)
++		return status;
++
++	fd.Detach();
++
++	status = gInfo->mode_list_area = clone_area(
++		"radeon_hd cloned modes", (void**)&gInfo->mode_list,
++		B_ANY_ADDRESS, B_READ_AREA, gInfo->shared_info->mode_list_area);
++
++	if (status < B_OK) {
++		uninit_common();
++		return status;
++	}
++
++	return B_OK;
++}
++
++
+ /*! This function is called for both, the primary accelerant and all of
+ 	its clones.
+ */
+diff --git a/src/add-ons/accelerants/radeon_hd/accelerant_protos.h b/src/add-ons/accelerants/radeon_hd/accelerant_protos.h
+index 1f75ee39b0..421b394830 100644
+--- a/src/add-ons/accelerants/radeon_hd/accelerant_protos.h
++++ b/src/add-ons/accelerants/radeon_hd/accelerant_protos.h
+@@ -24,6 +24,9 @@ void spin(bigtime_t delay);
+ 
+ // general
+ status_t radeon_init_accelerant(int fd);
++ssize_t radeon_accelerant_clone_info_size(void);
++void radeon_get_accelerant_clone_info(void* info);
++status_t radeon_clone_accelerant(void* info);
+ void radeon_uninit_accelerant(void);
+ status_t radeon_get_accelerant_device_info(accelerant_device_info* di);
+ 
+@@ -36,6 +39,7 @@ status_t radeon_get_preferred_mode(display_mode* preferredMode);
+ status_t radeon_get_frame_buffer_config(frame_buffer_config* config);
+ status_t radeon_get_pixel_clock_limits(display_mode* mode,
+ 	uint32* low, uint32* high);
++status_t radeon_move_display(uint16 horizontalStart, uint16 verticalStart);
+ status_t radeon_get_edid_info(void* info, size_t size, uint32* edid_version);
+ 
+ // accelerant engine
+diff --git a/src/add-ons/accelerants/radeon_hd/hooks.cpp b/src/add-ons/accelerants/radeon_hd/hooks.cpp
+index 238c9624e8..808aaf2e27 100644
+--- a/src/add-ons/accelerants/radeon_hd/hooks.cpp
++++ b/src/add-ons/accelerants/radeon_hd/hooks.cpp
+@@ -21,13 +21,13 @@ get_accelerant_hook(uint32 feature, void* data)
+ 			return (void*)radeon_init_accelerant;
+ 		case B_UNINIT_ACCELERANT:
+ 			return (void*)radeon_uninit_accelerant;
+-		/*case B_CLONE_ACCELERANT:
++		case B_CLONE_ACCELERANT:
+ 			return (void*)radeon_clone_accelerant;
+ 		case B_ACCELERANT_CLONE_INFO_SIZE:
+ 			return (void*)radeon_accelerant_clone_info_size;
+ 		case B_GET_ACCELERANT_CLONE_INFO:
+ 			return (void*)radeon_get_accelerant_clone_info;
+-		case B_ACCELERANT_RETRACE_SEMAPHORE:
++		/*case B_ACCELERANT_RETRACE_SEMAPHORE:
+ 			return (void*)radeon_accelerant_retrace_semaphore;
+ 		*/
+ 		case B_GET_ACCELERANT_DEVICE_INFO:
+@@ -60,6 +60,8 @@ get_accelerant_hook(uint32 feature, void* data)
+ 			return (void*)radeon_get_frame_buffer_config;
+ 		case B_GET_PIXEL_CLOCK_LIMITS:
+ 			return (void*)radeon_get_pixel_clock_limits;
++		case B_MOVE_DISPLAY:
++			return (void*)radeon_move_display;
+ 
+ 		/* engine */
+ 		case B_ACCELERANT_ENGINE_COUNT:
+diff --git a/src/add-ons/accelerants/radeon_hd/mode.cpp b/src/add-ons/accelerants/radeon_hd/mode.cpp
+index c122a8db21..12c6048234 100644
+--- a/src/add-ons/accelerants/radeon_hd/mode.cpp
++++ b/src/add-ons/accelerants/radeon_hd/mode.cpp
+@@ -321,6 +321,31 @@ radeon_get_pixel_clock_limits(display_mode* mode, uint32* _low, uint32* _high)
+ }
+ 
+ 
++status_t
++radeon_move_display(uint16 horizontalStart, uint16 verticalStart)
++{
++	TRACE("%s\n", __func__);
++
++	uint8 crtcID = 0;
++	display_mode& mode = gInfo->shared_info->current_mode;
++	register_info* regs = gDisplay[crtcID]->regs;
++
++	if (horizontalStart + mode.timing.h_display > mode.virtual_width
++		|| verticalStart + mode.timing.v_display > mode.virtual_height)
++		return B_BAD_VALUE;
++
++	mode.h_display_start = horizontalStart;
++	mode.v_display_start = verticalStart;
++
++	if (!gDisplay[crtcID]->attached)
++		return B_OK;
++
++	Write32(CRT, regs->viewportStart, (mode.h_display_start << 16) | mode.v_display_start);
++
++	return B_OK;
++}
++
++
+ bool
+ is_mode_supported(display_mode* mode)
+ {
+-- 
+2.30.2
+

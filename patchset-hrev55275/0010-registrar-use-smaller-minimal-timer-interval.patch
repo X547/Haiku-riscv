@@ -1,0 +1,37 @@
+From 95295b598c50ac30d2a4dca972418668451e9989 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Fri, 5 Jun 2020 14:06:19 +0900
+Subject: registrar: use smaller minimal timer interval
+
+Change-Id: Ie0788ba9b48597bb9cead20b3125af251b5b59cf
+---
+ src/servers/registrar/MessageRunnerManager.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/servers/registrar/MessageRunnerManager.cpp b/src/servers/registrar/MessageRunnerManager.cpp
+index 2df05d914d..9b04157827 100644
+--- a/src/servers/registrar/MessageRunnerManager.cpp
++++ b/src/servers/registrar/MessageRunnerManager.cpp
+@@ -64,8 +64,8 @@ using std::nothrow;
+ 
+ using namespace BPrivate;
+ 
+-//! The minimal time interval for message runners (50 ms).
+-static const bigtime_t kMininalTimeInterval = 50000LL;
++//! The minimal time interval for message runners (1 us).
++static const bigtime_t kMininalTimeInterval = 1LL;
+ 
+ 
+ static bigtime_t
+@@ -101,7 +101,7 @@ public:
+ 	/*!	\brief Hook method invoked when the event is executed.
+ 
+ 		Implements Event. Calls MessageRunnerManager::_DoEvent().
+-		
++
+ 		\param queue The event queue executing the event.
+ 		\return \c true, if the object shall be deleted, \c false otherwise.
+ 	*/
+-- 
+2.30.2
+

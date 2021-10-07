@@ -1,0 +1,34 @@
+From a0a2bac8a59b32fdf398f31a3ceeaad60f63f2fc Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 1 Jun 2020 10:21:48 +0900
+Subject: WebPositive: Fix crash for libbe_test
+
+Change-Id: I509484a2e7f91cf1f39ec249c079564e58a38f0d
+---
+ src/apps/webpositive/BrowserWindow.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/apps/webpositive/BrowserWindow.cpp b/src/apps/webpositive/BrowserWindow.cpp
+index df85ebbe88..b188e6cb01 100644
+--- a/src/apps/webpositive/BrowserWindow.cpp
++++ b/src/apps/webpositive/BrowserWindow.cpp
+@@ -671,6 +671,8 @@ BrowserWindow::BrowserWindow(BRect frame, SettingsMessage* appSettings,
+ 		AddShortcut(numStr[0], B_COMMAND_KEY, selectTab);
+ 	}
+ 
++// BKeymap is not working for libbe_test
++#ifndef HAIKU_TARGET_PLATFORM_LIBBE_TEST
+ 	BKeymap keymap;
+ 	keymap.SetToCurrent();
+ 	BObjectList<const char> unmodified(3, true);
+@@ -687,6 +689,7 @@ BrowserWindow::BrowserWindow(BRect frame, SettingsMessage* appSettings,
+ 		}
+ 	}
+ 	unmodified.MakeEmpty();
++#endif
+ 
+ 	be_app->PostMessage(WINDOW_OPENED);
+ }
+-- 
+2.30.2
+

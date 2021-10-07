@@ -1,0 +1,216 @@
+From 98c636b76e83cdc5511cd031476c951ae3b70201 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:21:24 +0900
+Subject: [WIP] haiku_loader.riscv: update for SMP support
+
+Change-Id: Ic3f83e80347036727a06eb6199c44e00079fb304
+---
+ src/system/boot/platform/riscv/Jamfile   |  1 +
+ src/system/boot/platform/riscv/fdt.cpp   | 52 ++++++++++++++++++++++--
+ src/system/boot/platform/riscv/smp.cpp   | 37 +++++++++++++++++
+ src/system/boot/platform/riscv/smp.h     | 16 ++++++++
+ src/system/boot/platform/riscv/start.cpp |  8 ++--
+ 5 files changed, 107 insertions(+), 7 deletions(-)
+
+diff --git a/src/system/boot/platform/riscv/Jamfile b/src/system/boot/platform/riscv/Jamfile
+index c1349cfb1b..4d8e9ad04e 100644
+--- a/src/system/boot/platform/riscv/Jamfile
++++ b/src/system/boot/platform/riscv/Jamfile
+@@ -32,6 +32,7 @@ for platform in [ MultiBootSubDirSetup riscv ] {
+ 			menu.cpp
+ 			mmu.cpp
+ 			cpu.cpp
++			smp.cpp
+ 			video.cpp
+ 
+ 			fdt.cpp
+diff --git a/src/system/boot/platform/riscv/fdt.cpp b/src/system/boot/platform/riscv/fdt.cpp
+index 80cb0692e9..970e23a6a7 100644
+--- a/src/system/boot/platform/riscv/fdt.cpp
++++ b/src/system/boot/platform/riscv/fdt.cpp
+@@ -9,12 +9,14 @@
+ #include <ByteOrder.h>
+ #include <KernelExport.h>
+ #include <boot/stage2.h>
++#include <arch_cpu_defs.h>
+ 
+ extern "C" {
+ #include <libfdt.h>
+ }
+ 
+ #include "mmu.h"
++#include "smp.h"
+ #include "graphics.h"
+ #include "virtio.h"
+ #include "Htif.h"
+@@ -47,6 +49,34 @@ HasFdtString(const char* prop, int size, const char* pattern)
+ }
+ 
+ 
++static bool
++GetReg(const void* fdt, int node, uint32 addressCells, uint32 sizeCells, size_t idx, addr_range& range)
++{
++	int propSize;
++	const uint8* prop = (const uint8*)fdt_getprop(fdt, node, "reg", &propSize);
++	if (prop == NULL)
++		return false;
++
++	size_t entrySize = 4*(addressCells + sizeCells);
++	if ((idx + 1)*entrySize > (size_t)propSize)
++		return false;
++
++	prop += idx*entrySize;
++
++	switch (addressCells) {
++		case 1: range.start = fdt32_to_cpu(*(uint32*)prop); prop += 4; break;
++		case 2: range.start = fdt64_to_cpu(*(uint64*)prop); prop += 8; break;
++		default: panic("unsupported addressCells");
++	}
++	switch (sizeCells) {
++		case 1: range.size = fdt32_to_cpu(*(uint32*)prop); prop += 4; break;
++		case 2: range.size = fdt64_to_cpu(*(uint64*)prop); prop += 8; break;
++		default: panic("unsupported sizeCells");
++	}
++	return true;
++}
++
++
+ static uint32
+ GetInterrupt(const void* fdt, int node)
+ {
+@@ -92,9 +122,25 @@ HandleFdt(const void* fdt, int node, uint32 addressCells, uint32 sizeCells,
+ 		sClint.size  = fdt64_to_cpu(*(reg + 1));
+ 		gClintRegs = (ClintRegs*)sClint.start;
+ 	} else if (HasFdtString(compatible, compatibleLen, "riscv,plic0")) {
+-		uint64* reg = (uint64*)fdt_getprop(fdt, node, "reg", NULL);
+-		sPlic.start = fdt64_to_cpu(*(reg + 0));
+-		sPlic.size  = fdt64_to_cpu(*(reg + 1));
++		GetReg(fdt, node, addressCells, sizeCells, 0, sPlic);
++		int propSize;
++		if (uint32* prop = (uint32*)fdt_getprop(fdt, node, "interrupts-extended", &propSize)) {
++			dprintf("PLIC contexts\n");
++			uint32 contextId = 0;
++			for (uint32 *it = prop; (uint8_t*)it - (uint8_t*)prop < propSize; it += 2) {
++				uint32 phandle = fdt32_to_cpu(*it);
++				uint32 interrupt = fdt32_to_cpu(*(it + 1));
++				if (interrupt == sExternInt) {
++					CpuInfo* cpuInfo = smp_find_cpu(phandle);
++					dprintf("  context %" B_PRIu32 ": %" B_PRIu32 "\n", contextId, phandle);
++					if (cpuInfo != NULL) {
++						cpuInfo->plicContext = contextId;
++						dprintf("    hartId: %" B_PRIu32 "\n", cpuInfo->hartId);
++					}
++				}
++				contextId++;
++			}
++		}
+ 	} else if (HasFdtString(compatible, compatibleLen, "virtio,mmio")) {
+ 		uint64* reg = (uint64*)fdt_getprop(fdt, node, "reg", NULL);
+ 		virtio_register(
+diff --git a/src/system/boot/platform/riscv/smp.cpp b/src/system/boot/platform/riscv/smp.cpp
+index 39e91d8ed5..29037fdc88 100644
+--- a/src/system/boot/platform/riscv/smp.cpp
++++ b/src/system/boot/platform/riscv/smp.cpp
+@@ -5,3 +5,40 @@
+ 
+ 
+ #include "smp.h"
++
++#include <boot/stage2.h>
++
++
++static CpuInfo sCpus[SMP_MAX_CPUS];
++uint32 sCpuCount = 0;
++
++
++CpuInfo*
++smp_find_cpu(uint32 phandle)
++{
++	return &sCpus[0];
++}
++
++
++void
++smp_init_other_cpus(void)
++{
++	gKernelArgs.num_cpus = 1;
++	for (uint32 i = 0; i < gKernelArgs.num_cpus; i++) {
++		gKernelArgs.arch_args.hartIds[i] = sCpus[i].hartId;
++		gKernelArgs.arch_args.plicContexts[i] = sCpus[i].plicContext;
++	}
++}
++
++
++void
++smp_boot_other_cpus(uint64 pageTable, uint64 kernel_entry)
++{
++}
++
++
++void
++smp_init()
++{
++	sCpus[0].hartId = 0;
++}
+diff --git a/src/system/boot/platform/riscv/smp.h b/src/system/boot/platform/riscv/smp.h
+index 21103dd8d3..9e973ebfd7 100644
+--- a/src/system/boot/platform/riscv/smp.h
++++ b/src/system/boot/platform/riscv/smp.h
+@@ -37,4 +37,20 @@ struct Mutex
+ };
+ 
+ 
++struct CpuInfo
++{
++	uint32 phandle;
++	uint32 hartId;
++	uint32 plicContext;
++};
++
++
++CpuInfo* smp_find_cpu(uint32 phandle);
++
++void smp_init_other_cpus(void);
++void smp_boot_other_cpus(uint64 pageTable, uint64 kernel_entry);
++
++void smp_init();
++
++
+ #endif	// _SMP_H_
+diff --git a/src/system/boot/platform/riscv/start.cpp b/src/system/boot/platform/riscv/start.cpp
+index 686dec70fc..163d5a1bee 100644
+--- a/src/system/boot/platform/riscv/start.cpp
++++ b/src/system/boot/platform/riscv/start.cpp
+@@ -159,10 +159,8 @@ platform_start_kernel(void)
+ 	preloaded_elf64_image* image = static_cast<preloaded_elf64_image*>(
+ 		gKernelArgs.kernel_image.Pointer());
+ 
+-	//smp_init_other_cpus();
++	smp_init_other_cpus();
+ 	//serial_cleanup();
+-	//mmu_init_for_kernel();
+-	//smp_boot_other_cpus();
+ 
+ 	// Avoid interrupts from virtio devices before kernel driver takes control.
+ 	virtio_fini();
+@@ -176,6 +174,8 @@ platform_start_kernel(void)
+ 	uint64 satp;
+ 	mmu_init_for_kernel(satp);
+ 
++	smp_boot_other_cpus(satp, image->elf_header.e_entry);
++
+ 	dprintf("kernel entry: %lx\n", image->elf_header.e_entry);
+ 	dprintf("args: %lx\n", (addr_t)args);
+ 
+@@ -214,7 +214,7 @@ _start(int hartId, void* fdt)
+ 	cpu_init();
+ 	mmu_init();
+ 	//apm_init();
+-	//smp_init();
++	smp_init();
+ 
+ 	main(&args);
+ }
+-- 
+2.30.2
+

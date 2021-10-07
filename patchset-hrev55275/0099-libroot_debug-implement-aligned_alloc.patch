@@ -1,0 +1,44 @@
+From f5acd29cba2c715db8e23c1d3d4d40f679486f97 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sat, 4 Sep 2021 13:57:49 +0900
+Subject: libroot_debug: implement aligned_alloc
+
+Change-Id: I321c5cfd3b4c10bd6f827906c9e2400b0caa0926
+---
+ .../libroot/posix/malloc_debug/malloc_debug_api.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/system/libroot/posix/malloc_debug/malloc_debug_api.cpp b/src/system/libroot/posix/malloc_debug/malloc_debug_api.cpp
+index 9f03044188..ebd9985bba 100644
+--- a/src/system/libroot/posix/malloc_debug/malloc_debug_api.cpp
++++ b/src/system/libroot/posix/malloc_debug/malloc_debug_api.cpp
+@@ -12,6 +12,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#include <errno_private.h>
++
+ 
+ static heap_implementation* sCurrentHeap = NULL;
+ 
+@@ -242,6 +244,17 @@ memalign(size_t alignment, size_t size)
+ }
+ 
+ 
++extern "C" void *
++aligned_alloc(size_t alignment, size_t size)
++{
++	if (size % alignment != 0) {
++		__set_errno(B_BAD_VALUE);
++		return NULL;
++	}
++	return memalign(alignment, size);
++}
++
++
+ extern "C" void*
+ malloc(size_t size)
+ {
+-- 
+2.30.2
+

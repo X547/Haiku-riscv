@@ -1,0 +1,26 @@
+From b63ca0c560c12081a0b72484415113bc7f7a9edc Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Wed, 26 May 2021 12:53:19 +0900
+Subject: libroot: exit thread by syscall when finished
+
+This reverts commit 51d414dddc9221816efc0a9d5dd988f08e927cbb.
+---
+ src/system/libroot/os/thread.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/system/libroot/os/thread.c b/src/system/libroot/os/thread.c
+index c278e660f1..2bb71d357a 100644
+--- a/src/system/libroot/os/thread.c
++++ b/src/system/libroot/os/thread.c
+@@ -45,6 +45,8 @@ thread_entry(void* _entry, void* _thread)
+ 
+ 	_thread_do_exit_work();
+ 	__heap_thread_exit();
++	
++	_kern_exit_thread(returnCode);
+ 
+ 	return returnCode;
+ }
+-- 
+2.30.2
+

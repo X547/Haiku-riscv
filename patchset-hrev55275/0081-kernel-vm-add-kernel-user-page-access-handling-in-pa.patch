@@ -1,0 +1,186 @@
+From 9cc72418ceabea5385806931c008ff8d3bf45974 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 02:54:50 +0900
+Subject: kernel/vm: add kernel user page access handling in page fault handler
+
+Change-Id: Id20e6f1b23fb64bb0aa2eebd9d006f62e8fee0d1
+---
+ headers/private/kernel/vm/vm_priv.h     |  2 +-
+ src/system/kernel/arch/x86/arch_int.cpp |  1 +
+ src/system/kernel/vm/vm.cpp             | 50 +++++++++++++++++--------
+ 3 files changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/headers/private/kernel/vm/vm_priv.h b/headers/private/kernel/vm/vm_priv.h
+index 9091c60c81..5568ae8f45 100644
+--- a/headers/private/kernel/vm/vm_priv.h
++++ b/headers/private/kernel/vm/vm_priv.h
+@@ -28,7 +28,7 @@ extern "C" {
+ 
+ // Should only be used by vm internals
+ status_t vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite,
+-	bool isExecute, bool isUser, addr_t *newip);
++	bool isExecute, bool isUser, bool allowUserPageAccess, addr_t *newip);
+ void vm_unreserve_memory(size_t bytes);
+ status_t vm_try_reserve_memory(size_t bytes, int priority, bigtime_t timeout);
+ status_t vm_daemon_init(void);
+diff --git a/src/system/kernel/arch/x86/arch_int.cpp b/src/system/kernel/arch/x86/arch_int.cpp
+index 416e9d21c4..5071a83a74 100644
+--- a/src/system/kernel/arch/x86/arch_int.cpp
++++ b/src/system/kernel/arch/x86/arch_int.cpp
+@@ -350,6 +350,7 @@ x86_page_fault_exception(struct iframe* frame)
+ 		(frame->error_code & PGFAULT_W) != 0,		// write access
+ 		(frame->error_code & PGFAULT_I) != 0,		// instruction fetch
+ 		IFRAME_IS_USER(frame),						// userland
++		true,
+ 		&newip);
+ 	if (newip != 0) {
+ 		// the page fault handler wants us to modify the iframe to set the
+diff --git a/src/system/kernel/vm/vm.cpp b/src/system/kernel/vm/vm.cpp
+index db05933b19..f4c78bf45c 100644
+--- a/src/system/kernel/vm/vm.cpp
++++ b/src/system/kernel/vm/vm.cpp
+@@ -272,7 +272,8 @@ static cache_info* sCacheInfoTable;
+ static void delete_area(VMAddressSpace* addressSpace, VMArea* area,
+ 	bool addressSpaceCleanup);
+ static status_t vm_soft_fault(VMAddressSpace* addressSpace, addr_t address,
+-	bool isWrite, bool isExecute, bool isUser, vm_page** wirePage);
++	bool isWrite, bool isExecute, bool isUser, bool allowUserPageAccess,
++	vm_page** wirePage);
+ static status_t map_backing_store(VMAddressSpace* addressSpace,
+ 	VMCache* cache, off_t offset, const char* areaName, addr_t size, int wiring,
+ 	int protection, int protectionMax, int mapping, uint32 flags,
+@@ -4370,7 +4371,7 @@ forbid_page_faults(void)
+ 
+ status_t
+ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+-	bool isUser, addr_t* newIP)
++	bool isUser, bool allowUserPageAccess, addr_t* newIP)
+ {
+ 	FTRACE(("vm_page_fault: page fault at 0x%lx, ip 0x%lx\n", address,
+ 		faultAddress));
+@@ -4414,7 +4415,7 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 
+ 	if (status == B_OK) {
+ 		status = vm_soft_fault(addressSpace, pageAddress, isWrite, isExecute,
+-			isUser, NULL);
++			isUser, allowUserPageAccess, NULL);
+ 	}
+ 
+ 	if (status < B_OK) {
+@@ -4431,14 +4432,18 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 				*newIP = reinterpret_cast<uintptr_t>(thread->fault_handler);
+ 				dprintf("*newIP = 0x%" B_PRIxADDR "\n", *newIP);
+ 			} else {
++#ifdef __riscv
+ 				WriteTrapInfo();
++#endif
+ 				// unhandled page fault in the kernel
+ 				panic("vm_page_fault: unhandled page fault in kernel space at "
+ 					"0x%lx, ip 0x%lx\n", address, faultAddress);
+ 			}
+ 		} else {
++#ifdef __riscv
+ 			WriteTrapInfo();
+ 			DoStackTrace(Fp(), 0);
++#endif
+ 			Thread* thread = thread_get_current_thread();
+ 
+ #ifdef TRACE_FAULTS
+@@ -4690,11 +4695,13 @@ fault_get_page(PageFaultContext& context)
+ */
+ static status_t
+ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
+-	bool isWrite, bool isExecute, bool isUser, vm_page** wirePage)
++	bool isWrite, bool isExecute, bool isUser, bool allowUserPageAccess,
++	vm_page** wirePage)
+ {
+ 	FTRACE(("vm_soft_fault: thid 0x%" B_PRIx32 " address 0x%" B_PRIxADDR ", "
+-		"isWrite %d, isUser %d\n", thread_get_current_thread_id(),
+-		originalAddress, isWrite, isUser));
++		"isWrite %d, isUser %d, allowUserpageAccess %d\n",
++		thread_get_current_thread_id(), originalAddress,
++		isWrite, isUser, allowUserpageAccess));
+ 
+ 	PageFaultContext context(addressSpace, isWrite);
+ 
+@@ -4730,8 +4737,8 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
+ 		// check permissions
+ 		uint32 protection = get_area_page_protection(area, address);
+ 		if (isUser && (protection & B_USER_PROTECTION) == 0) {
+-			dprintf("user access on kernel area 0x%" B_PRIx32 " at %p\n",
+-				area->id, (void*)originalAddress);
++			dprintf("user access on kernel area %" B_PRId32 "(%s) at %p\n",
++				area->id, area->name, (void*)originalAddress);
+ 			TPF(PageFaultError(area->id,
+ 				VMPageFaultTracing::PAGE_FAULT_ERROR_KERNEL_ONLY));
+ 			status = B_PERMISSION_DENIED;
+@@ -4739,8 +4746,9 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
+ 		}
+ 		if (isWrite && (protection
+ 				& (B_WRITE_AREA | (isUser ? 0 : B_KERNEL_WRITE_AREA))) == 0) {
+-			dprintf("write access attempted on write-protected area 0x%"
+-				B_PRIx32 " at %p\n", area->id, (void*)originalAddress);
++			dprintf("write access attempted on write-protected area %"
++				B_PRId32 "(%s) at %p\n", area->id, area->name,
++				(void*)originalAddress);
+ 			TPF(PageFaultError(area->id,
+ 				VMPageFaultTracing::PAGE_FAULT_ERROR_WRITE_PROTECTED));
+ 			status = B_PERMISSION_DENIED;
+@@ -4748,22 +4756,32 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
+ 		} else if (isExecute && (protection
+ 				& (B_EXECUTE_AREA
+ 					| (isUser ? 0 : B_KERNEL_EXECUTE_AREA))) == 0) {
+-			dprintf("instruction fetch attempted on execute-protected area 0x%"
+-				B_PRIx32 " at %p\n", area->id, (void*)originalAddress);
++			dprintf("instruction fetch attempted on execute-protected area %"
++				B_PRId32 "(%s) at %p\n", area->id, area->name,
++				(void*)originalAddress);
+ 			TPF(PageFaultError(area->id,
+ 				VMPageFaultTracing::PAGE_FAULT_ERROR_EXECUTE_PROTECTED));
+ 			status = B_PERMISSION_DENIED;
+ 			break;
+ 		} else if (!isWrite && !isExecute && (protection
+ 				& (B_READ_AREA | (isUser ? 0 : B_KERNEL_READ_AREA))) == 0) {
+-			dprintf("read access attempted on read-protected area 0x%" B_PRIx32
+-				" at %p\n", area->id, (void*)originalAddress);
++			dprintf("read access attempted on read-protected area %" B_PRId32
++				"(%s) at %p\n", area->id, area->name, (void*)originalAddress);
+ 			TPF(PageFaultError(area->id,
+ 				VMPageFaultTracing::PAGE_FAULT_ERROR_READ_PROTECTED));
+ 			status = B_PERMISSION_DENIED;
+ 			break;
+ 		}
+ 
++		if (!isUser && !allowUserPageAccess
++			&& (protection & B_USER_PROTECTION) != 0) {
++			dprintf("kernel access with user page access disabled on user area"
++				" %" B_PRId32 "(%s) at %p\n", area->id, area->name,
++				(void*)originalAddress);
++			status = B_PERMISSION_DENIED;
++			break;
++		}
++
+ 		// We have the area, it was a valid access, so let's try to resolve the
+ 		// page fault now.
+ 		// At first, the top most cache from the area is investigated.
+@@ -5610,7 +5628,7 @@ vm_wire_page(team_id team, addr_t address, bool writable,
+ 		addressSpaceLocker.Unlock();
+ 
+ 		error = vm_soft_fault(addressSpace, pageAddress, writable, false,
+-			isUser, &page);
++			isUser, true, &page);
+ 
+ 		if (error != B_OK) {
+ 			// The page could not be mapped -- clean up.
+@@ -5790,7 +5808,7 @@ lock_memory_etc(team_id team, void* address, size_t numBytes, uint32 flags)
+ 				addressSpaceLocker.Unlock();
+ 
+ 				error = vm_soft_fault(addressSpace, nextAddress, writable,
+-					false, isUser, &page);
++					false, isUser, true, &page);
+ 
+ 				addressSpaceLocker.Lock();
+ 				cacheChainLocker.SetTo(vm_area_get_locked_cache(area));
+-- 
+2.30.2
+

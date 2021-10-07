@@ -1,0 +1,60 @@
+From c5f279907aed8dd0f0561209ca21bd32e2d13200 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:46:48 +0900
+Subject: SlimDemo: update
+
+Change-Id: Ie0fcf1d5e654dee227b6143461c0797762b7580d
+---
+ src/tests/servers/app/SlimDemo/main.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/tests/servers/app/SlimDemo/main.c b/src/tests/servers/app/SlimDemo/main.c
+index 02c0b322c2..d467a59449 100644
+--- a/src/tests/servers/app/SlimDemo/main.c
++++ b/src/tests/servers/app/SlimDemo/main.c
+@@ -192,6 +192,7 @@ status_t get_and_set_mode(GetAccelerantHook gah, display_mode *dm) {
+ 	propose_display_mode pdm;
+ 	status_t result = B_ERROR;
+ 	set_display_mode sdm;
++	set_dpms_mode SetDpmsMode;
+ 
+ 	/* find the propose mode hook */
+ 	pdm = gah(B_PROPOSE_DISPLAY_MODE, NULL);
+@@ -206,6 +207,8 @@ status_t get_and_set_mode(GetAccelerantHook gah, display_mode *dm) {
+ 		goto exit0;
+ 	}
+ 
++	SetDpmsMode = gah(B_SET_DPMS_MODE, NULL);
++
+ 	/* how many modes does the driver support */
+ 	gmc = gah(B_ACCELERANT_MODE_COUNT, NULL);
+ 	if (!gmc) {
+@@ -234,8 +237,16 @@ status_t get_and_set_mode(GetAccelerantHook gah, display_mode *dm) {
+ 
+ 	/* take the first mode in the list */
+ 	target = high = low = *mode_list;
++/*
++	for (uint32 i = 0; i < mode_count; i++) {
++		if ((mode_list[i].space & ~0x3000) == B_RGB32_LITTLE || (mode_list[i].space & ~0x3000) == B_RGB32_BIG) {
++			target = high = low = mode_list[i];
++			break;
++		}
++	}
++*/
+ 	/* make as tall a virtual height as possible */
+-	target.virtual_height = high.virtual_height = 0xffff;
++	target.virtual_height = high.virtual_height = 2*target.virtual_height;
+ 	/* propose the display mode */
+ 	if (pdm(&target, &low, &high) == B_ERROR) {
+ 		debug_printf("propose_display_mode failed\n");
+@@ -248,6 +259,7 @@ status_t get_and_set_mode(GetAccelerantHook gah, display_mode *dm) {
+ 		debug_printf("set display mode failed\n");
+ 		goto free_mode_list;
+ 	}
++	SetDpmsMode(B_DPMS_ON);
+ 	/* note the mode and success */
+ 	*dm = target;
+ 	result = B_OK;
+-- 
+2.30.2
+

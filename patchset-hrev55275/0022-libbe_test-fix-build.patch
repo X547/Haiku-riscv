@@ -1,0 +1,26 @@
+From cff6e5b7f868621821f4bae6b7ee8b49c90457d7 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 30 Nov 2020 11:33:45 +0900
+Subject: libbe_test: fix build
+
+Change-Id: Ib864df378b403266c614941c0dedcb4cdae9a0e3
+---
+ src/apps/processcontroller/Jamfile | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/apps/processcontroller/Jamfile b/src/apps/processcontroller/Jamfile
+index 8d98329a5d..2bbd118224 100644
+--- a/src/apps/processcontroller/Jamfile
++++ b/src/apps/processcontroller/Jamfile
+@@ -1,6 +1,8 @@
+ SubDir HAIKU_TOP src apps processcontroller ;
+ 
++if $(TARGET_PLATFORM) = libbe_test {
+ SetSubDirSupportedPlatforms libbe_test ;
++}
+ 
+ UsePrivateSystemHeaders ;
+ UsePrivateHeaders app interface shared ;
+-- 
+2.30.2
+

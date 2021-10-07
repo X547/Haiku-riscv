@@ -1,0 +1,55 @@
+From a1ebdafde407c6c8f3c925727d1cde248541559f Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 24 May 2021 03:34:56 +0900
+Subject: drivers/vesa: fix for RISC-V
+
+Change-Id: I1f38f92d81fbfe47224893e1d9dbf6a74306e2f0
+---
+ src/add-ons/kernel/drivers/graphics/vesa/driver.cpp | 7 ++++++-
+ src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp   | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/vesa/driver.cpp b/src/add-ons/kernel/drivers/graphics/vesa/driver.cpp
+index 28cb549589..54070bb5e5 100644
+--- a/src/add-ons/kernel/drivers/graphics/vesa/driver.cpp
++++ b/src/add-ons/kernel/drivers/graphics/vesa/driver.cpp
+@@ -68,9 +68,12 @@ init_driver(void)
+ 
+ 	memset(gDeviceInfo[0], 0, sizeof(vesa_info));
+ 
+-	status_t status = get_module(B_ISA_MODULE_NAME, (module_info**)&gISA);
++	status_t status;
++#ifndef __riscv
++	status = get_module(B_ISA_MODULE_NAME, (module_info**)&gISA);
+ 	if (status != B_OK)
+ 		goto err1;
++#endif
+ 
+ 	gDeviceNames[0] = strdup("graphics/vesa");
+ 	if (gDeviceNames[0] == NULL) {
+@@ -85,7 +88,9 @@ init_driver(void)
+ 
+ err2:
+ 	put_module(B_ISA_MODULE_NAME);
++#ifndef __riscv
+ err1:
++#endif
+ 	free(gDeviceInfo[0]);
+ 	return status;
+ }
+diff --git a/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp b/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
+index dc155aec29..5004c4b0be 100644
+--- a/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
++++ b/src/add-ons/kernel/drivers/graphics/vesa/vesa.cpp
+@@ -289,7 +289,7 @@ remap_frame_buffer(vesa_info& info, addr_t physicalBase, uint32 width,
+ 	if (!info.complete_frame_buffer_mapped) {
+ 		addr_t base = physicalBase;
+ 		size_t size = bytesPerRow * height;
+-		bool remap = !initializing;
++		bool remap = true;
+ 
+ 		if (info.physical_frame_buffer_size != 0) {
+ 			// we can map the complete frame buffer
+-- 
+2.30.2
+

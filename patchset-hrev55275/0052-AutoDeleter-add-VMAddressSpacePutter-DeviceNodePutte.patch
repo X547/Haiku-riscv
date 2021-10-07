@@ -1,0 +1,61 @@
+From 37d85e6ecf06eeb2735d2ab378e72dc08f619441 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Wed, 26 May 2021 22:23:38 +0900
+Subject: AutoDeleter: add VMAddressSpacePutter, DeviceNodePutter
+
+Change-Id: I705de24f6a87287943814e748d5a02e43b029e60
+---
+ headers/private/shared/AutoDeleterDrivers.h | 23 +++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/headers/private/shared/AutoDeleterDrivers.h b/headers/private/shared/AutoDeleterDrivers.h
+index c290ede37f..eb9835ad90 100644
+--- a/headers/private/shared/AutoDeleterDrivers.h
++++ b/headers/private/shared/AutoDeleterDrivers.h
+@@ -11,6 +11,8 @@
+ #if defined(_KERNEL_MODE) && !defined(_BOOT_MODE)
+ #include <vfs.h>
+ #include <fs/fd.h>
++#include <vm/VMAddressSpace.h>
++#include <device_manager.h>
+ #endif
+ 
+ 
+@@ -23,6 +25,25 @@ typedef CObjectDeleter<void, status_t, unload_driver_settings> DriverSettingsUnl
+ 
+ typedef CObjectDeleter<struct vnode, void, vfs_put_vnode> VnodePutter;
+ typedef CObjectDeleter<file_descriptor, void, put_fd> DescriptorPutter;
++typedef MethodDeleter<VMAddressSpace, void, &VMAddressSpace::Put> VMAddressSpacePutter;
++
++#if __GNUC__ >= 4
++
++template <device_manager_info **deviceManager>
++using DeviceNodePutter = FieldFunctionDeleter<device_node, device_manager_info, deviceManager, void, &device_manager_info::put_node>;
++
++#else
++
++template <device_manager_info **deviceManager>
++struct DeviceNodePutter : FieldFunctionDeleter<device_node, device_manager_info, deviceManager, void, &device_manager_info::put_node>
++{
++	typedef FieldFunctionDeleter<device_node, device_manager_info, deviceManager, void, &device_manager_info::put_node> Base;
++
++	DeviceNodePutter() : Base() {}
++	DeviceNodePutter(device_node* object) : Base(object) {}
++};
++
++#endif
+ 
+ #endif
+ 
+@@ -36,6 +57,8 @@ using ::BPrivate::DriverSettingsUnloader;
+ 
+ using ::BPrivate::VnodePutter;
+ using ::BPrivate::DescriptorPutter;
++using ::BPrivate::VMAddressSpacePutter;
++using ::BPrivate::DeviceNodePutter;
+ 
+ #endif
+ 
+-- 
+2.30.2
+

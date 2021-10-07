@@ -1,0 +1,147 @@
+From d8adfa39d9a5fd0e75ae328b458772c61162863c Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:19:02 +0900
+Subject: libroot: riscv64 fixes
+
+Change-Id: I49235c25cb896e36b0a642ac5198928ca9e30948
+---
+ src/system/libroot/os/arch/riscv64/Jamfile      |  2 ++
+ src/system/libroot/os/arch/riscv64/cachectl.cpp | 11 +++++++++++
+ src/system/libroot/os/thread.c                  |  2 --
+ src/system/libroot/posix/glibc/stdlib/Jamfile   |  1 +
+ .../libroot/posix/glibc/stdlib/longlong.c       | 17 +++++++++++++++++
+ .../libroot/posix/malloc_hoard2/wrapper.cpp     | 10 +++++-----
+ 6 files changed, 36 insertions(+), 7 deletions(-)
+ create mode 100644 src/system/libroot/os/arch/riscv64/cachectl.cpp
+ create mode 100644 src/system/libroot/posix/glibc/stdlib/longlong.c
+
+diff --git a/src/system/libroot/os/arch/riscv64/Jamfile b/src/system/libroot/os/arch/riscv64/Jamfile
+index 57a3befd34..5e5f07c651 100644
+--- a/src/system/libroot/os/arch/riscv64/Jamfile
++++ b/src/system/libroot/os/arch/riscv64/Jamfile
+@@ -21,6 +21,8 @@ for architectureObject in [ MultiArchSubDirSetup riscv64 ] {
+ 			tls.cpp
+ 			time.cpp
+ 			thread.cpp
++			
++			cachectl.cpp
+ 
+ 			generic_atomic.cpp
+ 			generic_stack_trace.cpp
+diff --git a/src/system/libroot/os/arch/riscv64/cachectl.cpp b/src/system/libroot/os/arch/riscv64/cachectl.cpp
+new file mode 100644
+index 0000000000..616290c169
+--- /dev/null
++++ b/src/system/libroot/os/arch/riscv64/cachectl.cpp
+@@ -0,0 +1,11 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++extern "C" void
++__riscv_flush_icache(void *start, void *end, unsigned long int flags)
++{
++	__asm__ volatile ("fence.i");
++}
+diff --git a/src/system/libroot/os/thread.c b/src/system/libroot/os/thread.c
+index 2bb71d357a..c278e660f1 100644
+--- a/src/system/libroot/os/thread.c
++++ b/src/system/libroot/os/thread.c
+@@ -45,8 +45,6 @@ thread_entry(void* _entry, void* _thread)
+ 
+ 	_thread_do_exit_work();
+ 	__heap_thread_exit();
+-	
+-	_kern_exit_thread(returnCode);
+ 
+ 	return returnCode;
+ }
+diff --git a/src/system/libroot/posix/glibc/stdlib/Jamfile b/src/system/libroot/posix/glibc/stdlib/Jamfile
+index 7cbfd480d5..a9378ab1ef 100644
+--- a/src/system/libroot/posix/glibc/stdlib/Jamfile
++++ b/src/system/libroot/posix/glibc/stdlib/Jamfile
+@@ -46,6 +46,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 			strtod.c
+ 			strtold.c
+ 			strtof.c
++			longlong.c
+ 			;
+ 	}
+ }
+diff --git a/src/system/libroot/posix/glibc/stdlib/longlong.c b/src/system/libroot/posix/glibc/stdlib/longlong.c
+new file mode 100644
+index 0000000000..d881a95380
+--- /dev/null
++++ b/src/system/libroot/posix/glibc/stdlib/longlong.c
+@@ -0,0 +1,17 @@
++/*
++ * Copyright 2021, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++const char __clz_tab[256] =
++{
++  0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
++  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
++  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
++  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
++  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
++  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
++  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
++  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8
++};
+diff --git a/src/system/libroot/posix/malloc_hoard2/wrapper.cpp b/src/system/libroot/posix/malloc_hoard2/wrapper.cpp
+index c5e8c43c1a..38a7c1258b 100644
+--- a/src/system/libroot/posix/malloc_hoard2/wrapper.cpp
++++ b/src/system/libroot/posix/malloc_hoard2/wrapper.cpp
+@@ -315,7 +315,7 @@ malloc(size_t size)
+ 	if (addr == NULL) {
+ 		undefer_signals();
+ 		__set_errno(B_NO_MEMORY);
+-		KTRACE("malloc(%lu) -> NULL", size);
++		debug_printf("hoard2: malloc(%lu) -> NULL", size);
+ 		return NULL;
+ 	}
+ 
+@@ -363,7 +363,7 @@ ok:
+ 		undefer_signals();
+ 	nomem:
+ 		__set_errno(B_NO_MEMORY);
+-		KTRACE("calloc(%lu, %lu) -> NULL", nelem, elsize);
++		debug_printf("hoard2: calloc(%lu, %lu) -> NULL", nelem, elsize);
+ 		return NULL;
+ 	}
+ 
+@@ -428,7 +428,7 @@ memalign(size_t alignment, size_t size)
+ 	if (addr == NULL) {
+ 		undefer_signals();
+ 		__set_errno(B_NO_MEMORY);
+-		KTRACE("memalign(%lu, %lu) -> NULL", alignment, size);
++		debug_printf("hoard2: memalign(%lu, %lu) -> NULL", alignment, size);
+ 		return NULL;
+ 	}
+ 
+@@ -470,7 +470,7 @@ posix_memalign(void **_pointer, size_t alignment, size_t size)
+ 		size);
+ 	if (pointer == NULL) {
+ 		undefer_signals();
+-		KTRACE("posix_memalign(%p, %lu, %lu) -> NULL", _pointer, alignment,
++		debug_printf("hoard2: posix_memalign(%p, %lu, %lu) -> NULL", _pointer, alignment,
+ 			size);
+ 		return B_NO_MEMORY;
+ 	}
+@@ -535,7 +535,7 @@ realloc(void *ptr, size_t size)
+ 	if (buffer == NULL) {
+ 		// Allocation failed, leave old block and return
+ 		__set_errno(B_NO_MEMORY);
+-		KTRACE("realloc(%p, %lu) -> NULL", ptr, size);
++		debug_printf("hoard2: realloc(%p, %lu) -> NULL", ptr, size);
+ 		return NULL;
+ 	}
+ 
+-- 
+2.30.2
+

@@ -1,0 +1,52 @@
+From 826d02fe5d8ee15ccdd42ae22fcbfc7d1a04b3b4 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Sun, 27 Jun 2021 05:06:10 +0900
+Subject: ati.accelerant: fix mode setting
+
+Change-Id: I000a646bad46e372a4d65306c4ab419212887721
+---
+ src/add-ons/accelerants/ati/mode.cpp | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/accelerants/ati/mode.cpp b/src/add-ons/accelerants/ati/mode.cpp
+index dd101165d0..f0515f4cc6 100644
+--- a/src/add-ons/accelerants/ati/mode.cpp
++++ b/src/add-ons/accelerants/ati/mode.cpp
+@@ -298,13 +298,33 @@ SetDisplayMode(display_mode* pMode)
+ 			(mode.timing.flags & B_POSITIVE_HSYNC) ? '+' : '-',
+ 			(mode.timing.flags & B_POSITIVE_VSYNC) ? '+' : '-');
+ 	}
+-	
++
++	// QEMU need to reenable screen to apply new mode change.
++	struct ScopeExit {
++		uint32 oldDpms;
++
++		ScopeExit()
++		{
++			oldDpms = gInfo.GetDPMSMode();
++			gInfo.SetDPMSMode(B_DPMS_OFF);
++		}
++
++		~ScopeExit()
++		{
++			gInfo.SetDPMSMode(oldDpms);
++		}
++	} scopeExit;
++
+ 	status_t status = gInfo.SetDisplayMode(mode);
+ 	if (status != B_OK) {
+ 		TRACE("SetDisplayMode() failed;  status 0x%x\n", status);
+ 		return status;
+ 	}
+ 
++	// Clear framebuffer to avoid artifacts on mode change.
++	memset((void*)((addr_t)si.videoMemAddr + si.frameBufferOffset), 0,
++		mode.virtual_width * mode.virtual_height * bytesPerPixel);
++
+ 	si.displayMode = mode;
+ 
+ 	TRACE("SetDisplayMode() done\n");
+-- 
+2.30.2
+

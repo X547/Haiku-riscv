@@ -1,0 +1,123 @@
+From 84fe18b8b8bb61131f15254bbae7fd4040f63eeb Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:27:17 +0900
+Subject: drivers: update for riscv64
+
+Change-Id: Id48c7a2dd04d2dfcc423aa78088b553f87ec6cb4
+---
+ .../accelerants/nvidia/engine/nv_acc_dma.c    |  2 ++
+ .../busses/virtio/virtio_mmio/VirtioDevice.h  |  2 +-
+ .../input/virtio_input/virtio_input.cpp       |  2 +-
+ src/add-ons/kernel/drivers/network/Jamfile    |  1 +
+ .../wlan/idualwifi7260/dev/iwm/if_iwm.c       | 22 +++++++++++++------
+ 5 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/accelerants/nvidia/engine/nv_acc_dma.c b/src/add-ons/accelerants/nvidia/engine/nv_acc_dma.c
+index 9c56247dab..924b22d6ec 100644
+--- a/src/add-ons/accelerants/nvidia/engine/nv_acc_dma.c
++++ b/src/add-ons/accelerants/nvidia/engine/nv_acc_dma.c
+@@ -1425,7 +1425,9 @@ static void nv_start_dma(void)
+ 		if (si->ps.card_arch < NV40A)
+ 		{
+ 			/* some CPU's support out-of-order processing (WinChip/Cyrix). Flush them. */
++#if defined(__i386__) || defined(__x86_64__)
+ 			__asm__ __volatile__ ("lock; addl $0,0(%%esp)": : :"memory");
++#endif
+ 			/* read a non-cached adress to flush the cash */
+ 			dummy = ACCR(STATUS);
+ 		}
+diff --git a/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.h b/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.h
+index d671e0c5d1..cb6d64abd1 100644
+--- a/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.h
++++ b/src/add-ons/kernel/busses/virtio/virtio_mmio/VirtioDevice.h
+@@ -9,7 +9,7 @@
+ #include <util/AutoLock.h>
+ 
+ 
+-#define TRACE_VIRTIO
++//#define TRACE_VIRTIO
+ #ifdef TRACE_VIRTIO
+ #	define TRACE(x...) dprintf("virtio_mmio: " x)
+ #else
+diff --git a/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp b/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp
+index 55d546912c..0447beaddf 100644
+--- a/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp
++++ b/src/add-ons/kernel/drivers/input/virtio_input/virtio_input.cpp
+@@ -59,7 +59,7 @@ struct VirtioInputHandle {
+ 
+ 
+ 
+-#define TRACE_VIRTIO_INPUT
++//#define TRACE_VIRTIO_INPUT
+ #ifdef TRACE_VIRTIO_INPUT
+ #	define TRACE(x...) dprintf("virtio_input: " x)
+ #else
+diff --git a/src/add-ons/kernel/drivers/network/Jamfile b/src/add-ons/kernel/drivers/network/Jamfile
+index 9109d6b24d..6379c3bd56 100644
+--- a/src/add-ons/kernel/drivers/network/Jamfile
++++ b/src/add-ons/kernel/drivers/network/Jamfile
+@@ -21,6 +21,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers network attansic_l1 ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers network attansic_l2 ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers network broadcom440x ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers network broadcom570x ;
++SubInclude HAIKU_TOP src add-ons kernel drivers network cadence_gem ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers network dec21xxx ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers network emulex_oce ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers network ipro100 ;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/idualwifi7260/dev/iwm/if_iwm.c b/src/add-ons/kernel/drivers/network/wlan/idualwifi7260/dev/iwm/if_iwm.c
+index 53a5319c24..61f1c93829 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/idualwifi7260/dev/iwm/if_iwm.c
++++ b/src/add-ons/kernel/drivers/network/wlan/idualwifi7260/dev/iwm/if_iwm.c
+@@ -2298,7 +2298,7 @@ iwm_parse_nvm_data(struct iwm_softc *sc,
+ 				       IWM_NVM_LAR_OFFSET_8000_OLD :
+ 				       IWM_NVM_LAR_OFFSET_8000;
+ 
+-		lar_config = le16_to_cpup(regulatory + lar_offset);
++		lar_config = (regulatory == NULL) ? 0 : le16_to_cpup(regulatory + lar_offset);
+ 		data->lar_enabled = !!(lar_config &
+ 				       IWM_NVM_LAR_ENABLED_8000);
+ 	}
+@@ -2309,13 +2309,19 @@ iwm_parse_nvm_data(struct iwm_softc *sc,
+ 		return NULL;
+ 	}
+ 
+-	if (sc->cfg->device_family == IWM_DEVICE_FAMILY_7000) {
+-		memcpy(data->nvm_ch_flags, sc->cfg->nvm_type == IWM_NVM_SDP ?
+-		    &regulatory[0] : &nvm_sw[IWM_NVM_CHANNELS],
+-		    IWM_NUM_CHANNELS * sizeof(uint16_t));
++	if (regulatory != NULL) {
++		if (sc->cfg->device_family == IWM_DEVICE_FAMILY_7000) {
++			memcpy(data->nvm_ch_flags, sc->cfg->nvm_type == IWM_NVM_SDP ?
++			    &regulatory[0] : &nvm_sw[IWM_NVM_CHANNELS],
++			    IWM_NUM_CHANNELS * sizeof(uint16_t));
++		} else {
++			memcpy(data->nvm_ch_flags, &regulatory[IWM_NVM_CHANNELS_8000],
++			    IWM_NUM_CHANNELS_8000 * sizeof(uint16_t));
++		}
+ 	} else {
+-		memcpy(data->nvm_ch_flags, &regulatory[IWM_NVM_CHANNELS_8000],
+-		    IWM_NUM_CHANNELS_8000 * sizeof(uint16_t));
++		for (int i = 0; i < 14; i++) {
++			((uint16_t*)data->nvm_ch_flags)[i] = IWM_NVM_CHANNEL_VALID | IWM_NVM_CHANNEL_IBSS | IWM_NVM_CHANNEL_ACTIVE;
++		}
+ 	}
+ 
+ 	return data;
+@@ -2343,12 +2349,14 @@ iwm_parse_nvm_sections(struct iwm_softc *sc, struct iwm_nvm_section *sections)
+ 		}
+ 	} else if (sc->cfg->device_family >= IWM_DEVICE_FAMILY_8000) {
+ 		/* SW and REGULATORY sections are mandatory */
++#if 0
+ 		if (!sections[IWM_NVM_SECTION_TYPE_SW].data ||
+ 		    !sections[IWM_NVM_SECTION_TYPE_REGULATORY].data) {
+ 			device_printf(sc->sc_dev,
+ 			    "Can't parse empty OTP/NVM sections\n");
+ 			return NULL;
+ 		}
++#endif
+ 		/* MAC_OVERRIDE or at least HW section must exist */
+ 		if (!sections[sc->cfg->nvm_hw_section_num].data &&
+ 		    !sections[IWM_NVM_SECTION_TYPE_MAC_OVERRIDE].data) {
+-- 
+2.30.2
+

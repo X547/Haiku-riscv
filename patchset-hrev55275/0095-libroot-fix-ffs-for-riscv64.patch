@@ -1,0 +1,34 @@
+From c0c578650660896815b2285214d214e4781a5aff Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Wed, 4 Aug 2021 05:42:26 +0900
+Subject: libroot: fix ffs for riscv64
+
+Built-in function call ffs() causing infinite recursion.
+
+Change-Id: I506c0301c3a19178ebca4478cbe2ea06a7aeb932
+---
+ src/system/libroot/posix/string/ffs.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/system/libroot/posix/string/ffs.cpp b/src/system/libroot/posix/string/ffs.cpp
+index f7d03a1dfc..3660fed5f6 100644
+--- a/src/system/libroot/posix/string/ffs.cpp
++++ b/src/system/libroot/posix/string/ffs.cpp
+@@ -8,5 +8,14 @@
+ extern "C" int
+ ffs(int value)
+ {
++#ifdef __riscv
++	int bit;
++	if (value == 0)
++		return 0;
++	for (bit = 1; !(value & 1); bit++)
++		value >>= 1;
++	return bit;
++#else
+ 	return __builtin_ffs(value);
++#endif
+ }
+-- 
+2.30.2
+

@@ -1,0 +1,2615 @@
+From 06fa7739e6e578cab8ae8d180a373abe185ee6ee Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 6 Sep 2021 11:26:21 +0900
+Subject: kernel: SMP support for riscv64 etc.
+
+Change-Id: I0edf1a2e96a6de8c5a169ccea8dde4fe64ac57a2
+---
+ headers/os/drivers/bus/FDT.h                  |  20 +-
+ .../private/kernel/arch/riscv64/arch_cpu.h    |   2 +-
+ .../private/kernel/arch/riscv64/arch_debug.h  |   3 +-
+ .../private/kernel/arch/riscv64/arch_int.h    |   4 +
+ .../kernel/arch/riscv64/arch_kernel_args.h    |   4 +-
+ .../kernel/arch/riscv64/arch_thread_types.h   |  18 +-
+ .../private/kernel/arch/riscv64/arch_traps.h  | 134 +++----
+ .../kernel/boot/platform/efi/arch_smp.h       |   8 +-
+ headers/private/kernel/vm/VMCache.h           |   5 +-
+ headers/private/kernel/vm/vm_types.h          |  14 +-
+ .../system/arch/riscv64/arch_cpu_defs.h       |   3 +
+ src/system/kernel/arch/riscv64/Jamfile        |   2 +
+ .../arch/riscv64/RISCV64VMTranslationMap.cpp  | 356 ++++++++++++++----
+ .../arch/riscv64/RISCV64VMTranslationMap.h    |  37 +-
+ src/system/kernel/arch/riscv64/arch_cpu.cpp   |  36 +-
+ src/system/kernel/arch/riscv64/arch_debug.cpp |  88 ++++-
+ src/system/kernel/arch/riscv64/arch_int.cpp   | 305 +++++++++++----
+ .../kernel/arch/riscv64/arch_platform.cpp     |   2 +-
+ src/system/kernel/arch/riscv64/arch_smp.cpp   |  80 +++-
+ src/system/kernel/arch/riscv64/arch_timer.cpp |   8 +
+ src/system/kernel/arch/riscv64/arch_traps.S   |  76 ++--
+ src/system/kernel/arch/riscv64/arch_vm.cpp    | 159 +++++---
+ .../kernel/arch/riscv64/asm_offsets.cpp       |  52 +++
+ .../paging/32bit/X86VMTranslationMap32Bit.cpp |   4 +
+ src/system/kernel/debug/debug.cpp             |   2 +-
+ src/system/kernel/debug/user_debugger.cpp     |   1 -
+ .../kernel/device_manager/legacy_drivers.cpp  |   6 +-
+ src/system/kernel/int.cpp                     |   5 +
+ src/system/kernel/main.cpp                    |   4 +
+ src/system/kernel/vm/vm.cpp                   |  16 +-
+ 30 files changed, 1076 insertions(+), 378 deletions(-)
+ create mode 100644 src/system/kernel/arch/riscv64/asm_offsets.cpp
+
+diff --git a/headers/os/drivers/bus/FDT.h b/headers/os/drivers/bus/FDT.h
+index a5a49b5cf7..1936f562ec 100644
+--- a/headers/os/drivers/bus/FDT.h
++++ b/headers/os/drivers/bus/FDT.h
+@@ -12,20 +12,20 @@
+ struct fdt_bus;
+ struct fdt_device;
+ 
+-struct fdt_bus_module_info {
++typedef struct fdt_bus_module_info {
+ 	driver_module_info info;
+-	device_node* (*node_by_phandle)(fdt_bus* bus, int phandle);
+-};
++	device_node* (*node_by_phandle)(struct fdt_bus* bus, int phandle);
++} fdt_bus_module_info;
+ 
+-struct fdt_device_module_info{
++typedef struct fdt_device_module_info {
+ 	driver_module_info info;
+-	device_node* (*get_bus)(fdt_device* dev);
+-	const char* (*get_name)(fdt_device* dev);
+-	const void* (*get_prop)(fdt_device* dev, const char* name, int* len);
+-	bool (*get_reg)(fdt_device* dev, uint32 ord, uint64* regs, uint64* len);
+-	bool (*get_interrupt)(fdt_device* dev, uint32 ord,
++	device_node* (*get_bus)(struct fdt_device* dev);
++	const char* (*get_name)(struct fdt_device* dev);
++	const void* (*get_prop)(struct fdt_device* dev, const char* name, int* len);
++	bool (*get_reg)(struct fdt_device* dev, uint32 ord, uint64* regs, uint64* len);
++	bool (*get_interrupt)(struct fdt_device* dev, uint32 ord,
+ 		device_node** interruptController, uint64* interrupt);
+-};
++} fdt_device_module_info;
+ 
+ 
+ #endif // _DRIVERS_BUS_FDT_H
+diff --git a/headers/private/kernel/arch/riscv64/arch_cpu.h b/headers/private/kernel/arch/riscv64/arch_cpu.h
+index 2b0dff4ded..3e265aa66f 100644
+--- a/headers/private/kernel/arch/riscv64/arch_cpu.h
++++ b/headers/private/kernel/arch/riscv64/arch_cpu.h
+@@ -43,7 +43,7 @@ clear_ac()
+ 
+ 
+ typedef struct arch_cpu_info {
+-	int null;
++	uint64 hartId;
+ } arch_cpu_info;
+ 
+ 
+diff --git a/headers/private/kernel/arch/riscv64/arch_debug.h b/headers/private/kernel/arch/riscv64/arch_debug.h
+index 69830bfd65..2a1d582722 100644
+--- a/headers/private/kernel/arch/riscv64/arch_debug.h
++++ b/headers/private/kernel/arch/riscv64/arch_debug.h
+@@ -10,6 +10,7 @@
+ 
+ 
+ struct kernel_args;
++struct iframe;
+ 
+ struct arch_debug_registers {
+ };
+@@ -17,7 +18,7 @@ struct arch_debug_registers {
+ 
+ void WritePC(addr_t pc);
+ void DoStackTrace(addr_t fp, addr_t pc);
+-void WriteTrapInfo();
++void WriteTrapInfo(iframe* frame);
+ 
+ status_t arch_debug_init_early(kernel_args *args);
+ 
+diff --git a/headers/private/kernel/arch/riscv64/arch_int.h b/headers/private/kernel/arch/riscv64/arch_int.h
+index db1867716e..cc5b655cb1 100644
+--- a/headers/private/kernel/arch/riscv64/arch_int.h
++++ b/headers/private/kernel/arch/riscv64/arch_int.h
+@@ -15,6 +15,8 @@
+ #define NUM_IO_VECTORS	256
+ 
+ 
++#ifdef __cplusplus
++
+ static inline void
+ arch_int_enable_interrupts_inline(void)
+ {
+@@ -67,5 +69,7 @@ enum {
+ 
+ extern "C" status_t MSyscall(uint64 op, ...);
+ 
++#endif
++
+ 
+ #endif /* _KERNEL_ARCH_RISCV64_INT_H */
+diff --git a/headers/private/kernel/arch/riscv64/arch_kernel_args.h b/headers/private/kernel/arch/riscv64/arch_kernel_args.h
+index 279175bc24..4ed16dd729 100644
+--- a/headers/private/kernel/arch/riscv64/arch_kernel_args.h
++++ b/headers/private/kernel/arch/riscv64/arch_kernel_args.h
+@@ -60,7 +60,6 @@ typedef struct {
+ 	uint32 platform1;
+ 	uint32 platform2;
+ 
+-	uint bootHart;
+ 	uint64 timerFrequrency; // in Hz
+ 
+ 	// All following address are virtual
+@@ -71,6 +70,9 @@ typedef struct {
+ 	addr_range	plic;
+ 	addr_range	clint;
+ 	ArchUart    uart;
++
++	uint32 hartIds[SMP_MAX_CPUS];
++	uint32 plicContexts[SMP_MAX_CPUS];
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_RISCV64_KERNEL_ARGS_H */
+diff --git a/headers/private/kernel/arch/riscv64/arch_thread_types.h b/headers/private/kernel/arch/riscv64/arch_thread_types.h
+index a0c99bc8b3..ce911a848d 100644
+--- a/headers/private/kernel/arch/riscv64/arch_thread_types.h
++++ b/headers/private/kernel/arch/riscv64/arch_thread_types.h
+@@ -14,6 +14,11 @@ namespace BKernel {
+ 
+ 
+ struct iframe {
++	uint64 status;
++	uint64 cause;
++	uint64 tval;
++	uint64 align1; // structure need to be 16 byte aligned
++
+ 	uint64 ra;
+ 	uint64 t6;
+ 	uint64 sp;
+@@ -48,6 +53,7 @@ struct iframe {
+ 	uint64 epc;
+ };
+ 
++
+ struct arch_context {
+ 	uint64 ra;    //  0
+ 	uint64 s[12]; // 12
+@@ -60,12 +66,15 @@ struct fpu_context {
+ 	uint64 fcsr;
+ };
+ 
++struct __attribute__((aligned(16))) arch_stack {
++	BKernel::Thread* thread;
++};
+ 
+ struct arch_thread {
+-	BKernel::Thread* thread;
+ 	arch_context context;
+ 	fpu_context fpuContext;
+ 	iframe* userFrame;
++	uint64 oldA0;
+ };
+ 
+ struct arch_team {
+@@ -80,13 +89,12 @@ struct arch_fork_arg {
+ };
+ 
+ 
+-extern "C" int arch_setjmp(arch_context* ctx);
+-extern "C" void arch_longjmp(arch_context* ctx, int val);
++extern "C" void arch_context_switch(arch_context* from, arch_context* to);
+ extern "C" void save_fpu(fpu_context* ctx);
+ extern "C" void restore_fpu(fpu_context* ctx);
+ extern "C" void arch_thread_entry();
+-extern "C" void arch_enter_userspace(void *arg1, void *arg2, addr_t sp);
+-extern "C" void arch_longjmp_iframe(iframe* frame);
++extern "C" void arch_load_user_iframe(arch_stack* stackHeader, iframe* frame)
++	__attribute__ ((noreturn));
+ 
+ 
+ #endif	/* KERNEL_ARCH_RISCV64_THREAD_TYPES_H */
+diff --git a/headers/private/kernel/arch/riscv64/arch_traps.h b/headers/private/kernel/arch/riscv64/arch_traps.h
+index 8afc947b7e..60b70287c8 100644
+--- a/headers/private/kernel/arch/riscv64/arch_traps.h
++++ b/headers/private/kernel/arch/riscv64/arch_traps.h
+@@ -9,79 +9,79 @@
+ 
+ 
+ # NOTE: this macro don't save SP, it should be saved manually
+-.macro PushTrapFrame
+-	addi sp, sp, -256
++.macro PushTrapFrame extSize
++	addi sp, sp, -(\extSize + 256)
+ 
+-	sd ra,   0*8(sp)
+-	sd t6,   1*8(sp)
+-#	sd sp,   2*8(sp) # sp
+-	sd gp,   3*8(sp)
+-	sd tp,   4*8(sp)
+-	sd t0,   5*8(sp)
+-	sd t1,   6*8(sp)
+-	sd t2,   7*8(sp)
+-	sd t5,   8*8(sp)
+-	sd s1,   9*8(sp)
+-	sd a0,  10*8(sp)
+-	sd a1,  11*8(sp)
+-	sd a2,  12*8(sp)
+-	sd a3,  13*8(sp)
+-	sd a4,  14*8(sp)
+-	sd a5,  15*8(sp)
+-	sd a6,  16*8(sp)
+-	sd a7,  17*8(sp)
+-	sd s2,  18*8(sp)
+-	sd s3,  19*8(sp)
+-	sd s4,  20*8(sp)
+-	sd s5,  21*8(sp)
+-	sd s6,  22*8(sp)
+-	sd s7,  23*8(sp)
+-	sd s8,  24*8(sp)
+-	sd s9,  25*8(sp)
+-	sd s10, 26*8(sp)
+-	sd s11, 27*8(sp)
+-	sd t3,  28*8(sp)
+-	sd t4,  29*8(sp)
+-	sd fp,  30*8(sp)
++	sd ra,  \extSize +  0*8(sp)
++	sd t6,  \extSize +  1*8(sp)
++#	sd sp,  \extSize +  2*8(sp) # sp
++	sd gp,  \extSize +  3*8(sp)
++	sd tp,  \extSize +  4*8(sp)
++	sd t0,  \extSize +  5*8(sp)
++	sd t1,  \extSize +  6*8(sp)
++	sd t2,  \extSize +  7*8(sp)
++	sd t5,  \extSize +  8*8(sp)
++	sd s1,  \extSize +  9*8(sp)
++	sd a0,  \extSize + 10*8(sp)
++	sd a1,  \extSize + 11*8(sp)
++	sd a2,  \extSize + 12*8(sp)
++	sd a3,  \extSize + 13*8(sp)
++	sd a4,  \extSize + 14*8(sp)
++	sd a5,  \extSize + 15*8(sp)
++	sd a6,  \extSize + 16*8(sp)
++	sd a7,  \extSize + 17*8(sp)
++	sd s2,  \extSize + 18*8(sp)
++	sd s3,  \extSize + 19*8(sp)
++	sd s4,  \extSize + 20*8(sp)
++	sd s5,  \extSize + 21*8(sp)
++	sd s6,  \extSize + 22*8(sp)
++	sd s7,  \extSize + 23*8(sp)
++	sd s8,  \extSize + 24*8(sp)
++	sd s9,  \extSize + 25*8(sp)
++	sd s10, \extSize + 26*8(sp)
++	sd s11, \extSize + 27*8(sp)
++	sd t3,  \extSize + 28*8(sp)
++	sd t4,  \extSize + 29*8(sp)
++	sd fp,  \extSize + 30*8(sp)
+ 
+-	addi fp, sp, 256
++	addi fp, sp, \extSize + 256
+ .endm
+ 
+ 
+-.macro PopTrapFrame
+-	ld ra,   0*8(sp)
+-	ld t6,   1*8(sp)
+-#	ld sp,   2*8(sp) restore later
+-	ld gp,   3*8(sp)
+-#	ld tp,   4*8(sp)
+-	ld t0,   5*8(sp)
+-	ld t1,   6*8(sp)
+-	ld t2,   7*8(sp)
+-	ld t5,   8*8(sp)
+-	ld s1,   9*8(sp)
+-	ld a0,  10*8(sp)
+-	ld a1,  11*8(sp)
+-	ld a2,  12*8(sp)
+-	ld a3,  13*8(sp)
+-	ld a4,  14*8(sp)
+-	ld a5,  15*8(sp)
+-	ld a6,  16*8(sp)
+-	ld a7,  17*8(sp)
+-	ld s2,  18*8(sp)
+-	ld s3,  19*8(sp)
+-	ld s4,  20*8(sp)
+-	ld s5,  21*8(sp)
+-	ld s6,  22*8(sp)
+-	ld s7,  23*8(sp)
+-	ld s8,  24*8(sp)
+-	ld s9,  25*8(sp)
+-	ld s10, 26*8(sp)
+-	ld s11, 27*8(sp)
+-	ld t3,  28*8(sp)
+-	ld t4,  29*8(sp)
+-	ld fp,  30*8(sp)
++.macro PopTrapFrame extSize
++	ld ra,  \extSize +  0*8(sp)
++	ld t6,  \extSize +  1*8(sp)
++#	ld sp,  \extSize +  2*8(sp) restore later
++	ld gp,  \extSize +  3*8(sp)
++#	ld tp,  \extSize +  4*8(sp)
++	ld t0,  \extSize +  5*8(sp)
++	ld t1,  \extSize +  6*8(sp)
++	ld t2,  \extSize +  7*8(sp)
++	ld t5,  \extSize +  8*8(sp)
++	ld s1,  \extSize +  9*8(sp)
++	ld a0,  \extSize + 10*8(sp)
++	ld a1,  \extSize + 11*8(sp)
++	ld a2,  \extSize + 12*8(sp)
++	ld a3,  \extSize + 13*8(sp)
++	ld a4,  \extSize + 14*8(sp)
++	ld a5,  \extSize + 15*8(sp)
++	ld a6,  \extSize + 16*8(sp)
++	ld a7,  \extSize + 17*8(sp)
++	ld s2,  \extSize + 18*8(sp)
++	ld s3,  \extSize + 19*8(sp)
++	ld s4,  \extSize + 20*8(sp)
++	ld s5,  \extSize + 21*8(sp)
++	ld s6,  \extSize + 22*8(sp)
++	ld s7,  \extSize + 23*8(sp)
++	ld s8,  \extSize + 24*8(sp)
++	ld s9,  \extSize + 25*8(sp)
++	ld s10, \extSize + 26*8(sp)
++	ld s11, \extSize + 27*8(sp)
++	ld t3,  \extSize + 28*8(sp)
++	ld t4,  \extSize + 29*8(sp)
++	ld fp,  \extSize + 30*8(sp)
+ 
+-	ld sp,   2*8(sp)
++	ld sp,  \extSize +  2*8(sp)
+ .endm
+ 
+ 
+diff --git a/headers/private/kernel/boot/platform/efi/arch_smp.h b/headers/private/kernel/boot/platform/efi/arch_smp.h
+index 4a87605391..418830125e 100644
+--- a/headers/private/kernel/boot/platform/efi/arch_smp.h
++++ b/headers/private/kernel/boot/platform/efi/arch_smp.h
+@@ -11,10 +11,16 @@
+ #ifdef __riscv
+ 
+ struct CpuInfo {
+-	uint32 id;
++	uint32 hartId;
++	uint32 phandle;
++	uint32 plicContext;
+ };
+ 
++extern uint32 gBootHart;
++
+ void arch_smp_register_cpu(CpuInfo** cpu);
++CpuInfo* arch_smp_find_cpu(uint32 phandle);
++
+ 
+ #endif
+ 
+diff --git a/headers/private/kernel/vm/VMCache.h b/headers/private/kernel/vm/VMCache.h
+index 2db12cf3fe..f7eb46996b 100644
+--- a/headers/private/kernel/vm/VMCache.h
++++ b/headers/private/kernel/vm/VMCache.h
+@@ -376,7 +376,10 @@ vm_page::IncrementWiredCount()
+ inline void
+ vm_page::DecrementWiredCount()
+ {
+-	ASSERT(fWiredCount > 0);
++	// ASSERT(fWiredCount > 0);
++	if (!(fWiredCount > 0)) {
++		panic("[!] fWiredCount > 0, page: %#" B_PRIx64, physical_page_number * B_PAGE_SIZE);
++	}
+ 
+ 	if (--fWiredCount == 0)
+ 		cache_ref->cache->DecrementWiredPagesCount();
+diff --git a/headers/private/kernel/vm/vm_types.h b/headers/private/kernel/vm/vm_types.h
+index a165bb4229..2cb5d9f3c5 100644
+--- a/headers/private/kernel/vm/vm_types.h
++++ b/headers/private/kernel/vm/vm_types.h
+@@ -25,7 +25,7 @@
+ 
+ #include "kernel_debug_config.h"
+ 
+-#undef DEBUG_PAGE_ACCESS
++//#undef DEBUG_PAGE_ACCESS
+ 
+ 
+ #define VM_PAGE_ALLOCATION_TRACKING_AVAILABLE \
+@@ -232,9 +232,9 @@ vm_page_debug_access_start(vm_page* page)
+ 	thread_id previousThread = atomic_test_and_set(&page->accessing_thread,
+ 		threadID, -1);
+ 	if (previousThread != -1) {
+-		panic("Invalid concurrent access to page %p (start), currently "
++		panic("Invalid concurrent access to page %#" B_PRIx64 " (start), currently "
+ 			"accessed by: %" B_PRId32
+-			"@! page -m %p; sc %" B_PRId32 "; cache _cache", page,
++			"@! page -m %p; sc %" B_PRId32 "; cache _cache", page->physical_page_number * B_PAGE_SIZE,
+ 			previousThread, page, previousThread);
+ 	}
+ }
+@@ -247,9 +247,9 @@ vm_page_debug_access_end(vm_page* page)
+ 	thread_id previousThread = atomic_test_and_set(&page->accessing_thread, -1,
+ 		threadID);
+ 	if (previousThread != threadID) {
+-		panic("Invalid concurrent access to page %p (end) by current thread, "
++		panic("Invalid concurrent access to page %#" B_PRIx64 " (end) by current thread, "
+ 			"current accessor is: %" B_PRId32
+-			"@! page -m %p; sc %" B_PRId32 "; cache _cache", page,
++			"@! page -m %p; sc %" B_PRId32 "; cache _cache", page->physical_page_number * B_PAGE_SIZE,
+ 			previousThread, page, previousThread);
+ 	}
+ }
+@@ -260,9 +260,9 @@ vm_page_debug_access_check(vm_page* page)
+ {
+ 	thread_id thread = page->accessing_thread;
+ 	if (thread != thread_get_current_thread_id()) {
+-		panic("Invalid concurrent access to page %p (check), currently "
++		panic("Invalid concurrent access to page %#" B_PRIx64 " (check), currently "
+ 			"accessed by: %" B_PRId32
+-			"@! page -m %p; sc %" B_PRId32 "; cache _cache", page, thread, page,
++			"@! page -m %p; sc %" B_PRId32 "; cache _cache", page->physical_page_number * B_PAGE_SIZE, thread, page,
+ 			thread);
+ 	}
+ }
+diff --git a/headers/private/system/arch/riscv64/arch_cpu_defs.h b/headers/private/system/arch/riscv64/arch_cpu_defs.h
+index 93a422b143..7dbd8e8f74 100644
+--- a/headers/private/system/arch/riscv64/arch_cpu_defs.h
++++ b/headers/private/system/arch/riscv64/arch_cpu_defs.h
+@@ -8,6 +8,7 @@
+ 
+ #include <SupportDefs.h>
+ 
++#ifdef __cplusplus
+ 
+ enum {
+ 	modeU = 0,
+@@ -350,6 +351,8 @@ static B_ALWAYS_INLINE void Wfi() {asm volatile("wfi");}
+ static B_ALWAYS_INLINE void Mret() {asm volatile("mret");}
+ static B_ALWAYS_INLINE void Sret() {asm volatile("sret");}
+ 
++#endif // __cplusplus
++
+ 
+ #define SPINLOCK_PAUSE()	do {} while (false)
+ 
+diff --git a/src/system/kernel/arch/riscv64/Jamfile b/src/system/kernel/arch/riscv64/Jamfile
+index 305bed6e73..fa473d88e3 100644
+--- a/src/system/kernel/arch/riscv64/Jamfile
++++ b/src/system/kernel/arch/riscv64/Jamfile
+@@ -33,3 +33,5 @@ KernelMergeObject kernel_arch_riscv64.o :
+         $(TARGET_KERNEL_PIC_CCFLAGS) -Wno-unused
+         :
+ ;
++
++CreateAsmStructOffsetsHeader asm_offsets.h : asm_offsets.cpp ;
+diff --git a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+index 3ea75bdb00..ce05a89a6b 100644
+--- a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
++++ b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.cpp
+@@ -10,8 +10,6 @@
+ #include <util/AutoLock.h>
+ 
+ 
+-//#define DISABLE_MODIFIED_FLAGS 1
+-
+ //#define DO_TRACE
+ #ifdef DO_TRACE
+ #	define TRACE(x...) dprintf(x)
+@@ -40,6 +38,7 @@ FreePageTable(page_num_t ppn, bool isKernel, uint32 level = 2)
+ 		}
+ 	}
+ 	vm_page* page = vm_lookup_page(ppn);
++	DEBUG_PAGE_ACCESS_START(page);
+ 	vm_page_set_state(page, PAGE_STATE_FREE);
+ }
+ 
+@@ -83,6 +82,7 @@ RISCV64VMTranslationMap::LookupPte(addr_t virtAdr, bool alloc,
+ 		fPageTable = page->physical_page_number * B_PAGE_SIZE;
+ 		if (fPageTable == 0)
+ 			return NULL;
++		DEBUG_PAGE_ACCESS_END(page);
+ 		fPageTableSize++;
+ 		if (!fIsKernel) {
+ 			// Map kernel address space into user address space. Preallocated
+@@ -110,6 +110,7 @@ RISCV64VMTranslationMap::LookupPte(addr_t virtAdr, bool alloc,
+ 			pte->ppn = page->physical_page_number;
+ 			if (pte->ppn == 0)
+ 				return NULL;
++			DEBUG_PAGE_ACCESS_END(page);
+ 			fPageTableSize++;
+ 			pte->flags |= (1 << pteValid);
+ 		}
+@@ -136,7 +137,8 @@ RISCV64VMTranslationMap::RISCV64VMTranslationMap(bool kernel,
+ 	phys_addr_t pageTable):
+ 	fIsKernel(kernel),
+ 	fPageTable(pageTable),
+-	fPageTableSize(GetPageTableSize(pageTable / B_PAGE_SIZE, kernel))
++	fPageTableSize(GetPageTableSize(pageTable / B_PAGE_SIZE, kernel)),
++	fInvalidPagesCount(0)
+ {
+ 	TRACE("+RISCV64VMTranslationMap(%p, %d, 0x%" B_PRIxADDR ")\n", this,
+ 		kernel, pageTable);
+@@ -224,28 +226,26 @@ RISCV64VMTranslationMap::Map(addr_t virtualAddress,
+ 	Pte* pte = LookupPte(virtualAddress, true, reservation);
+ 	if (pte == NULL) panic("can't allocate page table");
+ 
+-	pte->ppn = physicalAddress / B_PAGE_SIZE;
+-	pte->flags = 0;
++	Pte newPte;
++	newPte.ppn = physicalAddress / B_PAGE_SIZE;
++	newPte.flags = (1 << pteValid);
+ 	if ((attributes & B_USER_PROTECTION) != 0) {
+-		pte->flags |= (1 << pteUser);
+-		if ((attributes & B_READ_AREA)    != 0) pte->flags |= (1 << pteRead);
+-		if ((attributes & B_WRITE_AREA)   != 0) pte->flags |= (1 << pteWrite);
+-		if ((attributes & B_EXECUTE_AREA) != 0) pte->flags |= (1 << pteExec);
++		newPte.flags |= (1 << pteUser);
++		if ((attributes & B_READ_AREA)    != 0) newPte.flags |= (1 << pteRead);
++		if ((attributes & B_WRITE_AREA)   != 0) newPte.flags |= (1 << pteWrite);
++		if ((attributes & B_EXECUTE_AREA) != 0) newPte.flags |= (1 << pteExec);
+ 	} else {
+ 		if ((attributes & B_KERNEL_READ_AREA)    != 0)
+-			pte->flags |= (1 << pteRead);
++			newPte.flags |= (1 << pteRead);
+ 		if ((attributes & B_KERNEL_WRITE_AREA)   != 0)
+-			pte->flags |= (1 << pteWrite);
++			newPte.flags |= (1 << pteWrite);
+ 		if ((attributes & B_KERNEL_EXECUTE_AREA) != 0)
+-			pte->flags |= (1 << pteExec);
++			newPte.flags |= (1 << pteExec);
+ 	}
+-	pte->flags |= (1 << pteValid)
+-#ifdef DISABLE_MODIFIED_FLAGS
+-		| (1 << pteAccessed) | (1 << pteDirty)
+-#endif
+-	;
++	*pte = newPte;
+ 
+-	FlushTlbPage(virtualAddress);
++	// Note: We don't need to invalidate the TLB for this address, as previously
++	// the entry was not present and the TLB doesn't cache those entries.
+ 
+ 	fMapCount++;
+ 
+@@ -265,9 +265,9 @@ RISCV64VMTranslationMap::Unmap(addr_t start, addr_t end)
+ 		Pte* pte = LookupPte(page, false, NULL);
+ 		if (pte != NULL) {
+ 			fMapCount--;
+-			pte->flags = 0;
+-			pte->ppn = 0;
+-			FlushTlbPage(page);
++			Pte oldPte((uint64)atomic_get_and_set64((int64*)&pte->val, 0));
++			if ((oldPte.flags & (1 << pteAccessed)) != 0)
++				InvalidatePage(page);
+ 		}
+ 	}
+ 	return B_OK;
+@@ -312,13 +312,15 @@ RISCV64VMTranslationMap::UnmapPage(VMArea* area, addr_t address,
+ 
+ 	RecursiveLocker locker(fLock);
+ 
+-	Pte oldPte = *pte;
+-	pte->flags = 0;
+-	pte->ppn = 0;
++	Pte oldPte((uint64)atomic_get_and_set64((int64*)&pte->val, 0));
+ 	fMapCount--;
+-	FlushTlbPage(address);
+ 	pinner.Unlock();
+ 
++	if ((oldPte.flags & (1 << pteAccessed)) != 0)
++		InvalidatePage(address);
++
++	Flush();
++
+ 	locker.Detach(); // PageUnmapped takes ownership
+ 	PageUnmapped(area, oldPte.ppn, ((1 << pteAccessed) & oldPte.flags) != 0,
+ 		((1 << pteDirty) & oldPte.flags) != 0, updatePageQueue);
+@@ -326,15 +328,147 @@ RISCV64VMTranslationMap::UnmapPage(VMArea* area, addr_t address,
+ }
+ 
+ 
++static void
++WriteVmPage(vm_page* page)
++{
++	dprintf("0x%08" B_PRIxADDR " ",
++		(addr_t)(page->physical_page_number * B_PAGE_SIZE));
++	switch (page->State()) {
++		case PAGE_STATE_ACTIVE:   dprintf("A"); break;
++		case PAGE_STATE_INACTIVE: dprintf("I"); break;
++		case PAGE_STATE_MODIFIED: dprintf("M"); break;
++		case PAGE_STATE_CACHED:   dprintf("C"); break;
++		case PAGE_STATE_FREE:     dprintf("F"); break;
++		case PAGE_STATE_CLEAR:    dprintf("L"); break;
++		case PAGE_STATE_WIRED:    dprintf("W"); break;
++		case PAGE_STATE_UNUSED:   dprintf("-"); break;
++	}
++	dprintf(" ");
++	if (page->busy)         dprintf("B"); else dprintf("-");
++	if (page->busy_writing) dprintf("W"); else dprintf("-");
++	if (page->accessed)     dprintf("A"); else dprintf("-");
++	if (page->modified)     dprintf("M"); else dprintf("-");
++	if (page->unused)       dprintf("U"); else dprintf("-");
++
++	dprintf(" usage:%3u", page->usage_count);
++	dprintf(" wired:%5u", page->WiredCount());
++
++	bool first = true;
++	vm_page_mappings::Iterator iterator = page->mappings.GetIterator();
++	vm_page_mapping* mapping;
++	while ((mapping = iterator.Next()) != NULL) {
++		if (first) {
++			dprintf(": ");
++			first = false;
++		} else
++			dprintf(", ");
++
++		dprintf("%" B_PRId32 " (%s)", mapping->area->id, mapping->area->name);
++		mapping = mapping->page_link.next;
++	}
++}
++
++
+ void
+ RISCV64VMTranslationMap::UnmapPages(VMArea* area, addr_t base, size_t size,
+ 	bool updatePageQueue)
+ {
++	if (size == 0)
++		return;
++
++	addr_t end = base + size - 1;
++
+ 	TRACE("RISCV64VMTranslationMap::UnmapPages(0x%" B_PRIxADDR "(%s), 0x%"
+ 		B_PRIxADDR ", 0x%" B_PRIxSIZE ", %d)\n", (addr_t)area, area->name, base,
+ 		size, updatePageQueue);
+-	for (addr_t end = base + size; base < end; base += B_PAGE_SIZE)
+-		UnmapPage(area, base, updatePageQueue);
++
++	VMAreaMappings queue;
++
++	RecursiveLocker locker(fLock);
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	for (addr_t start = base; start < end; start += B_PAGE_SIZE) {
++		Pte* pte = LookupPte(start, false, NULL);
++		if (pte == NULL)
++			continue;
++
++		Pte oldPte((uint64)atomic_get_and_set64((int64*)&pte->val, 0));
++		if ((oldPte.flags & (1 << pteValid)) == 0)
++			continue;
++
++		fMapCount--;
++
++		if ((oldPte.flags & (1 << pteAccessed)) != 0)
++			InvalidatePage(start);
++
++		if (area->cache_type != CACHE_TYPE_DEVICE) {
++			// get the page
++			vm_page* page = vm_lookup_page(oldPte.ppn);
++			ASSERT(page != NULL);
++			if (false) {
++				WriteVmPage(page); dprintf("\n");
++			}
++
++			DEBUG_PAGE_ACCESS_START(page);
++
++			// transfer the accessed/dirty flags to the page
++			if ((oldPte.flags & (1 << pteAccessed)) != 0)
++				page->accessed = true;
++			if ((oldPte.flags & (1 << pteDirty)) != 0)
++				page->modified = true;
++
++			// remove the mapping object/decrement the wired_count of the
++			// page
++			if (area->wiring == B_NO_LOCK) {
++				vm_page_mapping* mapping = NULL;
++				vm_page_mappings::Iterator iterator
++					= page->mappings.GetIterator();
++				while ((mapping = iterator.Next()) != NULL) {
++					if (mapping->area == area)
++						break;
++				}
++
++				ASSERT(mapping != NULL);
++
++				area->mappings.Remove(mapping);
++				page->mappings.Remove(mapping);
++				queue.Add(mapping);
++			} else
++				page->DecrementWiredCount();
++
++			if (!page->IsMapped()) {
++				atomic_add(&gMappedPagesCount, -1);
++
++				if (updatePageQueue) {
++					if (page->Cache()->temporary)
++						vm_page_set_state(page, PAGE_STATE_INACTIVE);
++					else if (page->modified)
++						vm_page_set_state(page, PAGE_STATE_MODIFIED);
++					else
++						vm_page_set_state(page, PAGE_STATE_CACHED);
++				}
++			}
++
++			DEBUG_PAGE_ACCESS_END(page);
++		}
++
++		Flush();
++			// flush explicitly, since we directly use the lock
++	}
++
++	// TODO: As in UnmapPage() we can lose page dirty flags here. ATM it's not
++	// really critical here, as in all cases this method is used, the unmapped
++	// area range is unmapped for good (resized/cut) and the pages will likely
++	// be freed.
++
++	locker.Unlock();
++
++	// free removed mappings
++	bool isKernelSpace = area->address_space == VMAddressSpace::Kernel();
++	uint32 freeFlags = CACHE_DONT_WAIT_FOR_MEMORY
++		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
++	while (vm_page_mapping* mapping = queue.RemoveHead())
++		object_cache_free(gPageMappingsObjectCache, mapping, freeFlags);
+ }
+ 
+ 
+@@ -387,9 +521,7 @@ RISCV64VMTranslationMap::UnmapArea(VMArea* area, bool deletingAddressSpace,
+ 				continue;
+ 			}
+ 
+-			Pte oldPte = *pte;
+-			pte->flags = 0;
+-			pte->ppn = 0;
++			Pte oldPte((uint64)atomic_get_and_set64((int64*)&pte->val, 0));
+ 
+ 			// transfer the accessed/dirty flags to the page and invalidate
+ 			// the mapping, if necessary
+@@ -397,19 +529,23 @@ RISCV64VMTranslationMap::UnmapArea(VMArea* area, bool deletingAddressSpace,
+ 				page->accessed = true;
+ 
+ 				if (!deletingAddressSpace)
+-					FlushTlbPage(address);
++					InvalidatePage(address);
+ 			}
+ 
+ 			if (((1 << pteDirty) & oldPte.flags) != 0)
+ 				page->modified = true;
+ 
+ 			if (pageFullyUnmapped) {
++				DEBUG_PAGE_ACCESS_START(page);
++
+ 				if (cache->temporary)
+ 					vm_page_set_state(page, PAGE_STATE_INACTIVE);
+ 				else if (page->modified)
+ 					vm_page_set_state(page, PAGE_STATE_MODIFIED);
+ 				else
+ 					vm_page_set_state(page, PAGE_STATE_CACHED);
++
++				DEBUG_PAGE_ACCESS_END(page);
+ 			}
+ 		}
+ 
+@@ -445,23 +581,23 @@ RISCV64VMTranslationMap::Query(addr_t virtualAddress,
+ 	if (pte == 0)
+ 		return B_OK;
+ 
+-	*_physicalAddress = pte->ppn * B_PAGE_SIZE;
++	Pte pteVal = *pte;
+ 
+-	if (((1 << pteValid)    & pte->flags) != 0) *_flags |= PAGE_PRESENT;
+-#ifndef DISABLE_MODIFIED_FLAGS
+-	if (((1 << pteDirty)    & pte->flags) != 0) *_flags |= PAGE_MODIFIED;
+-	if (((1 << pteAccessed) & pte->flags) != 0) *_flags |= PAGE_ACCESSED;
+-#endif
+-	if (((1 << pteUser) & pte->flags) != 0) {
+-		if (((1 << pteRead)  & pte->flags) != 0) *_flags |= B_READ_AREA;
+-		if (((1 << pteWrite) & pte->flags) != 0) *_flags |= B_WRITE_AREA;
+-		if (((1 << pteExec)  & pte->flags) != 0) *_flags |= B_EXECUTE_AREA;
++	*_physicalAddress = pteVal.ppn * B_PAGE_SIZE;
++
++	if (((1 << pteValid)    & pteVal.flags) != 0) *_flags |= PAGE_PRESENT;
++	if (((1 << pteDirty)    & pteVal.flags) != 0) *_flags |= PAGE_MODIFIED;
++	if (((1 << pteAccessed) & pteVal.flags) != 0) *_flags |= PAGE_ACCESSED;
++	if (((1 << pteUser) & pteVal.flags) != 0) {
++		if (((1 << pteRead)  & pteVal.flags) != 0) *_flags |= B_READ_AREA;
++		if (((1 << pteWrite) & pteVal.flags) != 0) *_flags |= B_WRITE_AREA;
++		if (((1 << pteExec)  & pteVal.flags) != 0) *_flags |= B_EXECUTE_AREA;
+ 	} else {
+-		if (((1 << pteRead)  & pte->flags) != 0)
++		if (((1 << pteRead)  & pteVal.flags) != 0)
+ 			*_flags |= B_KERNEL_READ_AREA;
+-		if (((1 << pteWrite) & pte->flags) != 0)
++		if (((1 << pteWrite) & pteVal.flags) != 0)
+ 			*_flags |= B_KERNEL_WRITE_AREA;
+-		if (((1 << pteExec)  & pte->flags) != 0)
++		if (((1 << pteExec)  & pteVal.flags) != 0)
+ 			*_flags |= B_KERNEL_EXECUTE_AREA;
+ 	}
+ 
+@@ -494,7 +630,8 @@ status_t RISCV64VMTranslationMap::Protect(addr_t base, addr_t top,
+ 			continue;
+ 		}
+ 
+-		Pte newPte = *pte;
++		Pte oldPte = *pte;
++		Pte newPte = oldPte;
+ 		newPte.flags &= (1 << pteValid) | (1 << pteAccessed) | (1 << pteDirty);
+ 		if ((attributes & B_USER_PROTECTION) != 0) {
+ 			newPte.flags |= (1 << pteUser);
+@@ -514,7 +651,8 @@ status_t RISCV64VMTranslationMap::Protect(addr_t base, addr_t top,
+ 		}
+ 		*pte = newPte;
+ 
+-		FlushTlbPage(page);
++		if ((oldPte.flags & (1 << pteAccessed)) != 0)
++			InvalidatePage(page);
+ 	}
+ 
+ 	return B_OK;
+@@ -554,9 +692,7 @@ RISCV64VMTranslationMap::SetFlags(addr_t address, uint32 flags)
+ 	Pte* pte = LookupPte(address, false, NULL);
+ 	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0)
+ 		return B_OK;
+-#ifndef DISABLE_MODIFIED_FLAGS
+ 	pte->flags |= ConvertAccessedFlags(flags);
+-#endif
+ 	FlushTlbPage(address);
+ 	return B_OK;
+ }
+@@ -569,10 +705,8 @@ RISCV64VMTranslationMap::ClearFlags(addr_t address, uint32 flags)
+ 	Pte* pte = LookupPte(address, false, NULL);
+ 	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0)
+ 		return B_OK;
+-#ifndef DISABLE_MODIFIED_FLAGS
+ 	pte->flags &= ~ConvertAccessedFlags(flags);
+-#endif
+-	FlushTlbPage(address);
++	InvalidatePage(address);
+ 	return B_OK;
+ }
+ 
+@@ -592,23 +726,27 @@ RISCV64VMTranslationMap::ClearAccessedAndModified(VMArea* area, addr_t address,
+ 	if (pte == NULL || ((1 << pteValid) & pte->flags) == 0) {
+ 		return false;
+ 	}
+-	Pte oldPte = *pte;
+-#ifndef DISABLE_MODIFIED_FLAGS
++	Pte oldPte;
+ 	if (unmapIfUnaccessed) {
+-		if (((1 << pteAccessed) & pte->flags) != 0) {
+-			pte->flags &= ~((1 << pteAccessed) | (1 << pteDirty));
+-		} else {
+-			pte->flags = 0;
+-			pte->ppn = 0;
++		for (;;) {
++			oldPte = *pte;
++			if (((1 << pteValid) & oldPte.flags) == 0)
++				return false;
++
++			if (((1 << pteAccessed) & oldPte.flags) != 0) {
++				oldPte.val = atomic_and64((int64*)&pte->val, ~((1 << pteAccessed) | (1 << pteDirty)));
++				break;
++			}
++			if (atomic_test_and_set64((int64*)&pte->val, 0, oldPte.val) == (int64)oldPte.val)
++				break;
+ 		}
+-	} else {
+-		pte->flags &= ~((1 << pteAccessed) | (1 << pteDirty));
+-	}
+-#endif
++	} else
++		oldPte.val = atomic_and64((int64*)&pte->val, ~((1 << pteAccessed) | (1 << pteDirty)));
++
+ 	pinner.Unlock();
+ 	_modified = ((1 << pteDirty) & oldPte.flags) != 0;
+ 	if (((1 << pteAccessed) & oldPte.flags) != 0) {
+-		FlushTlbPage(address);
++		InvalidatePage(address);
+ 		Flush();
+ 		return true;
+ 	}
+@@ -627,7 +765,78 @@ RISCV64VMTranslationMap::ClearAccessedAndModified(VMArea* area, addr_t address,
+ void
+ RISCV64VMTranslationMap::Flush()
+ {
+-	//NOT_IMPLEMENTED_PANIC();
++	// copy of X86VMTranslationMap::Flush
++	// TODO: move to common VMTranslationMap class
++
++	if (fInvalidPagesCount <= 0)
++		return;
++/*
++	dprintf("+Flush(%p)\n", this);
++	struct ScopeExit {
++		~ScopeExit()
++		{
++			dprintf("-Flush(%p)\n", this);
++		}
++	} scopeExit;
++*/
++	ThreadCPUPinner pinner(thread_get_current_thread());
++
++	if (fInvalidPagesCount > PAGE_INVALIDATE_CACHE_SIZE) {
++		// invalidate all pages
++		TRACE("flush_tmap: %d pages to invalidate, invalidate all\n",
++			fInvalidPagesCount);
++
++		if (fIsKernel) {
++			arch_cpu_global_TLB_invalidate();
++
++			// dprintf("+smp_send_broadcast_ici\n");
++			smp_send_broadcast_ici(SMP_MSG_GLOBAL_INVALIDATE_PAGES, 0, 0, 0,
++				NULL, SMP_MSG_FLAG_SYNC);
++			// dprintf("-smp_send_broadcast_ici\n");
++
++		} else {
++			cpu_status state = disable_interrupts();
++			arch_cpu_user_TLB_invalidate();
++			restore_interrupts(state);
++
++			int cpu = smp_get_current_cpu();
++			CPUSet cpuMask = fActiveOnCpus;
++			cpuMask.ClearBit(cpu);
++
++			if (!cpuMask.IsEmpty()) {
++				// dprintf("+smp_send_multicast_ici\n");
++				smp_send_multicast_ici(cpuMask, SMP_MSG_USER_INVALIDATE_PAGES,
++					0, 0, 0, NULL, SMP_MSG_FLAG_SYNC);
++				// dprintf("-smp_send_multicast_ici\n");
++			}
++		}
++	} else {
++		TRACE("flush_tmap: %d pages to invalidate, invalidate list\n",
++			fInvalidPagesCount);
++
++		arch_cpu_invalidate_TLB_list(fInvalidPages, fInvalidPagesCount);
++
++		if (fIsKernel) {
++			// dprintf("+smp_send_broadcast_ici\n");
++			smp_send_broadcast_ici(SMP_MSG_INVALIDATE_PAGE_LIST,
++				(addr_t)fInvalidPages, fInvalidPagesCount, 0, NULL,
++				SMP_MSG_FLAG_SYNC);
++			// dprintf("-smp_send_broadcast_ici\n");
++		} else {
++			int cpu = smp_get_current_cpu();
++			CPUSet cpuMask = fActiveOnCpus;
++			cpuMask.ClearBit(cpu);
++
++			if (!cpuMask.IsEmpty()) {
++				// dprintf("+smp_send_multicast_ici\n");
++				smp_send_multicast_ici(cpuMask, SMP_MSG_INVALIDATE_PAGE_LIST,
++					(addr_t)fInvalidPages, fInvalidPagesCount, 0, NULL,
++					SMP_MSG_FLAG_SYNC);
++				// dprintf("-smp_send_multicast_ici\n");
++			}
++		}
++	}
++	fInvalidPagesCount = 0;
+ }
+ 
+ 
+@@ -833,10 +1042,7 @@ RISCV64VMPhysicalPageMapper::MemsetPhysical(phys_addr_t address, int value,
+ {
+ 	TRACE("RISCV64VMPhysicalPageMapper::MemsetPhysical(0x%" B_PRIxADDR
+ 		", 0x%x, 0x%" B_PRIxADDR ")\n", address, value, length);
+-	set_ac();
+-	memset(VirtFromPhys(address), value, length);
+-	clear_ac();
+-	return B_OK;
++	return user_memset(VirtFromPhys(address), value, length);
+ }
+ 
+ 
+@@ -846,10 +1052,7 @@ RISCV64VMPhysicalPageMapper::MemcpyFromPhysical(void* to, phys_addr_t from,
+ {
+ 	TRACE("RISCV64VMPhysicalPageMapper::MemcpyFromPhysical(0x%" B_PRIxADDR
+ 		", 0x%" B_PRIxADDR ", %" B_PRIuSIZE ")\n", (addr_t)to, from, length);
+-	set_ac();
+-	memcpy(to, VirtFromPhys(from), length);
+-	clear_ac();
+-	return B_OK;
++	return user_memcpy(to, VirtFromPhys(from), length);
+ }
+ 
+ 
+@@ -859,10 +1062,7 @@ RISCV64VMPhysicalPageMapper::MemcpyToPhysical(phys_addr_t to, const void* from,
+ {
+ 	TRACE("RISCV64VMPhysicalPageMapper::MemcpyToPhysical(0x%" B_PRIxADDR
+ 		", 0x%" B_PRIxADDR ", %" B_PRIuSIZE ")\n", to, (addr_t)from, length);
+-	set_ac();
+-	memcpy(VirtFromPhys(to), from, length);
+-	clear_ac();
+-	return B_OK;
++	return user_memcpy(VirtFromPhys(to), from, length);
+ }
+ 
+ 
+@@ -872,7 +1072,5 @@ RISCV64VMPhysicalPageMapper::MemcpyPhysicalPage(phys_addr_t to,
+ {
+ 	TRACE("RISCV64VMPhysicalPageMapper::MemcpyPhysicalPage(0x%" B_PRIxADDR
+ 		", 0x%" B_PRIxADDR ")\n", to, from);
+-	set_ac();
+-	memcpy(VirtFromPhys(to), VirtFromPhys(from), B_PAGE_SIZE);
+-	clear_ac();
++	user_memcpy(VirtFromPhys(to), VirtFromPhys(from), B_PAGE_SIZE);
+ }
+diff --git a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+index 2d9e8a148c..d3ab3b0dfb 100644
+--- a/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
++++ b/src/system/kernel/arch/riscv64/RISCV64VMTranslationMap.h
+@@ -5,6 +5,11 @@
+ #include <arch_cpu_defs.h>
+ 
+ 
++enum {
++	PAGE_INVALIDATE_CACHE_SIZE = 64
++};
++
++
+ struct RISCV64VMTranslationMap: public VMTranslationMap {
+ 								RISCV64VMTranslationMap(bool kernel,
+ 									phys_addr_t pageTable = 0);
+@@ -79,6 +84,9 @@ struct RISCV64VMTranslationMap: public VMTranslationMap {
+ 			ssize_t				StrlcpyToMap(addr_t to, const char *from,
+ 									size_t size);
+ 
++	inline	CPUSet&				ActiveOnCpus();
++	inline	void				InvalidatePage(addr_t address);
++
+ private:
+ 			Pte*				LookupPte(addr_t virtAdr, bool alloc,
+ 									vm_page_reservation* reservation);
+@@ -86,16 +94,22 @@ private:
+ 
+ 			bool				fIsKernel;
+ 			phys_addr_t			fPageTable;
+-			uint64_t			fPageTableSize; // in page units
++			uint64				fPageTableSize; // in page units
++			CPUSet				fActiveOnCpus;
++			int					fInvalidPagesCount;
++			addr_t				fInvalidPages[PAGE_INVALIDATE_CACHE_SIZE];
+ };
+ 
+ 
+-inline phys_addr_t RISCV64VMTranslationMap::PageTable()
++inline phys_addr_t
++RISCV64VMTranslationMap::PageTable()
+ {
+ 	return fPageTable;
+ }
+ 
+-inline uint64 RISCV64VMTranslationMap::Satp()
++
++inline uint64
++RISCV64VMTranslationMap::Satp()
+ {
+ 	SatpReg satp;
+ 	satp.ppn = fPageTable / B_PAGE_SIZE;
+@@ -105,6 +119,23 @@ inline uint64 RISCV64VMTranslationMap::Satp()
+ }
+ 
+ 
++CPUSet&
++RISCV64VMTranslationMap::ActiveOnCpus()
++{
++	return fActiveOnCpus;
++}
++
++
++void
++RISCV64VMTranslationMap::InvalidatePage(addr_t address)
++{
++	if (fInvalidPagesCount < PAGE_INVALIDATE_CACHE_SIZE)
++		fInvalidPages[fInvalidPagesCount] = address;
++
++	fInvalidPagesCount++;
++}
++
++
+ struct RISCV64VMPhysicalPageMapper: public VMPhysicalPageMapper {
+ 								RISCV64VMPhysicalPageMapper();
+ 	virtual						~RISCV64VMPhysicalPageMapper();
+diff --git a/src/system/kernel/arch/riscv64/arch_cpu.cpp b/src/system/kernel/arch/riscv64/arch_cpu.cpp
+index d6a8000c69..de0d41495e 100644
+--- a/src/system/kernel/arch/riscv64/arch_cpu.cpp
++++ b/src/system/kernel/arch/riscv64/arch_cpu.cpp
+@@ -15,6 +15,8 @@
+ #include <platform/sbi/sbi_syscalls.h>
+ 
+ 
++extern "C" void SVec();
++
+ extern uint32 gPlatform1;
+ extern uint32 gPlatform2;
+ 
+@@ -22,6 +24,7 @@ extern uint32 gPlatform2;
+ status_t
+ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ {
++	// dprintf("arch_cpu_preboot_init_percpu(%" B_PRId32 ")\n", curr_cpu);
+ 	return B_OK;
+ }
+ 
+@@ -29,16 +32,34 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ status_t
+ arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
+ {
+-	//detect_cpu(curr_cpu);
++	SetStvec((uint64)SVec);
++	SstatusReg sstatus(Sstatus());
++	sstatus.ie = 0;
++	sstatus.fs = extStatusInitial; // enable FPU
++	sstatus.xs = extStatusOff;
++	SetSstatus(sstatus.val);
++	SetSie(Sie() | (1 << sTimerInt) | (1 << sSoftInt) | (1 << sExternInt));
+ 
+-	// we only support one anyway...
+-	return 0;
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ arch_cpu_init(kernel_args *args)
+ {
++	for (uint32 curCpu = 0; curCpu < args->num_cpus; curCpu++) {
++		cpu_ent* cpu = &gCPU[curCpu];
++
++		cpu->arch.hartId = args->arch_args.hartIds[curCpu];
++
++		cpu->topology_id[CPU_TOPOLOGY_PACKAGE] = 0;
++		cpu->topology_id[CPU_TOPOLOGY_CORE] = curCpu;
++		cpu->topology_id[CPU_TOPOLOGY_SMT] = 0;
++
++		for (unsigned int i = 0; i < CPU_MAX_CACHE_LEVEL; i++)
++			cpu->cache_id[i] = -1;
++	}
++
+ /*
+ 	uint64 conversionFactor
+ 		= (1LL << 32) * 1000000LL / args->arch_args.timerFrequrency;
+@@ -89,24 +110,33 @@ arch_cpu_memory_write_barrier(void)
+ void
+ arch_cpu_invalidate_TLB_range(addr_t start, addr_t end)
+ {
++	int32 numPages = end / B_PAGE_SIZE - start / B_PAGE_SIZE;
++	while (numPages-- >= 0) {
++		FlushTlbPage(start);
++		start += B_PAGE_SIZE;
++	}
+ }
+ 
+ 
+ void
+ arch_cpu_invalidate_TLB_list(addr_t pages[], int num_pages)
+ {
++	for (int i = 0; i < num_pages; i++)
++		FlushTlbPage(pages[i]);
+ }
+ 
+ 
+ void
+ arch_cpu_global_TLB_invalidate(void)
+ {
++	FlushTlbAll();
+ }
+ 
+ 
+ void
+ arch_cpu_user_TLB_invalidate(void)
+ {
++	FlushTlbAll();
+ }
+ 
+ 
+diff --git a/src/system/kernel/arch/riscv64/arch_debug.cpp b/src/system/kernel/arch/riscv64/arch_debug.cpp
+index 5bc6eb4b8d..dd39a20cc7 100644
+--- a/src/system/kernel/arch/riscv64/arch_debug.cpp
++++ b/src/system/kernel/arch/riscv64/arch_debug.cpp
+@@ -20,6 +20,12 @@ kernel_args *sKernelArgs;
+ bool sInitCalled = false;
+ 
+ 
++extern "C" void SVecRet();
++extern "C" void SVecURet();
++
++void WriteRegisters(iframe* frame);
++
++
+ static void
+ WriteImage(preloaded_image* _image)
+ {
+@@ -117,6 +123,19 @@ FindArea(addr_t adr)
+ }
+ 
+ 
++static VMArea*
++FindAreaEx(Thread* thread, addr_t adr)
++{
++	if (IS_KERNEL_ADDRESS(adr)) {
++		return VMAddressSpace::Kernel()->LookupArea(adr);
++	}
++	if (IS_USER_ADDRESS(adr)) {
++		return thread->team->address_space->LookupArea(adr);
++	}
++	return NULL;
++}
++
++
+ static status_t
+ lookup_symbol(Thread* thread, addr_t address, addr_t* _baseAddress,
+ 	const char** _symbolName, const char** _imageName, bool* _exactMatch)
+@@ -169,8 +188,8 @@ WritePCBoot(addr_t pc)
+ }
+ 
+ 
+-void
+-WritePC(addr_t pc)
++static void
++WritePCEx(Thread* thread, addr_t pc)
+ {
+ 	dprintf("0x%" B_PRIxADDR " ", pc);
+ 	if (!sInitCalled) {
+@@ -181,7 +200,7 @@ WritePC(addr_t pc)
+ 	const char* symbolName;
+ 	const char* imageName;
+ 	bool exactMatch;
+-	if (lookup_symbol(thread_get_current_thread(), pc, &baseAddress,
++	if (lookup_symbol(thread, pc, &baseAddress,
+ 		&symbolName, &imageName, &exactMatch) >= B_OK) {
+ 		if (symbolName != NULL) {
+ 			dprintf("<%s> %s + %" B_PRIdSSIZE, imageName, symbolName,
+@@ -192,7 +211,7 @@ WritePC(addr_t pc)
+ 		return;
+ 	}
+ 
+-	VMArea* area = FindArea(pc);
++	VMArea* area = FindAreaEx(thread, pc);
+ 	if (area != NULL) {
+ 		dprintf("<%s> 0x%" B_PRIxADDR, area->name, pc - area->Base());
+ 		return;
+@@ -202,14 +221,30 @@ WritePC(addr_t pc)
+ }
+ 
+ 
++void WritePC(addr_t pc)
++{
++	WritePCEx(thread_get_current_thread(), pc);
++}
++
++
++static status_t
++arch_debug_memcpy(void* dst, const void* src, size_t size)
++{
++	if (debug_debugger_running())
++		return debug_memcpy(B_CURRENT_TEAM, dst, src, size);
++
++	return user_memcpy(dst, src, size);
++}
++
++
+ static void
+ DumpMemory(uint64* adr, size_t len)
+ {
+ 	while (len > 0) {
+ 		if ((addr_t)adr % 0x10 == 0)
+-			dprintf("%08" B_PRIxADDR " ", (addr_t)adr);
++			dprintf("  %08" B_PRIxADDR " ", (addr_t)adr);
+ 		uint64 val;
+-		if (user_memcpy(&val, adr++, sizeof(val)) < B_OK) {
++		if (arch_debug_memcpy(&val, adr++, sizeof(val)) < B_OK) {
+ 			dprintf(" ????????????????");
+ 		} else {
+ 			dprintf(" %016" B_PRIx64, val);
+@@ -223,39 +258,57 @@ DumpMemory(uint64* adr, size_t len)
+ }
+ 
+ 
+-void
+-DoStackTrace(addr_t fp, addr_t pc)
++static void
++DoStackTraceEx(Thread* thread, addr_t fp, addr_t pc)
+ {
+ 	dprintf("Stack:\n");
+ 	dprintf("FP: 0x%" B_PRIxADDR, fp);
+ 	if (pc != 0) {
+-		dprintf(", PC: "); WritePC(pc);
++		dprintf(", PC: "); WritePCEx(thread, pc);
+ 	}
+ 	dprintf("\n");
+ 	addr_t oldFp = fp;
+-	while (fp != 0) {
++	int i = 0;
++	while (fp != 0 && i < 1000) {
+ 		if (
+ 			(pc >= (addr_t)&strcpy && pc < (addr_t)&strcpy + 32) ||
+-			(pc >= (addr_t)&memset && pc < (addr_t)&memset + 34)
++			(pc >= (addr_t)&memset && pc < (addr_t)&memset + 34) ||
++			(pc >= (addr_t)&memcpy && pc < (addr_t)&memcpy + 186)
+ 		) {
+-			if (user_memcpy(&fp, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
++			if (arch_debug_memcpy(&fp, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
+ 			pc = 0;
+ 		} else {
+-			if (user_memcpy(&pc, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
+-			if (user_memcpy(&fp, (uint64*)fp - 2, sizeof(pc)) < B_OK) break;
++			if (arch_debug_memcpy(&pc, (uint64*)fp - 1, sizeof(pc)) < B_OK) break;
++			if (arch_debug_memcpy(&fp, (uint64*)fp - 2, sizeof(pc)) < B_OK) break;
+ 		}
+ 		dprintf("FP: 0x%" B_PRIxADDR, fp);
+-		dprintf(", PC: "); WritePC((pc == 0) ? 0 : pc - 1);
++		dprintf(", PC: "); WritePCEx(thread, pc);
+ 		dprintf("\n");
++
++		if (pc == (addr_t)&SVecRet || pc == (addr_t)&SVecURet) {
++			WriteTrapInfo((iframe*)fp - 1);
++		}
++
+ /*
+-		if (IS_KERNEL_ADDRESS(oldFp) && IS_KERNEL_ADDRESS(fp))
++		if (IS_KERNEL_ADDRESS(oldFp) != IS_KERNEL_ADDRESS(fp))
++			oldFp = fp;
++		else if (fp != 0)
+ 			DumpMemory((uint64*)oldFp, (addr_t)fp - (addr_t)oldFp);
+ */
++
+ 		oldFp = fp;
++		i++;
+ 	}
+ }
+ 
+ 
++void
++DoStackTrace(addr_t fp, addr_t pc)
++{
++	DoStackTraceEx(thread_get_current_thread(), fp, pc);
++}
++
++
+ static int
+ stack_trace(int argc, char **argv)
+ {
+@@ -268,7 +321,8 @@ stack_trace(int argc, char **argv)
+ 		}
+ 		uint64 oldSatp = Satp();
+ 		SetSatp(thread->arch_info.context.satp);
+-		DoStackTrace(thread->arch_info.context.s[0], thread->arch_info.context.ra);
++		DebuggedThreadSetter threadSetter(thread);
++		DoStackTraceEx(thread, thread->arch_info.context.s[0], thread->arch_info.context.ra);
+ 		SetSatp(oldSatp);
+ 		return 0;
+ 	}
+diff --git a/src/system/kernel/arch/riscv64/arch_int.cpp b/src/system/kernel/arch/riscv64/arch_int.cpp
+index 95af34f489..b8bf80aae1 100644
+--- a/src/system/kernel/arch/riscv64/arch_int.cpp
++++ b/src/system/kernel/arch/riscv64/arch_int.cpp
+@@ -26,17 +26,12 @@
+ #include <algorithm>
+ 
+ 
+-static uint32 sBootHartId = 0;
+-static int32 sPlicContextOfs = 0;
+-
+-
+-extern "C" void SVec();
+-extern "C" void SVecU();
++static uint32 sPlicContexts[SMP_MAX_CPUS];
+ 
+ 
+ //#pragma mark debug output
+ 
+-void
++static void
+ WriteMode(int mode)
+ {
+ 	switch (mode) {
+@@ -48,7 +43,7 @@ WriteMode(int mode)
+ }
+ 
+ 
+-void
++static void
+ WriteModeSet(uint32_t val)
+ {
+ 	bool first = true;
+@@ -63,21 +58,20 @@ WriteModeSet(uint32_t val)
+ }
+ 
+ 
+-void
+-WriteMstatus(uint64_t val)
++static void
++WriteExt(uint64_t val)
+ {
+-	MstatusReg status(val);
+-	dprintf("(");
+-	dprintf("ie: "); WriteModeSet(status.ie);
+-	dprintf(", pie: "); WriteModeSet(status.pie);
+-	dprintf(", spp: "); WriteMode(status.spp);
+-	dprintf(", mpp: "); WriteMode(status.mpp);
+-	dprintf(", sum: %d", (int)status.sum);
+-	dprintf(")");
++	switch (val) {
++		case 0: dprintf("off"); break;
++		case 1: dprintf("initial"); break;
++		case 2: dprintf("clean"); break;
++		case 3: dprintf("dirty"); break;
++		default: dprintf("%" B_PRId64, val);
++	}
+ }
+ 
+ 
+-void
++static void
+ WriteSstatus(uint64_t val)
+ {
+ 	SstatusReg status(val);
+@@ -85,12 +79,17 @@ WriteSstatus(uint64_t val)
+ 	dprintf("ie: "); WriteModeSet(status.ie);
+ 	dprintf(", pie: "); WriteModeSet(status.pie);
+ 	dprintf(", spp: "); WriteMode(status.spp);
++	dprintf(", fs: "); WriteExt(status.fs);
++	dprintf(", xs: "); WriteExt(status.xs);
+ 	dprintf(", sum: %d", (int)status.sum);
++	dprintf(", mxr: %d", (int)status.mxr);
++	dprintf(", uxl: %d", (int)status.uxl);
++	dprintf(", sd: %d", (int)status.sd);
+ 	dprintf(")");
+ }
+ 
+ 
+-void
++static void
+ WriteInterrupt(uint64_t val)
+ {
+ 	switch (val) {
+@@ -108,7 +107,7 @@ WriteInterrupt(uint64_t val)
+ }
+ 
+ 
+-void
++static void
+ WriteInterruptSet(uint64_t val)
+ {
+ 	bool first = true;
+@@ -123,7 +122,7 @@ WriteInterruptSet(uint64_t val)
+ }
+ 
+ 
+-void
++static void
+ WriteCause(uint64_t cause)
+ {
+ 	if ((cause & causeInterrupt) == 0) {
+@@ -151,18 +150,99 @@ WriteCause(uint64_t cause)
+ }
+ 
+ 
++const static char* registerNames[] = {
++	" ra", " t6", " sp", " gp",
++	" tp", " t0", " t1", " t2",
++	" t5", " s1", " a0", " a1",
++	" a2", " a3", " a4", " a5",
++	" a6", " a7", " s2", " s3",
++	" s4", " s5", " s6", " s7",
++	" s8", " s9", "s10", "s11",
++	" t3", " t4", " fp", "epc"
++};
++
++
++static void WriteRegisters(iframe* frame)
++{
++	uint64* regs = &frame->ra;
++	for (int i = 0; i < 32; i += 4) {
++		dprintf(
++			"  %s: 0x%016" B_PRIx64
++			"  %s: 0x%016" B_PRIx64
++			"  %s: 0x%016" B_PRIx64
++			"  %s: 0x%016" B_PRIx64 "\n",
++			registerNames[i + 0], regs[i + 0],
++			registerNames[i + 1], regs[i + 1],
++			registerNames[i + 2], regs[i + 2],
++			registerNames[i + 3], regs[i + 3]
++		);
++	}
++}
++
++
++static void
++DumpMemory(uint64* adr, size_t len)
++{
++	while (len > 0) {
++		if ((addr_t)adr % 0x10 == 0)
++			dprintf("%08" B_PRIxADDR " ", (addr_t)adr);
++		uint64 val;
++		if (user_memcpy(&val, adr++, sizeof(val)) < B_OK) {
++			dprintf(" ????????????????");
++		} else {
++			dprintf(" %016" B_PRIx64, val);
++		}
++		if ((addr_t)adr % 0x10 == 0)
++			dprintf("\n");
++		len -= 8;
++	}
++	if ((addr_t)adr % 0x10 != 0)
++		dprintf("\n");
++
++	dprintf("%08" B_PRIxADDR "\n\n", (addr_t)adr);
++}
++
++
+ void
+-WriteTrapInfo()
++WriteTrapInfo(iframe* frame)
+ {
+ 	InterruptsLocker locker;
+-	dprintf("STrap("); WriteCause(Scause()); dprintf(")\n");
+-	dprintf("  sstatus: "); WriteSstatus(Sstatus()); dprintf("\n");
+-	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
+-	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
++	dprintf("STrap("); WriteCause(frame->cause); dprintf(")\n");
++	dprintf("  sstatus: "); WriteSstatus(frame->status); dprintf("\n");
++//	dprintf("  sie: "); WriteInterruptSet(Sie()); dprintf("\n");
++//	dprintf("  sip: "); WriteInterruptSet(Sip()); dprintf("\n");
+ 	//dprintf("  stval: "); WritePC(Stval()); dprintf("\n");
+-	dprintf("  stval: 0x%" B_PRIx64 "\n", Stval());
+-	dprintf("  tp: 0x%" B_PRIxADDR "(%s)\n", Tp(),
+-		thread_get_current_thread()->name);
++	dprintf("  stval: 0x%" B_PRIx64 "\n", frame->tval);
++//	dprintf("  tp: 0x%" B_PRIxADDR "(%s)\n", Tp(),
++//		thread_get_current_thread()->name);
++
++	WriteRegisters(frame);
++#if 0
++	dprintf("  kernel stack: %#" B_PRIxADDR " - %#" B_PRIxADDR "\n",
++		thread_get_current_thread()->kernel_stack_base,
++		thread_get_current_thread()->kernel_stack_top - 1
++	);
++	dprintf("  user stack: %#" B_PRIxADDR " - %#" B_PRIxADDR "\n",
++		thread_get_current_thread()->user_stack_base,
++		thread_get_current_thread()->user_stack_base +
++		thread_get_current_thread()->user_stack_size - 1
++	);
++	if (thread_get_current_thread()->arch_info.userFrame != NULL) {
++		WriteRegisters(thread_get_current_thread()->arch_info.userFrame);
++
++		dprintf("Stack memory dump:\n");
++		DumpMemory(
++			(uint64*)thread_get_current_thread()->arch_info.userFrame->sp,
++			thread_get_current_thread()->user_stack_base +
++			thread_get_current_thread()->user_stack_size -
++			thread_get_current_thread()->arch_info.userFrame->sp
++		);
++//		if (true) {
++//		} else {
++//			DumpMemory((uint64*)frame->sp, thread_get_current_thread()->kernel_stack_top - frame->sp);
++//		}
++	}
++#endif
+ }
+ 
+ 
+@@ -176,7 +256,6 @@ SendSignal(debug_exception_type type, uint32 signalNumber, int32 signalCode,
+ 		struct sigaction action;
+ 		Thread* thread = thread_get_current_thread();
+ 
+-		WriteTrapInfo();
+ 		DoStackTrace(Fp(), 0);
+ 
+ 		enable_interrupts();
+@@ -193,7 +272,6 @@ SendSignal(debug_exception_type type, uint32 signalNumber, int32 signalCode,
+ 			send_signal_to_thread(thread, signal, 0);
+ 		}
+ 	} else {
+-		WriteTrapInfo();
+ 		panic("Unexpected exception occurred in kernel mode!");
+ 	}
+ }
+@@ -244,6 +322,10 @@ SetAccessedFlags(addr_t addr, bool isWrite)
+ 	phys_addr_t physAdr;
+ 	uint32 pageFlags;
+ 	map->QueryInterrupt(addr, &physAdr, &pageFlags);
++
++	if ((PAGE_PRESENT & pageFlags) == 0)
++		return false;
++
+ 	if (isWrite) {
+ 		if (
+ 			((B_WRITE_AREA | B_KERNEL_WRITE_AREA) & pageFlags) != 0
+@@ -272,23 +354,6 @@ SetAccessedFlags(addr_t addr, bool isWrite)
+ }
+ 
+ 
+-static void
+-WriteProtection(uint32 flags)
+-{
+-	dprintf("kernel: {");
+-	if (B_KERNEL_READ_AREA & flags) dprintf("R");
+-	if (B_KERNEL_WRITE_AREA & flags) dprintf("W");
+-	if (B_KERNEL_EXECUTE_AREA & flags) dprintf("X");
+-	if (B_KERNEL_STACK_AREA & flags) dprintf("S");
+-	dprintf("}, user: {");
+-	if (B_READ_AREA & flags) dprintf("R");
+-	if (B_WRITE_AREA & flags) dprintf("W");
+-	if (B_EXECUTE_AREA & flags) dprintf("X");
+-	if (B_STACK_AREA & flags) dprintf("S");
+-	dprintf("}");
+-}
+-
+-
+ template<typename F>
+ class ScopeExit 
+ {
+@@ -326,29 +391,45 @@ STrap(iframe* frame)
+ {
+ 	// dprintf("STrap("); WriteCause(Scause()); dprintf(")\n");
+ 
+-	SstatusReg status(Sstatus());
+-	uint64 cause = Scause();
++/*
++	iframe oldFrame = *frame;
++	const auto& frameChangeChecker = MakeScopeExit([&]() {
++			InterruptsLocker locker;
++			bool first = true;
++			for (int i = 0; i < 32; i++) {
++				uint64 oldVal = ((int64*)&oldFrame)[i];
++				uint64 newVal = ((int64*)frame)[i];
++				if (oldVal != newVal) {
++					if (first) {
++						dprintf("FrameChangeChecker, thread: %" B_PRId32 "(%s)\n", thread_get_current_thread()->id, thread_get_current_thread()->name);
++						first = false;
++					}
++					dprintf("  %s: %#" B_PRIxADDR " -> %#" B_PRIxADDR "\n", registerNames[i], oldVal, newVal);
++				}
++			}
+ 
+-	const auto& statusRestorer = MakeScopeExit([&]() {
+-		SetSstatus(status.val);
++			if (frame->epc == 0)
++				panic("FrameChangeChecker: EPC = 0");
+ 	});
+-
+-	switch (cause) {
++*/
++	switch (frame->cause) {
+ 		case causeExecPageFault:
+ 		case causeLoadPageFault:
+ 		case causeStorePageFault: {
+-			if (SetAccessedFlags(Stval(), cause == causeStorePageFault))
++			if (SetAccessedFlags(Stval(), frame->cause == causeStorePageFault))
+ 				return;
+ 		}
+ 	}
+ 
+-	if (status.spp == modeU) {
++	if (SstatusReg(frame->status).spp == modeU) {
+ 		thread_get_current_thread()->arch_info.userFrame = frame;
++		thread_get_current_thread()->arch_info.oldA0 = frame->a0;
+ 		thread_at_kernel_entry(system_time());
+ 	}
+ 	const auto& kernelExit = MakeScopeExit([&]() {
+-		if (status.spp == modeU) {
++		if (SstatusReg(frame->status).spp == modeU) {
+ 			disable_interrupts();
++			atomic_and(&thread_get_current_thread()->flags, ~THREAD_FLAGS_SYSCALL_RESTARTED);
+ 			if ((thread_get_current_thread()->flags
+ 				& (THREAD_FLAGS_SIGNALS_PENDING
+ 				| THREAD_FLAGS_DEBUG_THREAD
+@@ -358,11 +439,18 @@ STrap(iframe* frame)
+ 			} else {
+ 				thread_at_kernel_exit_no_signals();
+ 			}
++			if ((THREAD_FLAGS_RESTART_SYSCALL & thread_get_current_thread()->flags) != 0) {
++				atomic_and(&thread_get_current_thread()->flags, ~THREAD_FLAGS_RESTART_SYSCALL);
++				atomic_or(&thread_get_current_thread()->flags, THREAD_FLAGS_SYSCALL_RESTARTED);
++
++				frame->a0 = thread_get_current_thread()->arch_info.oldA0;
++				frame->epc -= 4;
++			}
+ 			thread_get_current_thread()->arch_info.userFrame = NULL;
+ 		}
+ 	});
+ 
+-	switch (cause) {
++	switch (frame->cause) {
+ 		case causeIllegalInst: {
+ 			return SendSignal(B_INVALID_OPCODE_EXCEPTION, SIGILL, ILL_ILLOPC,
+ 				frame->epc);
+@@ -391,7 +479,7 @@ STrap(iframe* frame)
+ 					cpu_ent* cpu = &gCPU[smp_get_current_cpu()];
+ 					if (cpu->fault_handler != 0) {
+ 						debug_set_page_fault_info(stval, frame->epc,
+-							(cause == causeStorePageFault)
++							(frame->cause == causeStorePageFault)
+ 								? DEBUG_PAGE_FAULT_WRITE : 0);
+ 						frame->epc = cpu->fault_handler;
+ 						frame->sp = cpu->fault_handler_stack_pointer;
+@@ -402,7 +490,7 @@ STrap(iframe* frame)
+ 						kprintf("ERROR: thread::fault_handler used in kernel "
+ 							"debugger!\n");
+ 						debug_set_page_fault_info(stval, frame->epc,
+-							cause == causeStorePageFault
++							frame->cause == causeStorePageFault
+ 								? DEBUG_PAGE_FAULT_WRITE : 0);
+ 						frame->epc = (addr_t)thread->fault_handler;
+ 						return;
+@@ -414,29 +502,46 @@ STrap(iframe* frame)
+ 				return;
+ 			}
+ 
+-			if (status.pie == 0) {
+-				WriteTrapInfo();
++			if (SstatusReg(frame->status).pie == 0) {
++				// user_memcpy() failure
++				Thread* thread = thread_get_current_thread();
++				if (thread != NULL && thread->fault_handler != 0) {
++					addr_t handler = (addr_t)(thread->fault_handler);
++					if (frame->epc != handler) {
++						frame->epc = handler;
++						return;
++					}
++				}
+ 				panic("page fault with interrupts disabled@!dump_virt_page %#" B_PRIx64, stval);
+ 			}
+ 
+ 			addr_t newIP = 0;
+ 			enable_interrupts();
+-			vm_page_fault(stval, frame->epc, cause == causeStorePageFault,
+-				cause == causeExecPageFault, status.spp == modeU, status.sum != 0, &newIP);
++			vm_page_fault(stval, frame->epc, frame->cause == causeStorePageFault,
++				frame->cause == causeExecPageFault, SstatusReg(frame->status).spp == modeU, SstatusReg(frame->status).sum != 0, &newIP);
+ 			if (newIP != 0)
+ 				frame->epc = newIP;
+ 
+ 			return;
+ 		}
++		case causeInterrupt + sSoftInt: {
++			SetSip(Sip() & ~(1 << sSoftInt));
++			// dprintf("sSoftInt(%" B_PRId32 ")\n", smp_get_current_cpu());
++			smp_intercpu_int_handler(smp_get_current_cpu());
++			AfterInterrupt();
++			return;
++		}
+ 		case causeInterrupt + sTimerInt: {
++			SetSie(Sie() & ~(1 << sTimerInt));
++			// dprintf("sTimerInt(%" B_PRId32 ")\n", smp_get_current_cpu());
+ 			timer_interrupt();
+ 			AfterInterrupt();
+ 			return;
+ 		}
+ 		case causeInterrupt + sExternInt: {
+-			uint64 irq = gPlicRegs->contexts[modeS + 2*sBootHartId + sPlicContextOfs].claimAndComplete;
++			uint64 irq = gPlicRegs->contexts[sPlicContexts[smp_get_current_cpu()]].claimAndComplete;
+ 			int_io_interrupt_handler(irq, true);
+-			gPlicRegs->contexts[modeS + 2*sBootHartId + sPlicContextOfs].claimAndComplete = irq;
++			gPlicRegs->contexts[sPlicContexts[smp_get_current_cpu()]].claimAndComplete = irq;
+ 			AfterInterrupt();
+ 			return;
+ 		}
+@@ -462,12 +567,12 @@ STrap(iframe* frame)
+ 			switch (syscall) {
+ 				case SYSCALL_READ_PORT_ETC:
+ 				case SYSCALL_WRITE_PORT_ETC:
+-					WriteTrapInfo();
+ 					DoStackTrace(Fp(), 0);
+ 					break;
+ 			}
+ */
+ 			// dprintf("syscall: %s\n", kExtendedSyscallInfos[syscall].name);
++
+ 			enable_interrupts();
+ 			uint64 returnValue = 0;
+ 			syscall_dispatcher(syscall, (void*)args, &returnValue);
+@@ -475,7 +580,6 @@ STrap(iframe* frame)
+ 			return;
+ 		}
+ 	}
+-	WriteTrapInfo();
+ 	panic("unhandled STrap");
+ }
+ 
+@@ -485,21 +589,23 @@ STrap(iframe* frame)
+ status_t
+ arch_int_init(kernel_args* args)
+ {
+-	sBootHartId = args->arch_args.bootHart;
+-	sPlicContextOfs = (sBootHartId == 0) ? 0 : -1;
++	dprintf("arch_int_init()\n");
+ 
+-	SetStvec((uint64)SVec);
+-	SstatusReg sstatus(Sstatus());
+-	sstatus.ie = 0;
+-	sstatus.fs = extStatusInitial; // enable FPU
+-	sstatus.xs = extStatusOff;
+-	SetSstatus(sstatus.val);
+-	SetSie(Sie() | (1 << sTimerInt) | (1 << sExternInt));
++	for (uint32 i = 0; i < args->num_cpus; i++) {
++		dprintf("  CPU %" B_PRIu32 ":\n", i);
++		dprintf("    hartId: %" B_PRIu32 "\n", args->arch_args.hartIds[i]);
++		dprintf("    plicContext: %" B_PRIu32 "\n", args->arch_args.plicContexts[i]);
++	}
++
++	for (uint32 i = 0; i < args->num_cpus; i++)
++		sPlicContexts[i] = args->arch_args.plicContexts[i];
+ 
+ 	// TODO: read from FDT
+ 	reserve_io_interrupt_vectors(128, 0, INTERRUPT_TYPE_IRQ);
+ 
+-	gPlicRegs->contexts[modeS + 2*sBootHartId + sPlicContextOfs].priorityThreshold = 0;
++	for (uint32 i = 0; i < args->num_cpus; i++)
++		gPlicRegs->contexts[sPlicContexts[i]].priorityThreshold = 0;
++
+ 	return B_OK;
+ }
+ 
+@@ -530,7 +636,7 @@ arch_int_enable_io_interrupt(int irq)
+ {
+ 	dprintf("arch_int_enable_io_interrupt(%d)\n", irq);
+ 	gPlicRegs->priority[irq] = 1;
+-	gPlicRegs->enable[modeS + 2*sBootHartId + sPlicContextOfs][irq / 32] |= 1 << (irq % 32);
++	gPlicRegs->enable[sPlicContexts[0]][irq / 32] |= 1 << (irq % 32);
+ }
+ 
+ 
+@@ -539,12 +645,47 @@ arch_int_disable_io_interrupt(int irq)
+ {
+ 	dprintf("arch_int_disable_io_interrupt(%d)\n", irq);
+ 	gPlicRegs->priority[irq] = 0;
+-	gPlicRegs->enable[modeS + 2*sBootHartId + sPlicContextOfs][irq / 32] &= ~(1 << (irq % 32));
++	gPlicRegs->enable[sPlicContexts[0]][irq / 32] &= ~(1 << (irq % 32));
+ }
+ 
+ 
+ void
+ arch_int_assign_to_cpu(int32 irq, int32 cpu)
+ {
+-	// SMP not yet supported
++	if (cpu != 0)
++		panic("arch_int_assign_to_cpu: not implemented");
++}
++
++
++#undef arch_int_enable_interrupts
++#undef arch_int_disable_interrupts
++#undef arch_int_restore_interrupts
++#undef arch_int_are_interrupts_enabled
++
++
++extern "C" void
++arch_int_enable_interrupts()
++{
++	arch_int_enable_interrupts_inline();
++}
++
++
++extern "C" int
++arch_int_disable_interrupts()
++{
++	return arch_int_disable_interrupts_inline();
++}
++
++
++extern "C" void
++arch_int_restore_interrupts(int oldState)
++{
++	arch_int_restore_interrupts_inline(oldState);
++}
++
++
++extern "C" bool
++arch_int_are_interrupts_enabled()
++{
++	return arch_int_are_interrupts_enabled_inline();
+ }
+diff --git a/src/system/kernel/arch/riscv64/arch_platform.cpp b/src/system/kernel/arch/riscv64/arch_platform.cpp
+index b8c5636112..251dd71d30 100644
+--- a/src/system/kernel/arch/riscv64/arch_platform.cpp
++++ b/src/system/kernel/arch/riscv64/arch_platform.cpp
+@@ -60,7 +60,7 @@ arch_platform_init(struct kernel_args *args)
+ status_t
+ arch_platform_init_post_vm(struct kernel_args *kernelArgs)
+ {
+-	if (gPlatform1 == kPlatform1Sbi) {
++	if (false && gPlatform1 == kPlatform1Sbi) {
+ 		sbiret res;
+ 		res = sbi_get_spec_version();
+ 		dprintf("SBI spec version: %#lx\n", res.value);
+diff --git a/src/system/kernel/arch/riscv64/arch_smp.cpp b/src/system/kernel/arch/riscv64/arch_smp.cpp
+index 5971139e11..061119a35b 100644
+--- a/src/system/kernel/arch/riscv64/arch_smp.cpp
++++ b/src/system/kernel/arch/riscv64/arch_smp.cpp
+@@ -17,16 +17,60 @@
+ #include <debug.h>
+ #include <int.h>
+ 
++#include <cpu.h>
++#include <platform/sbi/sbi_syscalls.h>
++
++
++extern uint32 gPlatform1;
++extern uint32 gPlatform2;
++
++
++static void
++WriteTopologyLevel(cpu_topology_level level)
++{
++	switch (level) {
++		case CPU_TOPOLOGY_SMT:     dprintf("smt"); break;
++		case CPU_TOPOLOGY_CORE:    dprintf("core"); break;
++		case CPU_TOPOLOGY_PACKAGE: dprintf("package"); break;
++		case CPU_TOPOLOGY_LEVELS:  dprintf("levels"); break;
++		default: dprintf("?(%d)", level);
++	}
++}
++
++
++static void
++DumpCpuTopologyInt(const cpu_topology_node* node, int indent)
++{
++	for (int i = 0; i < indent; i++)
++		dprintf("  ");
++
++	dprintf("node(%d, ", node->id);
++	WriteTopologyLevel(node->level);
++	dprintf(")\n");
++
++	for (int i = 0; i < node->children_count; i++)
++		DumpCpuTopologyInt(node->children[i], indent + 1);
++}
++
++
++void
++DumpCpuTopology()
++{
++	dprintf("CPU topology:\n");
++	DumpCpuTopologyInt(get_cpu_topology(), 1);
++}
++
+ 
+ status_t
+ arch_smp_init(kernel_args *args)
+ {
++	dprintf("arch_smp_init()\n");
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-arch_smp_per_cpu_init(kernel_args *args, int32 cpu)
++arch_smp_per_cpu_init(kernel_args *args, int32 cpuId)
+ {
+ 	return B_OK;
+ }
+@@ -35,6 +79,20 @@ arch_smp_per_cpu_init(kernel_args *args, int32 cpu)
+ void
+ arch_smp_send_multicast_ici(CPUSet& cpuSet)
+ {
++	switch (gPlatform1) {
++	case kPlatform1Sbi: {
++		int32 cpuCount = smp_get_num_cpus();
++		for (int32 i = 0; i < cpuCount; i++) {
++			if (cpuSet.GetBit(i) && i != smp_get_current_cpu()) {
++				// TODO: use bitset to send multiple IPI at once
++				sbi_send_ipi((uint64)1 << gCPU[i].arch.hartId, 0);
++			}
++		}
++		break;
++	}
++	default:
++		dprintf("arch_smp_send_multicast_ici: not implemented\n");
++	}
+ #if KDEBUG
+ 	if (are_interrupts_enabled())
+ 		panic("arch_smp_send_multicast_ici: called with interrupts enabled");
+@@ -45,14 +103,26 @@ arch_smp_send_multicast_ici(CPUSet& cpuSet)
+ void
+ arch_smp_send_ici(int32 target_cpu)
+ {
+-	panic("called arch_smp_send_ici!\n");
++	switch (gPlatform1) {
++	case kPlatform1Sbi:
++		// dprintf("arch_smp_send_ici(%" B_PRId32 ")\n", target_cpu);
++		sbi_send_ipi((uint64)1 << gCPU[target_cpu].arch.hartId, 0);
++		break;
++	default:
++		dprintf("arch_smp_send_ici: not implemented\n");
++	}
+ }
+ 
+ 
+ void
+ arch_smp_send_broadcast_ici()
+ {
+-	panic("called arch_smp_send_broadcast_ici\n");
++	switch (gPlatform1) {
++	case kPlatform1Sbi:
++		// dprintf("arch_smp_send_broadcast_ici()\n");
++		sbi_send_ipi(0, -1);
++		break;
++	default:
++		dprintf("arch_smp_send_broadcast_ici: not implemented\n");
++	}
+ }
+-
+-
+diff --git a/src/system/kernel/arch/riscv64/arch_timer.cpp b/src/system/kernel/arch/riscv64/arch_timer.cpp
+index 7510930b7f..28099266d2 100644
+--- a/src/system/kernel/arch/riscv64/arch_timer.cpp
++++ b/src/system/kernel/arch/riscv64/arch_timer.cpp
+@@ -17,6 +17,8 @@
+ #include <Clint.h>
+ #include <platform/sbi/sbi_syscalls.h>
+ 
++#include <smp.h>
++
+ 
+ extern uint32 gPlatform1;
+ extern uint32 gPlatform2;
+@@ -25,6 +27,8 @@ extern uint32 gPlatform2;
+ void
+ arch_timer_set_hardware_timer(bigtime_t timeout)
+ {
++	// dprintf("arch_timer_set_hardware_timer(%" B_PRIu64 "), cpu: %" B_PRId32 "\n", timeout, smp_get_current_cpu());
++
+ 	// TODO: Read timer frequency from FDT
+ 	switch (gPlatform1) {
+ 		case kPlatform1Riscv:
+@@ -38,12 +42,16 @@ arch_timer_set_hardware_timer(bigtime_t timeout)
+ 		default:
+ 			;
+ 	}
++
++	SetSie(Sie() | (1 << sTimerInt));
+ }
+ 
+ 
+ void
+ arch_timer_clear_hardware_timer()
+ {
++	SetSie(Sie() & ~(1 << sTimerInt));
++
+ 	switch (gPlatform1) {
+ 		case kPlatform1Riscv:
+ 			MSyscall(kMSyscallSetTimer, false);
+diff --git a/src/system/kernel/arch/riscv64/arch_traps.S b/src/system/kernel/arch/riscv64/arch_traps.S
+index dcadb6ed51..11b65f64d9 100644
+--- a/src/system/kernel/arch/riscv64/arch_traps.S
++++ b/src/system/kernel/arch/riscv64/arch_traps.S
+@@ -4,43 +4,58 @@
+  */
+ 
+ 
++#include <asm_defs.h>
+ #include "arch_traps.h"
++#include "asm_offsets.h"
+ 
+ 
+-.globl SVec
+-.type  SVec, @function
+ .align 4
+-SVec:
+-	PushTrapFrame
+-	sd fp, 2*8(sp)
++FUNCTION(SVec):
++	PushTrapFrame IFRAME_ra
++	sd fp, IFRAME_sp(sp)
+ 	csrr t0, sepc
+-	sd   t0, 31*8(sp)
++	sd   t0, IFRAME_epc(sp)
++
++	csrr t0, sstatus
++	sd   t0, IFRAME_status(sp)
++	csrr t0, scause
++	sd   t0, IFRAME_cause(sp)
++	csrr t0, stval
++	sd   t0, IFRAME_tval(sp)
+ 
+ 	mv a0, sp
+ 	call STrap
+ 
+-	ld t0, 31*8(sp)
++FUNCTION(SVecRet):
++	ld   t0, IFRAME_status(sp)
++	csrw sstatus, t0
++
++	ld t0, IFRAME_epc(sp)
+ 	csrw sepc, t0
+-	PopTrapFrame
++	PopTrapFrame IFRAME_ra
+ 	sret
+-.size	SVec, .-SVec
++FUNCTION_END(SVec)
+ 
+ 
+-.globl SVecU
+-.type  SVecU, @function
+ .align 4
+-SVecU:
+-	csrrw t0, sscratch, t0   # t0: &arch_thread
+-	ld    tp,        0*8(t0) # tp = arch_thread.thread
+-	ld    t0, (1 + 13)*8(t0) # t0 = arch_thread.context.sp
+-	sd    sp,  2*8 - 256(t0) # save user SP
+-	mv    sp, t0             # switch to kernel stack
+-	csrr  t0, sscratch
+-
+-	PushTrapFrame
++FUNCTION(SVecU):
++	# switch to kernel stack, SSCRATCH will hold user SP
++	csrrw sp, sscratch, sp
+ 
++	PushTrapFrame IFRAME_ra
++	csrr t0, sscratch
++	sd   t0, IFRAME_sp(sp)
+ 	csrr t0, sepc
+-	sd   t0, 31*8(sp)
++	sd   t0, IFRAME_epc(sp)
++
++	csrr t0, sstatus
++	sd   t0, IFRAME_status(sp)
++	csrr t0, scause
++	sd   t0, IFRAME_cause(sp)
++	csrr t0, stval
++	sd   t0, IFRAME_tval(sp)
++
++	ld tp, ARCH_STACK_thread(fp)
+ 
+ 	la   t0,    SVec
+ 	csrw stvec, t0
+@@ -48,19 +63,18 @@ SVecU:
+ 	mv a0, sp
+ 	call STrap
+ 
+-.globl SVecURet
+-.type  SVecURet, @function
+-SVecURet:
+-	call RestoreUserRegs
+-
+-	csrr  t0, sscratch
+-	sd    fp, (1 + 13)*8(t0) # arch_thread.context.sp = fp
++FUNCTION(SVecURet):
++	csrw sscratch, fp # save kernel SP
+ 
+ 	la   t0,    SVecU
+ 	csrw stvec, t0
+ 
+-	ld t0, 31*8(sp)
++	ld   t0, IFRAME_status(sp)
++	csrw sstatus, t0
++
++	ld tp, IFRAME_tp(sp)
++	ld t0, IFRAME_epc(sp)
+ 	csrw sepc, t0
+-	PopTrapFrame
++	PopTrapFrame IFRAME_ra
+ 	sret
+-.size	SVecU, .-SVecU
++FUNCTION_END(SVecU)
+diff --git a/src/system/kernel/arch/riscv64/arch_vm.cpp b/src/system/kernel/arch/riscv64/arch_vm.cpp
+index d70fb21f00..56d938fc91 100644
+--- a/src/system/kernel/arch/riscv64/arch_vm.cpp
++++ b/src/system/kernel/arch/riscv64/arch_vm.cpp
+@@ -72,28 +72,49 @@ WritePteFlags(uint32 flags)
+ }
+ 
+ 
+-static void
+-DumpPageWrite(uint64_t virtAdr, uint64_t physAdr, size_t size, uint64 flags, uint64& firstVirt, uint64& firstPhys, uint64& firstFlags, uint64& len)
++class PageTableDumper
+ {
+-	if (virtAdr == firstVirt + len && physAdr == firstPhys + len && flags == firstFlags) {
+-		len += size;
+-	} else {
+-		if (len != 0) {
+-			dprintf("  0x%08" B_PRIxADDR " - 0x%08" B_PRIxADDR,
+-				firstVirt, firstVirt + (len - 1));
+-			dprintf(": 0x%08" B_PRIxADDR " - 0x%08" B_PRIxADDR ", %#" B_PRIxADDR ", ", firstPhys, firstPhys + (len - 1), len);
+-			WritePteFlags(firstFlags); dprintf("\n");
++private:
++	uint64 firstVirt;
++	uint64 firstPhys;
++	uint64 firstFlags;
++	uint64 len;
++	
++public:
++	PageTableDumper():
++		firstVirt(0),
++		firstPhys(0),
++		firstFlags(0),
++		len(0)
++	{}
++	
++	~PageTableDumper()
++	{
++		Write(0, 0, 0, 0);
++	}
++	
++	void Write(uint64_t virtAdr, uint64_t physAdr, size_t size, uint64 flags)
++	{
++		if (virtAdr == firstVirt + len && physAdr == firstPhys + len && flags == firstFlags) {
++			len += size;
++		} else {
++			if (len != 0) {
++				dprintf("  0x%08" B_PRIxADDR " - 0x%08" B_PRIxADDR,
++					firstVirt, firstVirt + (len - 1));
++				dprintf(": 0x%08" B_PRIxADDR " - 0x%08" B_PRIxADDR ", %#" B_PRIxADDR ", ", firstPhys, firstPhys + (len - 1), len);
++				WritePteFlags(firstFlags); dprintf("\n");
++			}
++			firstVirt = virtAdr;
++			firstPhys = physAdr;
++			firstFlags = flags;
++			len = size;
+ 		}
+-		firstVirt = virtAdr;
+-		firstPhys = physAdr;
+-		firstFlags = flags;
+-		len = size;
+ 	}
+-}
++};
+ 
+ 
+ static void
+-DumpPageTableInt(Pte* pte, uint64_t virtAdr, uint32_t level, uint64& firstVirt, uint64& firstPhys, uint64& firstFlags, uint64& len)
++DumpPageTableInt(Pte* pte, uint64_t virtAdr, uint32_t level, PageTableDumper& dumper)
+ {
+ 	for (uint32 i = 0; i < pteCount; i++) {
+ 		if (((1 << pteValid) & pte[i].flags) != 0) {
+@@ -103,46 +124,90 @@ DumpPageTableInt(Pte* pte, uint64_t virtAdr, uint32_t level, uint64& firstVirt,
+ 
+ 				DumpPageTableInt((Pte*)VirtFromPhys(pageSize*pte[i].ppn),
+ 					virtAdr + ((uint64_t)i << (pageBits + pteIdxBits*level)),
+-					level - 1, firstVirt, firstPhys, firstFlags, len);
++					level - 1, dumper);
+ 			} else {
+-				DumpPageWrite(
++				dumper.Write(
+ 					SignExtendVirtAdr(virtAdr + ((uint64_t)i << (pageBits + pteIdxBits*level))),
+ 					pte[i].ppn * B_PAGE_SIZE,
+ 					1 << (pageBits + pteIdxBits*level),
+-					pte[i].flags,
+-					firstVirt, firstPhys, firstFlags, len);
++					pte[i].flags);
+ 			}
+ 		}
+ 	}
+ }
+ 
+ 
++static VMArea* LookupArea(area_id id)
++{
++	VMAreaHash::ReadLock();
++	VMArea* area = VMAreaHash::LookupLocked(id);
++	VMAreaHash::ReadUnlock();
++
++	return area;
++}
++
++
+ static int
+ DumpPageTable(int argc, char** argv)
+ {
++	int curArg = 1;
+ 	SatpReg satp;
+-	if (argc >= 2) {
+-		team_id id = strtoul(argv[1], NULL, 0);
+-		VMAddressSpace* addrSpace = VMAddressSpace::DebugGet(id);
+-		if (addrSpace == NULL) {
+-			kprintf("could not find team %" B_PRId32 "\n", id);
++
++	bool isArea = false;
++	addr_t base = 0;
++	size_t size = 0;
++
++	satp.val = Satp();
++	while (curArg < argc && argv[curArg][0] == '-') {
++		if (strcmp(argv[curArg], "-team") == 0) {
++			curArg++;
++			team_id id = strtoul(argv[curArg++], NULL, 0);
++			VMAddressSpace* addrSpace = VMAddressSpace::DebugGet(id);
++			if (addrSpace == NULL) {
++				kprintf("could not find team %" B_PRId32 "\n", id);
++				return 0;
++			}
++			satp.val = ((RISCV64VMTranslationMap*)
++				addrSpace->TranslationMap())->Satp();
++			isArea = false;
++		} else if (strcmp(argv[curArg], "-area") == 0) {
++			curArg++;
++			uint64 areaId;
++			if (!evaluate_debug_expression(argv[curArg++], &areaId, false))
++				return 0;
++			VMArea* area = LookupArea((area_id)areaId);
++			if (area == NULL) {
++				kprintf("could not find area %" B_PRId32 "\n", (area_id)areaId);
++				return 0;
++			}
++			satp.val = ((RISCV64VMTranslationMap*)
++				area->address_space->TranslationMap())->Satp();
++			base = area->Base();
++			size = area->Size();
++			kprintf("area %" B_PRId32 "(%s)\n", area->id, area->name);
++			isArea = true;
++		} else {
++			kprintf("unknown flag \"%s\"\n", argv[curArg]);
+ 			return 0;
+ 		}
+-		satp.val = ((RISCV64VMTranslationMap*)
+-			addrSpace->TranslationMap())->Satp();
+-		dprintf("page table for team %" B_PRId32 "\n", id);
+-	} else {
+-		satp.val = Satp();
+-		dprintf("current page table:\n");
+ 	}
+-	Pte* root = (Pte*)VirtFromPhys(satp.ppn * B_PAGE_SIZE);
+ 
+-	uint64 firstVirt = 0;
+-	uint64 firstPhys = 0;
+-	uint64 firstFlags = 0;
+-	uint64 len = 0;
+-	DumpPageTableInt(root, 0, 2, firstVirt, firstPhys, firstFlags, len);
+-	DumpPageWrite(0, 0, 0, 0, firstVirt, firstPhys, firstFlags, len);
++	kprintf("satp: %#" B_PRIx64 "\n", satp.val);
++
++	PageTableDumper dumper;
++
++	if (!isArea) {
++		Pte* root = (Pte*)VirtFromPhys(satp.ppn * B_PAGE_SIZE);
++		DumpPageTableInt(root, 0, 2, dumper);
++	} else {
++		for (; size > 0; base += B_PAGE_SIZE, size -= B_PAGE_SIZE) {
++			Pte* pte = LookupPte(satp.ppn * B_PAGE_SIZE, base);
++			if (pte == NULL || (pte->flags & (1 << pteValid)) == 0)
++				continue;
++
++			dumper.Write(base, pte->ppn * B_PAGE_SIZE, B_PAGE_SIZE, pte->flags);
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -155,7 +220,7 @@ DumpVirtPage(int argc, char** argv)
+ 	SatpReg satp;
+ 
+ 	satp.val = Satp();
+-	while (argv[curArg][0] == '-') {
++	while (curArg < argc && argv[curArg][0] == '-') {
+ 		if (strcmp(argv[curArg], "-team") == 0) {
+ 			curArg++;
+ 			team_id id = strtoul(argv[curArg++], NULL, 0);
+@@ -174,24 +239,20 @@ DumpVirtPage(int argc, char** argv)
+ 
+ 	kprintf("satp: %#" B_PRIx64 "\n", satp.val);
+ 
+-	uint64 firstVirt = 0;
+-	uint64 firstPhys = 0;
+-	uint64 firstFlags = 0;
+-	uint64 len = B_PAGE_SIZE;
+-	if (!evaluate_debug_expression(argv[curArg++], &firstVirt, false))
++	uint64 virt = 0;
++	if (!evaluate_debug_expression(argv[curArg++], &virt, false))
+ 		return 0;
+ 
+-	firstVirt = ROUNDDOWN(firstVirt, B_PAGE_SIZE);
++	virt = ROUNDDOWN(virt, B_PAGE_SIZE);
+ 
+-	Pte* pte = LookupPte(satp.ppn * B_PAGE_SIZE, firstVirt);
++	Pte* pte = LookupPte(satp.ppn * B_PAGE_SIZE, virt);
+ 	if (pte == NULL) {
+ 		dprintf("not mapped\n");
+ 		return 0;
+ 	}
+-	firstPhys = pte->ppn * B_PAGE_SIZE;
+-	firstFlags = pte->flags;
+ 
+-	DumpPageWrite(0, 0, 0, 0, firstVirt, firstPhys, firstFlags, len);
++	PageTableDumper dumper;
++	dumper.Write(virt, pte->ppn * B_PAGE_SIZE, B_PAGE_SIZE, pte->flags);
+ 
+ 	return 0;
+ }
+diff --git a/src/system/kernel/arch/riscv64/asm_offsets.cpp b/src/system/kernel/arch/riscv64/asm_offsets.cpp
+new file mode 100644
+index 0000000000..a43c31374f
+--- /dev/null
++++ b/src/system/kernel/arch/riscv64/asm_offsets.cpp
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2007-2011, Ingo Weinhold, ingo_weinhold@gmx.de.
++ * Distributed under the terms of the MIT License.
++ */
++
++// This file is used to get C structure offsets into assembly code.
++// The build system assembles the file and processes the output to create
++// a header file with macro definitions, that can be included from assembly
++// code.
++
++
++#include <computed_asm_macros.h>
++
++#include <arch_cpu.h>
++#include <cpu.h>
++#include <ksignal.h>
++#include <ksyscalls.h>
++#include <thread_types.h>
++
++
++#define DEFINE_MACRO(macro, value) DEFINE_COMPUTED_ASM_MACRO(macro, value)
++
++#define DEFINE_OFFSET_MACRO(prefix, structure, member) \
++	DEFINE_MACRO(prefix##_##member, offsetof(struct structure, member));
++
++#define DEFINE_SIZEOF_MACRO(prefix, structure) \
++	DEFINE_MACRO(prefix##_sizeof, sizeof(struct structure));
++
++
++void
++dummy()
++{
++	// struct Thread
++	DEFINE_OFFSET_MACRO(THREAD, Thread, arch_info);
++
++	// struct arch_thread
++	DEFINE_OFFSET_MACRO(ARCH_THREAD, arch_thread, context);
++	DEFINE_OFFSET_MACRO(ARCH_THREAD, arch_thread, fpuContext);
++
++	DEFINE_OFFSET_MACRO(ARCH_CONTEXT, arch_context, sp);
++
++	DEFINE_OFFSET_MACRO(ARCH_STACK, arch_stack, thread);
++
++	DEFINE_SIZEOF_MACRO(IFRAME, iframe);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, status);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, cause);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, tval);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, ra);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, sp);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, tp);
++	DEFINE_OFFSET_MACRO(IFRAME, iframe, epc);
++}
+diff --git a/src/system/kernel/arch/x86/paging/32bit/X86VMTranslationMap32Bit.cpp b/src/system/kernel/arch/x86/paging/32bit/X86VMTranslationMap32Bit.cpp
+index 939b4d206b..62ce296b13 100644
+--- a/src/system/kernel/arch/x86/paging/32bit/X86VMTranslationMap32Bit.cpp
++++ b/src/system/kernel/arch/x86/paging/32bit/X86VMTranslationMap32Bit.cpp
+@@ -873,6 +873,10 @@ X86VMTranslationMap32Bit::ClearAccessedAndModified(VMArea* area, addr_t address,
+ 
+ 	// We have unmapped the address. Do the "high level" stuff.
+ 
++	dprintf("X86VMPhysicalPageMapper::ClearAccessedAndModified(0x%" B_PRIxADDR
++		"(%s), 0x%" B_PRIxADDR ", %d): unmapped\n", (addr_t)area, area->name, address,
++		unmapIfUnaccessed);
++
+ 	fMapCount--;
+ 
+ 	locker.Detach();
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index 7418440dd7..cd119dfc1e 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -1504,7 +1504,7 @@ debug_output(const char* string, int32 length, bool notifySyslog)
+ 	if (length >= OUTPUT_BUFFER_SIZE)
+ 		length = OUTPUT_BUFFER_SIZE - 1;
+ 
+-	if (length > 1 && string[length - 1] == '\n'
++	if (false && /* !!! */ length > 1 && string[length - 1] == '\n'
+ 		&& strncmp(string, sLastOutputBuffer, length) == 0) {
+ 		sMessageRepeatCount++;
+ 		sMessageRepeatLastTime = system_time();
+diff --git a/src/system/kernel/debug/user_debugger.cpp b/src/system/kernel/debug/user_debugger.cpp
+index 348040339e..f3eae157e4 100644
+--- a/src/system/kernel/debug/user_debugger.cpp
++++ b/src/system/kernel/debug/user_debugger.cpp
+@@ -2783,7 +2783,6 @@ void
+ _user_debugger(const char *userMessage)
+ {
+ #ifdef __riscv
+-	WriteTrapInfo();
+ 	DoStackTrace(Fp(), 0);
+ #endif
+ 	// install the default debugger, if there is none yet
+diff --git a/src/system/kernel/device_manager/legacy_drivers.cpp b/src/system/kernel/device_manager/legacy_drivers.cpp
+index e0b169d57c..4ec68765dd 100644
+--- a/src/system/kernel/device_manager/legacy_drivers.cpp
++++ b/src/system/kernel/device_manager/legacy_drivers.cpp
+@@ -33,7 +33,7 @@
+ #include "devfs_private.h"
+ 
+ 
+-//#define TRACE_LEGACY_DRIVERS
++#define TRACE_LEGACY_DRIVERS
+ #ifdef TRACE_LEGACY_DRIVERS
+ #	define TRACE(x) dprintf x
+ #else
+@@ -747,14 +747,14 @@ handle_driver_events(void* /*_fs*/, int /*iteration*/)
+ 			}
+ 
+ 			case kAddWatcher:
+-				TRACE(("  add watcher %ld:%lld\n", event->node.device,
++				TRACE(("  add watcher %" B_PRId32 ":%" B_PRId64 "\n", event->node.device,
+ 					event->node.node));
+ 				add_node_listener(event->node.device, event->node.node,
+ 					B_WATCH_STAT | B_WATCH_NAME, sDriverWatcher);
+ 				break;
+ 
+ 			case kRemoveWatcher:
+-				TRACE(("  remove watcher %ld:%lld\n", event->node.device,
++				TRACE(("  remove watcher %" B_PRId32 ":%" B_PRId64 "\n", event->node.device,
+ 					event->node.node));
+ 				remove_node_listener(event->node.device, event->node.node,
+ 					sDriverWatcher);
+diff --git a/src/system/kernel/int.cpp b/src/system/kernel/int.cpp
+index 1cd125538b..0518fb1b1d 100644
+--- a/src/system/kernel/int.cpp
++++ b/src/system/kernel/int.cpp
+@@ -411,6 +411,11 @@ restore_interrupts(cpu_status status)
+ static
+ uint32 assign_cpu(void)
+ {
++// arch_int_assign_to_cpu is not yet implemented for riscv
++#ifdef __riscv
++	return 0;
++#endif
++
+ 	const cpu_topology_node* node;
+ 	do {
+ 		int32 nextID = atomic_add(&sLastCPU, 1);
+diff --git a/src/system/kernel/main.cpp b/src/system/kernel/main.cpp
+index ae8bd70cfb..c075d82a11 100644
+--- a/src/system/kernel/main.cpp
++++ b/src/system/kernel/main.cpp
+@@ -95,6 +95,7 @@ non_boot_cpu_init(void* args, int currentCPU)
+ 
+ 
+ extern "C" status_t arch_debug_console_init(kernel_args *args);
++void DumpCpuTopology();
+ 
+ 
+ extern "C" int
+@@ -190,6 +191,9 @@ _start(kernel_args *bootKernelArgs, int currentCPU)
+ 		TRACE("init SMP\n");
+ 		smp_init(&sKernelArgs);
+ 		cpu_build_topology_tree();
++#ifdef __riscv
++		DumpCpuTopology();
++#endif
+ 		TRACE("init timer\n");
+ 		timer_init(&sKernelArgs);
+ 		TRACE("init real time clock\n");
+diff --git a/src/system/kernel/vm/vm.cpp b/src/system/kernel/vm/vm.cpp
+index f4c78bf45c..112acbd862 100644
+--- a/src/system/kernel/vm/vm.cpp
++++ b/src/system/kernel/vm/vm.cpp
+@@ -4419,10 +4419,13 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 	}
+ 
+ 	if (status < B_OK) {
+-		dprintf("vm_page_fault: vm_soft_fault returned error '%s' on fault at "
+-			"0x%lx, ip 0x%lx, write %d, user %d, thread 0x%" B_PRIx32 "\n",
+-			strerror(status), address, faultAddress, isWrite, isUser,
+-			thread_get_current_thread_id());
++		dprintf("vm_page_fault: vm_soft_fault returned error '%s' on %s %s fault at "
++			"0x%lx, ip 0x%lx, thread %" B_PRId32 "(%s)\n",
++			strerror(status),
++			isUser ? "user" : "kernel",
++			isWrite ? "write" : (isExecute ? "execute" : "read"),
++			address, faultAddress, thread_get_current_thread_id(),
++			thread_get_current_thread()->name);
+ 		if (!isUser) {
+ 			Thread* thread = thread_get_current_thread();
+ 			if (thread != NULL && thread->fault_handler != 0) {
+@@ -4430,18 +4433,13 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 				// modify the IP on the interrupt frame or whatever to return
+ 				// to this address
+ 				*newIP = reinterpret_cast<uintptr_t>(thread->fault_handler);
+-				dprintf("*newIP = 0x%" B_PRIxADDR "\n", *newIP);
+ 			} else {
+-#ifdef __riscv
+-				WriteTrapInfo();
+-#endif
+ 				// unhandled page fault in the kernel
+ 				panic("vm_page_fault: unhandled page fault in kernel space at "
+ 					"0x%lx, ip 0x%lx\n", address, faultAddress);
+ 			}
+ 		} else {
+ #ifdef __riscv
+-			WriteTrapInfo();
+ 			DoStackTrace(Fp(), 0);
+ #endif
+ 			Thread* thread = thread_get_current_thread();
+-- 
+2.30.2
+

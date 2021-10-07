@@ -1,0 +1,88 @@
+From 0cccefdb569ed57aea887978ddfac2e897bc1424 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Mon, 26 Jul 2021 03:14:41 +0900
+Subject: nvme: add legacy interrupts support
+
+Change-Id: I29b9676c6c2407e7795af4c7b1c56a7afb546f6e
+---
+ .../drivers/disk/nvme/compat/libnvme_haiku.cpp   | 10 +++++++++-
+ .../kernel/drivers/disk/nvme/nvme_disk.cpp       | 16 +++++++++++-----
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/disk/nvme/compat/libnvme_haiku.cpp b/src/add-ons/kernel/drivers/disk/nvme/compat/libnvme_haiku.cpp
+index af959e62fc..3ea404efb3 100644
+--- a/src/add-ons/kernel/drivers/disk/nvme/compat/libnvme_haiku.cpp
++++ b/src/add-ons/kernel/drivers/disk/nvme/compat/libnvme_haiku.cpp
+@@ -126,12 +126,20 @@ int
+ nvme_pcicfg_map_bar(void* devhandle, unsigned int bar, bool read_only,
+ 	void** mapped_addr)
+ {
++	dprintf("nvme_pcicfg_map_bar()\n");
+ 	struct pci_device* dev = (struct pci_device*)devhandle;
+ 	pci_info* info = (pci_info*)dev->pci_info;
+ 
+-	uint32 addr = info->u.h0.base_registers[bar];
++	uint64 addr = info->u.h0.base_registers[bar];
++	if ((info->u.h0.base_register_flags[0] & PCI_address_type)
++			== PCI_address_type_64) {
++		addr |= (uint64)info->u.h0.base_registers[1] << 32;
++	}
++
+ 	uint32 size = info->u.h0.base_register_sizes[bar];
+ 
++	dprintf("  addr: 0x%" B_PRIx64 ", size: 0x%" B_PRIx32 "\n", addr, size);
++
+ 	area_id area = map_physical_memory("nvme mapped bar", (phys_addr_t)addr,
+ 		size, B_ANY_KERNEL_ADDRESS,
+ 		B_KERNEL_READ_AREA | (read_only ? 0 : B_KERNEL_WRITE_AREA),
+diff --git a/src/add-ons/kernel/drivers/disk/nvme/nvme_disk.cpp b/src/add-ons/kernel/drivers/disk/nvme/nvme_disk.cpp
+index b90ab7047b..d31775b26b 100644
+--- a/src/add-ons/kernel/drivers/disk/nvme/nvme_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/nvme/nvme_disk.cpp
+@@ -198,6 +198,11 @@ nvme_disk_init_device(void* _info, void** _cookie)
+ 
+ 	device->pci_info = &info->info;
+ 
++	// enable busmaster and memory mapped access
++	uint16 command = pci->read_pci_config(pcidev, PCI_command, 2);
++	command |= PCI_command_master | PCI_command_memory;
++	pci->write_pci_config(pcidev, PCI_command, 2, command);
++
+ 	// open the controller
+ 	info->ctrlr = nvme_ctrlr_open(device, NULL);
+ 	if (info->ctrlr == NULL) {
+@@ -290,10 +295,6 @@ nvme_disk_init_device(void* _info, void** _cookie)
+ 		sPCIx86Module = NULL;
+ 	}
+ 
+-	uint16 command = pci->read_pci_config(pcidev, PCI_command, 2);
+-	command &= ~(PCI_command_int_disable);
+-	pci->write_pci_config(pcidev, PCI_command, 2, command);
+-
+ 	uint8 irq = info->info.u.h0.interrupt_line;
+ 	if (sPCIx86Module != NULL) {
+ 		if (sPCIx86Module->get_msix_count(info->info.bus, info->info.device,
+@@ -317,6 +318,10 @@ nvme_disk_init_device(void* _info, void** _cookie)
+ 				irq = msiVector;
+ 			}
+ 		}
++	} else {
++		uint16 command = pci->read_pci_config(pcidev, PCI_command, 2);
++		command &= ~(PCI_command_int_disable);
++		pci->write_pci_config(pcidev, PCI_command, 2, command);
+ 	}
+ 
+ 	if (irq == 0 || irq == 0xFF) {
+@@ -946,7 +951,8 @@ nvme_disk_register_device(device_node* parent)
+ 	CALLED();
+ 
+ 	device_attr attrs[] = {
+-		{ NULL }
++		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {string: "NVMe Disk"}},
++		{}
+ 	};
+ 
+ 	return sDeviceManager->register_node(parent, NVME_DISK_DRIVER_MODULE_NAME,
+-- 
+2.30.2
+
